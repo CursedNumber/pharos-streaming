@@ -1,0 +1,29 @@
+[package]
+name = "media-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+tracing = "0.1"
+
+# libopus binding. Linux (host encode + desktop client decode) and Windows (M3
+# host encode via WASAPI loopback). `audiopus_sys` vendors libopus and builds it
+# with `cc`, so it cross-compiles to windows-msvc via cargo-xwin. Android decodes
+# Opus via MediaCodec (not this), so it's excluded there.
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+opus = "0.3"
+
+# WASAPI loopback capture (the system mix) on the Windows host. Matches the
+# `windows` 0.52 already used by pharos-win.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    # IMMDevice::Activate references PROPVARIANT, so it's generated only with these
+    # two extra features on (Required features per the windows-rs docs).
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+] }

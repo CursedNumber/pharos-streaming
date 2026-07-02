@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Stream-hub strings. StreamHub itself renders no UI (its own messages are log
+  lines), but it exposes the ConnStatus enum that the navbar host rows and the
+  active-stream badge display. These are the canonical labels for that enum, so
+  the Navbar agent + the shell read them via stringResource(...) instead of
+  hardcoding status text — English-first, themed by the caller, i18n-ready.
+  Keys are snake_case + `stream_` namespaced to avoid cross-module collisions.
+-->
+<resources>
+    <!-- ConnStatus labels (one per enum value). -->
+    <string name="stream_status_connecting">Connecting…</string>
+    <string name="stream_status_live">Live</string>
+    <string name="stream_status_reconnecting">Reconnecting…</string>
+    <string name="stream_status_failed">Connection failed</string>
+    <string name="stream_status_disconnected">Disconnected</string>
+    <!-- Another device took the host's single streaming slot; tap the host to reclaim. -->
+    <string name="stream_status_preempted">Another device is streaming — select this host to resume</string>
+
+    <!-- Active-stream badge / overlay copy. %1$s = host friendly name. -->
+    <string name="stream_active_on">Streaming from %1$s</string>
+    <!-- Shown over the surface while no host is active (cold start / idle). -->
+    <string name="stream_idle">No active stream</string>
+    <!-- TalkBack description for the yellow wifi icon shown when the host link is
+         degraded (dropping frames). The icon itself carries the visual cue. -->
+    <string name="stream_link_degraded_desc">Connection degraded — reduced quality</string>
+</resources>

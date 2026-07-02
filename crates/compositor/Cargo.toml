@@ -1,0 +1,70 @@
+[package]
+name = "compositor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+transport = { path = "../transport" }
+# Shared cross-platform pairing/identity glue (re-exported as `compositor::pair`).
+host-core = { path = "../host-core" }
+serde = { workspace = true }
+# Multi-output config (capture-zc-multi).
+toml = "0.8"
+# Identity load for the video streamer (`Identity::load_or_create`).
+core-crypto = { path = "../core-crypto" }
+# Input event types arriving via the transport's input rx.
+core-proto = { path = "../core-proto" }
+# Local control/telemetry protocol with pharos-panel (compositor is the server).
+control-ipc = { path = "../control-ipc" }
+# App launcher: resolve a slug from apps.toml and spawn it into the virtual display.
+app-launcher = { path = "../app-launcher" }
+dirs = "5"
+# PIN generation.
+rand = "0.8"
+hex = "0.4"
+# mDNS service advertisement (zeroconf) for LAN auto-discovery.
+mdns-sd = "0.20"
+# gethostname(3) for the mDNS host label.
+libc = "0.2"
+# Async runtime for the pairing listener; tokio is already pulled in by transport.
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+
+# Smithay + Wayland are Linux-only; the crate compiles to a stub elsewhere so
+# the Windows CI job stays green.
+[target.'cfg(target_os = "linux")'.dependencies]
+smithay = { version = "0.7", default-features = false, features = [
+    "wayland_frontend",
+    "desktop",
+    "renderer_gl",
+    "renderer_pixman",
+    "backend_gbm",
+] }
+# Zero-copy NVENC path (M1 #1).
+nvidia-video-codec-sdk = "0.4"
+cudarc = "0.16"
+libloading = "0.8"
+# Opus audio capture/encode (host side), streamed as QUIC datagrams.
+media-audio = { path = "../media-audio" }
+# uinput virtual gamepad — networked gamepad input from the Trireme client is
+# injected as a real Xbox 360 pad the game reads via evdev (same crate as
+# gamepad-bridge).
+evdev = "0.12"
+# GPU telemetry for the health watchdog (P4). dlopen's libnvidia-ml at runtime,
+# so it builds without NVML present and degrades to best-effort if it's absent.
+nvml-wrapper = "0.10"
+# systemd sd_notify — the Type=notify/WatchdogSec external backstop for a fully
+# hung render loop. No-op when not run under a notify unit (manual runs).
+sd-notify = "0.4"
+# Idle "no app running" screen: shared Pharos lighthouse art + glyph rasterization
+# for the status text (composited once into the streamed background).
+pharos-assets = { path = "../pharos-assets" }
+ab_glyph = "0.2"
+
+[[bin]]
+name = "pharos-compositor"
+path = "src/main.rs"

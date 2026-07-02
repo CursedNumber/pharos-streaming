@@ -1,0 +1,52 @@
+[package]
+name = "pharos-win"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Pharos streaming host for Windows (BATTLE_PLAN.md M3). Captures a display
+# (a real monitor for bring-up; an IddCx headless virtual display next) → HEVC
+# via Quick Sync / NVENC through an ffmpeg subprocess → reuses the cross-platform
+# QUIC streamer, pairing, and input back-channel verbatim. Input is injected with
+# Win32 SendInput. The binary stubs out on non-Windows so the workspace still
+# builds on the Linux dev box.
+
+[dependencies]
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+transport = { path = "../transport" }
+host-core = { path = "../host-core" }
+host-info = { path = "../host-info" }
+core-proto = { path = "../core-proto" }
+core-crypto = { path = "../core-crypto" }
+control-ipc = { path = "../control-ipc" }
+media-audio = { path = "../media-audio" }
+integration-mqtt = { path = "../integration-mqtt" }
+
+# Win32 input injection (SendInput) + virtual-screen metrics. Reuses the
+# `windows` 0.52 already in the lockfile (pulled by winit/wgpu on the client).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    # Windows.Graphics.Capture (WGC) native capture path.
+    "Foundation",
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_System_Com",
+] }
+
+[[bin]]
+name = "pharos-host"
+path = "src/main.rs"

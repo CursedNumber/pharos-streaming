@@ -1,0 +1,65 @@
+[package]
+name = "trireme"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The Linux reference client. Reuses the shared Rust `transport` directly (no
+# JNI hop) and decodes with NVDEC. The KMP/Compose-Desktop GUI can layer on top.
+[[bin]]
+name = "trireme"
+path = "src/main.rs"
+
+[dependencies]
+transport = { path = "../transport" }
+# Input event wire types (re-exported via transport, but used directly by the
+# filter/classify path in `input.rs`).
+core-proto = { path = "../core-proto" }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Multi-source player config (sources.toml, layout, per-source pace).
+serde = { workspace = true }
+toml = "0.8"
+# Pairing handshake (shared SPAKE2 + identity).
+core-crypto = { path = "../core-crypto" }
+# Async runtime for the pairing client; transport pulls tokio too.
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+hex = "0.4"
+# mDNS service discovery (browser side).
+mdns-sd = "0.20"
+# Reverse DNS (getnameinfo) so a server added by IP can display its hostname.
+dns-lookup = "3"
+# Windowed player (GPU present + the PaceMode→present-mode mapping).
+winit = "0.30"
+wgpu = "22"
+pollster = "0.3"
+# Server-selector menu (the first screen).
+eframe = { version = "0.29", default-features = false, features = [
+    "default_fonts",
+    "wgpu",
+    "wayland",
+    "x11",
+] }
+egui = "0.29"
+dirs = "5"
+# USB export side (claim the device, service URBs against it via libusb).
+core-usbip = { path = "../core-usbip" }
+rusb = "0.9"
+# Opus audio decode (from QUIC datagrams) → PCM → pacat playback.
+media-audio = { path = "../media-audio" }
+# HEVC HW-decoder capability probe (picks hevc_cuvid/qsv/rkmpp/v4l2 at runtime).
+media-decode = { path = "../media-decode" }
+# Native VNC source for split-screen cells (e.g. Proxmox VMs). RFB client; the
+# decoded framebuffer is bridged to the existing NV12 render path via ffmpeg.
+vnc = "0.4"
+# Native SPICE source (the usual QEMU/Proxmox console protocol). Optional: it
+# links libspice-client-glib-2.0 via FFI, so it's gated behind the `spice`
+# feature and only pulled in (with its `ffi` feature) when that's enabled.
+media-spice = { path = "../media-spice", features = ["ffi"], optional = true }
+
+[features]
+default = []
+# Compile in the native SPICE source (`protocol = "spice"`). Requires the
+# spice-gtk system library at build time (pkg-config: spice-client-glib-2.0).
+spice = ["dep:media-spice"]

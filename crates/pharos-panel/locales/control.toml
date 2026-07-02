@@ -1,0 +1,37 @@
+# rust-i18n locale file (v2). English is the default + fallback.
+#
+# Shared strings for the live control link to a running compositor (the
+# `control_ipc` socket). Owned by the panel's `control` module + the live
+# surfaces that use it (the compositor Play-media card, the Video latency
+# benchmark, and the Overview live banner). Namespaced `control.*` so it never
+# clashes with a tab's own strings.
+_version = 2
+
+# --- Link state --------------------------------------------------------------
+["control.not_running"]
+en = "Host not running — the control socket isn't answering. Start the Pharos compositor on this machine to enable live status and controls."
+nb = "Verten kjører ikke — kontrollsocketen svarer ikke. Start Pharos-kompositoren på denne maskinen for å aktivere sanntidsstatus og -kontroller."
+
+["control.unavailable"]
+en = "Control socket unavailable on this platform — live status and controls need the Linux compositor."
+nb = "Kontrollsocket er ikke tilgjengelig på denne plattformen — sanntidsstatus og -kontroller krever Linux-kompositoren."
+
+["control.connected"]
+en = "Connected to the host"
+nb = "Tilkoblet verten"
+
+["control.disconnected"]
+en = "Not connected to a host"
+nb = "Ikke tilkoblet en vert"
+
+# Shown when the connected host is status-only (the Windows host): it reports
+# live status but doesn't accept control actions (pairing, relaunch, launch,
+# preview). The action controls are disabled with this as the reason.
+["control.read_only"]
+en = "This host reports status only — control actions (pairing, launch, preview, relaunch) aren't available from the panel here."
+nb = "Denne verten rapporterer kun status — kontrollhandlinger (paring, start, forhåndsvisning, omstart) er ikke tilgjengelige fra panelet her."
+
+# Short badge form of the above (for status_badge labels).
+["control.read_only_short"]
+en = "Status-only host"
+nb = "Kun-status-vert"

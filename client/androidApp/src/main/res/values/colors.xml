@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Deep sea-navy field behind the trireme on the launcher / legacy icons.
+         Matches the darkest surface in the nautical theme (TriremeTokens). -->
+    <color name="ic_launcher_background">#FF001830</color>
+
+    <!-- Window background behind the SurfaceView before the first frame and behind
+         the navbar scrim — the deepest sea backdrop (TriremeTokens.SeaBackdrop). -->
+    <color name="window_backdrop">#FF000C14</color>
+</resources>

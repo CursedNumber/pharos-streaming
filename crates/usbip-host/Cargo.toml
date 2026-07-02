@@ -1,0 +1,21 @@
+[package]
+name = "usbip-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Pharos import bridge: accept the exporter, hand vhci_hcd a socket, relay URBs.
+# Linux-only (vhci_hcd); the binary stubs out elsewhere so the workspace builds.
+[[bin]]
+name = "pharos-usbimport"
+path = "src/bin/pharos-usbimport.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+transport = { path = "../transport" }
+# Shared wire-port constants (USB/IP import listener default).
+core-proto = { path = "../core-proto" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+nix = { version = "0.29", features = ["socket"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

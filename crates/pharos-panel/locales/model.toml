@@ -1,0 +1,116 @@
+# Shared model enum labels (Theme, FontScale, ResolutionPolicy, RefreshPolicy,
+# Liveness) surfaced in the UI. English default + Norwegian (Bokmål).
+_version = 2
+
+# --- Theme ----------------------------------------------------------------
+["theme.comfort"]
+en = "Comfort grey"
+nb = "Komfortgrå"
+
+["theme.comfort_desc"]
+en = "Comfortable grey background with bright text — easy on the eyes, high legibility."
+nb = "Behagelig grå bakgrunn med lys tekst — skånsom mot øynene, høy lesbarhet."
+
+["theme.midnight"]
+en = "Midnight"
+nb = "Midnatt"
+
+["theme.midnight_desc"]
+en = "Near-black background for dark rooms; bright text."
+nb = "Nesten svart bakgrunn for mørke rom; lys tekst."
+
+["theme.daylight"]
+en = "Daylight"
+nb = "Dagslys"
+
+["theme.daylight_desc"]
+en = "Black text on a white background, for bright rooms."
+nb = "Svart tekst på hvit bakgrunn, for lyse rom."
+
+["theme.high_contrast"]
+en = "High contrast"
+nb = "Høy kontrast"
+
+["theme.high_contrast_desc"]
+en = "Maximum contrast with a colourblind-safe accent palette (Okabe–Ito)."
+nb = "Maksimal kontrast med en fargeblindvennlig aksentpalett (Okabe–Ito)."
+
+# --- Font scale -----------------------------------------------------------
+["fontscale.small"]
+en = "Small"
+nb = "Liten"
+
+["fontscale.medium"]
+en = "Medium"
+nb = "Middels"
+
+["fontscale.large"]
+en = "Large"
+nb = "Stor"
+
+# --- Resolution policy ----------------------------------------------------
+["respol.native"]
+en = "Native per display"
+nb = "Naturlig per skjerm"
+
+["respol.native_desc"]
+en = "Every virtual display streams at its own native resolution — best fidelity."
+nb = "Hver virtuelle skjerm strømmer i sin egen naturlige oppløsning — best kvalitet."
+
+["respol.uniform"]
+en = "Uniform (LCD wall)"
+nb = "Ensartet (LCD-vegg)"
+
+["respol.uniform_desc"]
+en = "All displays drop to the lowest common resolution, so the wall is uniform."
+nb = "Alle skjermer settes til den laveste felles oppløsningen, slik at veggen blir ensartet."
+
+["respol.stretch"]
+en = "Stretch to fill"
+nb = "Strekk for å fylle"
+
+["respol.stretch_desc"]
+en = "Stretch the source to fill each display, ignoring aspect ratio."
+nb = "Strekk kilden for å fylle hver skjerm, uten hensyn til sideforhold."
+
+["respol.letterbox"]
+en = "Letterbox"
+nb = "Letterbox (sorte kanter)"
+
+["respol.letterbox_desc"]
+en = "Fit the source with black bars, preserving the original aspect ratio."
+nb = "Tilpass kilden med sorte kanter, og behold det opprinnelige sideforholdet."
+
+# --- Refresh policy -------------------------------------------------------
+["refpol.lowest"]
+en = "Lowest common"
+nb = "Laveste felles"
+
+["refpol.lowest_desc"]
+en = "All displays share one pacer at the lowest common refresh — simplest, no tearing."
+nb = "Alle skjermer deler én pacer på laveste felles oppdateringsfrekvens — enklest, ingen riving."
+
+["refpol.per_display"]
+en = "Per display"
+nb = "Per skjerm"
+
+["refpol.per_display_desc"]
+en = "Each display paces independently at its own refresh rate."
+nb = "Hver skjerm går uavhengig i sin egen oppdateringsfrekvens."
+
+# --- Liveness (peer status badge) -----------------------------------------
+["liveness.online"]
+en = "Online"
+nb = "Tilkoblet"
+
+["liveness.streaming"]
+en = "Streaming"
+nb = "Strømmer"
+
+["liveness.offline"]
+en = "Offline"
+nb = "Frakoblet"
+
+["liveness.unknown"]
+en = "Unknown"
+nb = "Ukjent"

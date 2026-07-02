@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  rust:
+    name: rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `compositor` needs CUDA + the Smithay/GBM stack a stock runner lacks,
+          # so skip it on ubuntu CI (it's validated on the dev rig). It already
+          # stubs out on Windows (#![cfg(target_os = "linux")]).
+          - os: ubuntu-latest
+            flags: --workspace --exclude compositor
+          - os: windows-latest
+            flags: --workspace
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev \
+            libdrm-dev libudev-dev libusb-1.0-0-dev libxkbcommon-dev \
+            libinput-dev libxcb1-dev libopus-dev pkg-config
+      - name: build
+        run: cargo build ${{ matrix.flags }} --all-targets
+      - name: test
+        run: cargo test ${{ matrix.flags }}
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy ${{ matrix.flags }} --all-targets -- -D warnings
+
+  bindings:
+    name: uniffi kotlin bindings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build core cdylib
+        run: cargo build -p core-ffi
+      - name: generate kotlin bindings
+        run: |
+          cargo run -p core-ffi --bin uniffi-bindgen -- \
+            generate --library target/debug/libcore_ffi.so \
+            --language kotlin --out-dir client/shared/generated/kotlin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kotlin-bindings
+          path: client/shared/generated/kotlin

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Navbar (left rail) strings. Owned by the Navbar agent (contract C). English is
+  the canonical locale; other locales are scaffolded under res/values-<lang>/.
+  Keys are snake_case + namespaced (nav_*) to avoid collisions across the
+  per-module string files Android merges into one R.string table.
+-->
+<resources>
+    <!-- Left-rail destination labels (also the spoken Tab labels for TalkBack). -->
+    <string name="nav_stream">Stream</string>
+    <string name="nav_hosts">Hosts</string>
+    <string name="nav_apps">Apps</string>
+    <string name="nav_controllers">Controllers</string>
+    <string name="nav_settings">Settings</string>
+    <string name="nav_exit">Exit</string>
+
+    <!-- contentDescription for each rail icon — spoken on focus, distinct from the
+         visible label so TalkBack announces intent, not just the glyph. -->
+    <string name="nav_stream_desc">Return to the live stream</string>
+    <string name="nav_hosts_desc">Choose a host</string>
+    <string name="nav_apps_desc">Launch an app</string>
+    <string name="nav_controllers_desc">Detected gamepads, gyro calibration, and per-controller tuning</string>
+    <string name="nav_settings_desc">Open settings</string>
+    <string name="nav_exit_desc">Disconnect and exit Trireme</string>
+
+    <!-- The navigation rail as a whole, for screen-reader landmark context. -->
+    <string name="nav_rail_desc">Trireme navigation</string>
+
+    <!-- Touch affordances (phones/tablets). The edge grip is tap-to-open; the scrim
+         to the right of an open navbar is tap-to-dismiss. Spoken by TalkBack. -->
+    <string name="nav_open_handle_desc">Open navigation</string>
+    <string name="nav_close_to_stream">Close navigation and return to the stream</string>
+</resources>

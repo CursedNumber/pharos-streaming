@@ -1,0 +1,31 @@
+# Trireme player config — multi-source grid.
+#
+# Loaded by `trireme play` from (in order):
+#   $TRIREME_CONFIG, $XDG_CONFIG_HOME/trireme/sources.toml,
+#   ~/.config/trireme/sources.toml, ./trireme-sources.toml
+# or pass the path explicitly:  trireme play path/to/sources.toml
+#
+# Each [[source]] = one Pharos stream (its own QUIC connection, its own NVDEC
+# decode pipeline, its own GPU texture). The grid lays them out left→right,
+# top→bottom; cells letterbox the source to preserve its aspect ratio.
+#
+# Multi-monitor on one Pharos = one [[source]] per virtual output (different
+# ports). Multi-host = one [[source]] per Pharos box. Same plumbing either way.
+
+# Swapchain present mode (window-level): low-latency | balanced | smooth | vrr
+present = "low-latency"
+
+# Grid shape. cols * rows must be ≥ number of sources.
+layout = { cols = 2, rows = 1 }
+
+[[source]]
+name = "desktop"
+addr = "192.0.2.100:15777"
+pace = "low-latency"      # per-source: controls jitter buffer + take-newest
+# width  = 1920           # optional; defaults to 1920 (host-side render size)
+# height = 1080
+
+[[source]]
+name = "console"
+addr = "192.0.2.101:15777"
+pace = "vrr"

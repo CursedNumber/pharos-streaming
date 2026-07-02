@@ -1,0 +1,61 @@
+[package]
+name = "pharos-panel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The Pharos host control panel — a cross-platform egui/eframe desktop app that
+# manages a Pharos streaming host (peers, encoders, the virtual-display layout,
+# input forwarding, controller tuning, MQTT/WoL). Mirrors the Trireme client's
+# look (system theme, Frame::group cards, RichText status badges). Builds on
+# Linux x86-64, and compiles clean for Windows x64 + ARM64 (no unconditional
+# Linux-only syscalls).
+[[bin]]
+name = "pharos-panel"
+path = "src/main.rs"
+
+[dependencies]
+# GUI — match the Trireme client exactly (same features so the look/idioms and
+# the renderer path are identical).
+eframe = { version = "0.29", default-features = false, features = [
+    "accesskit",     # screen-reader support (universal design) — see a11y.rs
+    "default_fonts",
+    "wgpu",
+    "wayland",
+    "x11",
+] }
+egui = { version = "0.29", features = ["accesskit"] }
+# AccessKit node-builder API, so the a11y helper can set per-widget descriptions
+# that screen readers announce (pulled in transitively by the eframe feature, but
+# named here so `accesskit::` is usable directly).
+accesskit = "0.16"
+egui_extras = "0.29"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { workspace = true }
+toml = "0.8"
+dirs = "5"
+# Shared contract: wire/profile types and the HEVC decoder capability probe.
+core-proto = { path = "../core-proto" }
+media-decode = { path = "../media-decode" }
+# Local control + telemetry protocol (newline-delimited JSON over a Unix socket).
+# Compositor = server, panel = client. The Unix I/O is cfg(unix)-gated upstream,
+# so the panel's `control` module gates its usage the same way and falls back to a
+# no-op handle on non-unix targets (Windows).
+control-ipc = { path = "../control-ipc" }
+# App catalog + easy-mode scan/suggest, shared with the host. Lean leaf (no
+# tokio/QUIC), so it's safe for the cross-platform panel.
+app-launcher = { path = "../app-launcher" }
+# Host identity helpers (hostname + advertised NIC MACs). A lean leaf that
+# cross-compiles cleanly and gives us the host name + MACs for free, without
+# dragging in the MQTT/rumqttc stack. `host-core` was deliberately NOT taken: its
+# HostConfig is Deserialize-only (can't serialize for save) and it drags in the
+# full QUIC/tokio transport stack — so the panel reads/writes its TOML directly
+# via serde mirror structs in data.rs instead.
+host-info = { path = "../host-info" }
+rust-i18n = "4.1.0"
+egui-phosphor = "0.7"
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
+serde_json = "1.0.150"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }

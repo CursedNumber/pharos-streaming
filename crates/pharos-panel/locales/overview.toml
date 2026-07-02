@@ -1,0 +1,479 @@
+# rust-i18n locale file (v2) for the Overview tab.
+# English is the default + fallback. Every user-facing string in
+# crates/pharos-panel/src/tabs/overview.rs is keyed here under the "overview.*"
+# namespace so keys never clash with other tabs. To add a language, add its code
+# (e.g. `"fr"`) alongside `en` under each key.
+_version = 2
+
+# --- Page header ----------------------------------------------------------
+["overview.heading"]
+en = "Overview"
+nb = "Oversikt"
+
+["overview.subtitle_desc"]
+en = "The Status tab shows this host's identity and the fleet of Trireme clients it has paired with. The panel reads peers.toml — the known fleet — not a live transport, so liveness and telemetry are honestly marked Unknown until live data exists."
+nb = "Oversikten viser denne vertens identitet og flåten av Trireme-klienter den er paret med. Panelet leser peers.toml — den kjente flåten — ikke en levende transport, så tilstand og telemetri er ærlig merket Ukjent inntil det finnes sanntidsdata."
+
+# --- Live status banner (control socket) ----------------------------------
+["overview.live.icon_name"]
+en = "Live host status"
+nb = "Sanntidsstatus for vert"
+
+["overview.live.icon_desc"]
+en = "A live read of the running compositor over the local control socket: whether it's streaming, how many clients are connected, and the encoder in use."
+nb = "En sanntidsavlesning av den kjørende kompositoren over den lokale kontrollsocketen: om den strømmer, hvor mange klienter som er tilkoblet, og enkoderen som brukes."
+
+["overview.live.offline"]
+en = "Host not connected"
+nb = "Vert ikke tilkoblet"
+
+["overview.live.offline_desc"]
+en = "The panel isn't connected to a running compositor, so live streaming status is unavailable. This is normal when the host isn't running — paired peers below still show from peers.toml."
+nb = "Panelet er ikke tilkoblet en kjørende kompositor, så sanntids strømmestatus er utilgjengelig. Dette er normalt når verten ikke kjører — parede noder nedenfor vises fortsatt fra peers.toml."
+
+["overview.live.connecting"]
+en = "Connecting…"
+nb = "Kobler til…"
+
+["overview.live.connecting_desc"]
+en = "Connected to the control socket; waiting for the first status snapshot from the compositor."
+nb = "Tilkoblet kontrollsocketen; venter på det første statusbildet fra kompositoren."
+
+["overview.live.streaming"]
+en = "Streaming"
+nb = "Strømmer"
+
+["overview.live.idle"]
+en = "Idle"
+nb = "Inaktiv"
+
+["overview.gpu.degraded"]
+en = "GPU degraded"
+nb = "GPU degradert"
+
+["overview.gpu.faulted"]
+en = "GPU fault"
+nb = "GPU-feil"
+
+["overview.gpu.reason_desc"]
+en = "Why the host's GPU is degraded or faulted — read live from the control socket (the encode classifier / watchdog)."
+nb = "Hvorfor vertens GPU er degradert eller har feilet — lest direkte fra kontrollsocketen (enkoder-klassifisereren / vakthunden)."
+
+["overview.live.client_one"]
+en = "client connected"
+nb = "klient tilkoblet"
+
+["overview.live.client_many"]
+en = "clients connected"
+nb = "klienter tilkoblet"
+
+["overview.live.clients_desc"]
+en = "How many Trireme clients are connected to the host right now (a live count from the control socket)."
+nb = "Hvor mange Trireme-klienter som er tilkoblet verten akkurat nå (et sanntidstall fra kontrollsocketen)."
+
+["overview.live.encoder_desc"]
+en = "The encoder, codec and frame rate the host is using for the first connected client's stream."
+nb = "Enkoderen, kodeken og bildefrekvensen verten bruker for strømmen til den første tilkoblede klienten."
+
+["overview.live.configured_desc"]
+en = "The configured encode pipeline — codec, audio and output resolution — shown even before a client connects."
+nb = "Den konfigurerte enkoderkjeden — kodek, lyd og utgangsoppløsning — vist allerede før en klient kobler til."
+
+# --- Host header card -----------------------------------------------------
+["overview.host.icon_name"]
+en = "Host"
+nb = "Vert"
+
+["overview.host.icon_desc"]
+en = "This Pharos host — the machine running the control panel and the compositor that Trireme clients connect to."
+nb = "Denne Pharos-verten — maskinen som kjører kontrollpanelet og Compositor-en som Trireme-klienter kobler seg til."
+
+["overview.host.unknown_hostname"]
+en = "unknown host"
+nb = "ukjent vert"
+
+["overview.host.hostname_desc"]
+en = "The hostname this Pharos host advertises to paired Trireme clients."
+nb = "Vertsnavnet denne Pharos-verten annonserer til parede Trireme-klienter."
+
+["overview.host.summary_desc"]
+en = "A one-line summary of this host: it is a control panel, how many clients are paired, and whether MQTT reporting is enabled. The panel has no live compositor signal, so this describes the known fleet rather than an active listener."
+nb = "En kortfattet oppsummering av denne verten: at den er et kontrollpanel, hvor mange klienter som er paret, og om MQTT-rapportering er aktivert. Panelet har ikke noe levende Compositor-signal, så dette beskriver den kjente flåten heller enn en aktiv lytter."
+
+["overview.host.badge"]
+en = "This host"
+nb = "Denne verten"
+
+["overview.host.badge_desc"]
+en = "This card describes the machine you are running the control panel on — not a remote client."
+nb = "Dette kortet beskriver maskinen du kjører kontrollpanelet på — ikke en ekstern klient."
+
+["overview.host.nics_label"]
+en = "Advertised NICs"
+nb = "Annonserte nettverkskort (NIC)"
+
+["overview.host.nics_label_desc"]
+en = "The network interface MAC addresses this host advertises. These are used for Wake-on-LAN and for pinning the QUIC listener to a specific NIC (bind_mac)."
+nb = "MAC-adressene til nettverkskortene denne verten annonserer. Disse brukes til Wake-on-LAN og til å feste QUIC-lytteren til et bestemt nettverkskort (NIC) (bind_mac)."
+
+["overview.host.nics_none_desc"]
+en = "No NIC MAC addresses were detected. Wake-on-LAN and MAC pinning need at least one advertised interface."
+nb = "Ingen MAC-adresser for nettverkskort (NIC) ble oppdaget. Wake-on-LAN og MAC-festing trenger minst ett annonsert grensesnitt."
+
+["overview.host.nic_mac_desc"]
+en = "An advertised NIC MAC address, used for Wake-on-LAN and for the [network] bind_mac pin."
+nb = "En annonsert MAC-adresse for et nettverkskort (NIC), brukt til Wake-on-LAN og til [network] bind_mac-festingen."
+
+["overview.host.bound_label"]
+en = "Bound to NIC"
+nb = "Bundet til nettverkskort (NIC)"
+
+["overview.host.bound_desc"]
+en = "The QUIC listener is pinned to this NIC's MAC address ([network] bind_mac). Clients reach this host only on this interface."
+nb = "QUIC-lytteren er festet til MAC-adressen til dette nettverkskortet (NIC) ([network] bind_mac). Klienter når denne verten kun via dette grensesnittet."
+
+# --- One-line host summary (composed with dynamic counts/addresses) --------
+["overview.summary.panel"]
+en = "Host control panel"
+nb = "Kontrollpanel for vert"
+
+["overview.summary.fleet_none"]
+en = "no paired clients"
+nb = "ingen parede klienter"
+
+["overview.summary.fleet_one"]
+en = "1 paired client"
+nb = "1 paret klient"
+
+["overview.summary.fleet_many_suffix"]
+en = "paired clients"
+nb = "parede klienter"
+
+["overview.summary.mqtt"]
+en = "MQTT →"
+nb = "MQTT →"
+
+# --- Fleet section + controls ---------------------------------------------
+["overview.fleet.heading"]
+en = "Paired clients"
+nb = "Parede klienter"
+
+["overview.fleet.heading_desc"]
+en = "The Trireme clients this host has paired with, read from peers.toml. Each card shows a client's display name, public-key fingerprint, and any telemetry the panel has. Use the filter to find a client by alias or key, and Refresh to re-read the file from disk."
+nb = "Trireme-klientene denne verten er paret med, lest fra peers.toml. Hvert kort viser en klients visningsnavn, fingeravtrykk av den offentlige nøkkelen og eventuell telemetri panelet har. Bruk filteret for å finne en klient etter alias eller nøkkel, og Oppdater for å lese filen fra disk på nytt."
+
+["overview.fleet.filter_label"]
+en = "Filter"
+nb = "Filter"
+
+["overview.fleet.filter_hint"]
+en = "alias or pubkey…"
+nb = "alias eller pubkey…"
+
+["overview.fleet.filter_desc"]
+en = "Filter the paired-client cards below by alias or by public-key fingerprint. The filter is remembered between frames but resets when the panel relaunches."
+nb = "Filtrer kortene for parede klienter nedenfor etter alias eller etter fingeravtrykk av den offentlige nøkkelen. Filteret huskes mellom bilder, men nullstilles når panelet startes på nytt."
+
+["overview.fleet.clear_desc"]
+en = "Clear the filter and show every paired client again."
+nb = "Tøm filteret og vis alle parede klienter igjen."
+
+["overview.fleet.refresh"]
+en = "Refresh"
+nb = "Oppdater"
+
+["overview.fleet.refresh_desc"]
+en = "Re-read peers.toml from disk and rebuild the paired-client list."
+nb = "Les peers.toml fra disk på nytt og bygg listen over parede klienter på nytt."
+
+["overview.fleet.no_match_prefix"]
+en = "No clients match"
+nb = "Ingen klienter samsvarer med"
+
+# --- Empty state ----------------------------------------------------------
+["overview.empty.title"]
+en = "No paired clients yet."
+nb = "Ingen parede klienter ennå."
+
+["overview.empty.title_desc"]
+en = "peers.toml lists no paired clients yet. Pair a Trireme client and it will appear here."
+nb = "peers.toml lister ingen parede klienter ennå. Par en Trireme-klient, så dukker den opp her."
+
+["overview.empty.prompt"]
+en = "Pair a Trireme client from the host with:"
+nb = "Par en Trireme-klient fra verten med:"
+
+["overview.empty.command"]
+en = "pharos-compositor pair"
+nb = "pharos-compositor pair"
+
+["overview.empty.command_desc"]
+en = "Run this command on the host, then enter the PIN it shows on the Trireme client to complete pairing."
+nb = "Kjør denne kommandoen på verten, og skriv deretter inn PIN-koden den viser på Trireme-klienten for å fullføre paringen."
+
+["overview.empty.hint"]
+en = "then enter the PIN on the client. Paired clients are stored in peers.toml and appear here."
+nb = "skriv deretter inn PIN-koden på klienten. Parede klienter lagres i peers.toml og dukker opp her."
+
+# --- Peer card ------------------------------------------------------------
+["overview.peer.name_desc"]
+en = "Display name for this paired client — its alias if one is set, otherwise a short fingerprint of its public key."
+nb = "Visningsnavn for denne parede klienten — aliaset dersom et er satt, ellers et kort fingeravtrykk av den offentlige nøkkelen."
+
+["overview.peer.fingerprint_desc"]
+en = "Short fingerprint of this client's Ed25519 public key. Hover to read the full key."
+nb = "Kort fingeravtrykk av denne klientens offentlige Ed25519-nøkkel. Hold pekeren over for å lese hele nøkkelen."
+
+["overview.peer.fingerprint_full_label"]
+en = "Ed25519 pubkey:"
+nb = "Ed25519 pubkey:"
+
+# Telemetry row labels.
+["overview.peer.row.address"]
+en = "Address"
+nb = "Adresse"
+
+["overview.peer.row.address_unknown_desc"]
+en = "Last-seen network address. No live transport telemetry is wired to the panel yet, so this is blank for known-but-not-probed clients."
+nb = "Sist sett nettverksadresse. Ingen levende transporttelemetri er koblet til panelet ennå, så dette er tomt for klienter som er kjent, men ikke sjekket."
+
+["overview.peer.row.encoder"]
+en = "Encoder"
+nb = "Enkoder"
+
+["overview.peer.row.encoder_unknown_desc"]
+en = "Encoder negotiated for this client's stream (telemetry — not yet reported to the panel)."
+nb = "Enkoder forhandlet frem for denne klientens strøm (telemetri — ikke rapportert til panelet ennå)."
+
+["overview.peer.row.decoder"]
+en = "Decoder"
+nb = "Dekoder"
+
+["overview.peer.row.decoder_unknown_desc"]
+en = "The video codec this client is decoding (HEVC / AV1), reported live while it's connected. The host can't see the client's exact decoder, so the codec is the honest stand-in. Blank when the client isn't streaming."
+nb = "Videokodeken denne klienten dekoder (HEVC / AV1), rapportert i sanntid mens den er tilkoblet. Verten kan ikke se klientens nøyaktige dekoder, så kodeken er den ærlige erstatningen. Tom når klienten ikke strømmer."
+
+["overview.peer.row.resolution"]
+en = "Resolution"
+nb = "Oppløsning"
+
+["overview.peer.row.resolution_unknown_desc"]
+en = "The stream resolution the host is encoding for this client, reported live while it's connected. Blank when the client isn't streaming."
+nb = "Strømmeoppløsningen verten enkoder for denne klienten, rapportert i sanntid mens den er tilkoblet. Tom når klienten ikke strømmer."
+
+["overview.peer.row.fps"]
+en = "FPS"
+nb = "FPS"
+
+["overview.peer.row.fps_unknown_desc"]
+en = "Negotiated frame rate (telemetry — not yet reported to the panel)."
+nb = "Forhandlet bildefrekvens (telemetri — ikke rapportert til panelet ennå)."
+
+["overview.peer.row.paired"]
+en = "Paired"
+nb = "Paret"
+
+["overview.peer.row.paired_unknown_desc"]
+en = "When this client first paired (from peers.toml)."
+nb = "Når denne klienten først ble paret (fra peers.toml)."
+
+["overview.peer.row.last_seen"]
+en = "Last seen"
+nb = "Sist sett"
+
+["overview.peer.row.last_seen_unknown_desc"]
+en = "Last successful connection (telemetry — not yet reported to the panel)."
+nb = "Siste vellykkede tilkobling (telemetri — ikke rapportert til panelet ennå)."
+
+# --- Liveness badge tooltips ----------------------------------------------
+["overview.liveness.online"]
+en = "Reachable / connected but idle."
+nb = "Tilgjengelig / tilkoblet, men inaktiv."
+
+["overview.liveness.streaming"]
+en = "Actively streaming right now."
+nb = "Strømmer aktivt akkurat nå."
+
+["overview.liveness.offline"]
+en = "Known client, not currently reachable."
+nb = "Kjent klient, ikke tilgjengelig for øyeblikket."
+
+["overview.liveness.unknown"]
+en = "Liveness unknown. peers.toml lists clients the host has paired with, but the panel has no live per-client telemetry yet — so we show \"Unknown\" rather than a guessed status."
+nb = "Tilstand ukjent. peers.toml lister klientene verten er paret med, men panelet har ennå ingen levende telemetri per klient — så vi viser \"Ukjent\" heller enn en gjettet status."
+
+# --- Status messages (refresh) --------------------------------------------
+["overview.status.reloaded_one"]
+en = "Reloaded 1 paired client"
+nb = "Lastet inn 1 paret klient på nytt"
+
+["overview.status.reloaded_many_prefix"]
+en = "Reloaded"
+nb = "Lastet inn"
+
+["overview.status.reloaded_many_suffix"]
+en = "paired clients"
+nb = "parede klienter på nytt"
+
+# --- Pairing card ---------------------------------------------------------
+["overview.pairing.heading"]
+en = "Pairing"
+nb = "Paring"
+
+["overview.pairing.heading_desc"]
+en = "Enroll a new Trireme device. Opens a short-lived PIN window on the host; enter the PIN on the device's Pair dialog to authorize it. Requires a running host."
+nb = "Registrer en ny Trireme-enhet. Åpner et kortvarig PIN-vindu på verten; skriv inn PIN-en i enhetens paringsdialog for å godkjenne den. Krever en kjørende vert."
+
+["overview.pairing.needs_host"]
+en = "Host not running"
+nb = "Vert kjører ikke"
+
+["overview.pairing.needs_host_desc"]
+en = "Pairing runs on the host. Launch the host below, then open the pairing window."
+nb = "Paring kjører på verten. Start verten nedenfor, og åpne deretter paringsvinduet."
+
+["overview.pairing.idle_title"]
+en = "Pair a new device"
+nb = "Par en ny enhet"
+
+["overview.pairing.idle_desc"]
+en = "Open a PIN window and authorize a Trireme client to connect."
+nb = "Åpne et PIN-vindu og godkjenn at en Trireme-klient kan koble til."
+
+["overview.pairing.start"]
+en = "Pair a new device"
+nb = "Par en ny enhet"
+
+["overview.pairing.start_desc"]
+en = "Bring up the host's pairing listener and generate a PIN to enter on the Trireme device."
+nb = "Start vertens paringslytter og generer en PIN som skrives inn på Trireme-enheten."
+
+["overview.pairing.enter_pin"]
+en = "Enter this PIN on the Trireme device"
+nb = "Skriv inn denne PIN-en på Trireme-enheten"
+
+["overview.pairing.pin_desc"]
+en = "The six-digit pairing PIN. It rotates after each device, so a guess can't be replayed. Enter it on the Trireme client's Pair dialog."
+nb = "Den sekssifrede paring-PIN-en. Den roterer etter hver enhet, så en gjetning kan ikke gjenbrukes. Skriv den inn i Trireme-klientens paringsdialog."
+
+["overview.pairing.listening_on"]
+en = "Listening on"
+nb = "Lytter på"
+
+["overview.pairing.waiting"]
+en = "Waiting for a device…"
+nb = "Venter på en enhet …"
+
+["overview.pairing.cancel"]
+en = "Cancel"
+nb = "Avbryt"
+
+["overview.pairing.cancel_desc"]
+en = "Close the pairing window and stop the listener."
+nb = "Lukk paringsvinduet og stopp lytteren."
+
+["overview.pairing.connecting"]
+en = "Device connecting from"
+nb = "Enhet kobler til fra"
+
+["overview.pairing.paired_badge"]
+en = "Paired"
+nb = "Paret"
+
+["overview.pairing.paired_with"]
+en = "Paired with"
+nb = "Paret med"
+
+["overview.pairing.failed_badge"]
+en = "Failed"
+nb = "Mislyktes"
+
+["overview.pairing.peer_added"]
+en = "New device paired — added to the fleet"
+nb = "Ny enhet paret — lagt til i flåten"
+
+# --- Host control row (launch / relaunch) ---------------------------------
+["overview.host.launch"]
+en = "Launch host"
+nb = "Start vert"
+
+["overview.host.launch_desc"]
+en = "Start a Pharos host process on this machine (pharos-compositor capture-zc-multi, or $PHAROS_HOST_CMD). The panel runs on the host, so this launches it locally."
+nb = "Start en Pharos-vertsprosess på denne maskinen (pharos-compositor capture-zc-multi, eller $PHAROS_HOST_CMD). Panelet kjører på verten, så dette starter den lokalt."
+
+["overview.host.launch_hint"]
+en = "No host is running."
+nb = "Ingen vert kjører."
+
+["overview.host.launching"]
+en = "Launching host…"
+nb = "Starter vert …"
+
+["overview.host.launch_error"]
+en = "Couldn't launch host:"
+nb = "Kunne ikke starte vert:"
+
+["overview.host.relaunch"]
+en = "Relaunch host"
+nb = "Start vert på nytt"
+
+["overview.host.stop"]
+en = "Stop"
+nb = "Stopp"
+
+["overview.host.stop_desc"]
+en = "Stop the running host and the USB/IP bridge. Any active stream ends; relaunch when you want it back."
+nb = "Stopp den kjørende verten og USB/IP-broen. En aktiv strøm avsluttes; start på nytt når du vil ha den tilbake."
+
+["overview.host.stopped"]
+en = "Host stopped."
+nb = "Vert stoppet."
+
+["overview.host.relaunch_desc"]
+en = "Restart the running host in place. Applies a changed layout/encoder config and recovers a wedged host. Briefly interrupts any active stream — the client reconnects on its own."
+nb = "Start den kjørende verten på nytt. Tar i bruk endret oppsett/enkoder-konfig og gjenoppretter en låst vert. Avbryter kort en aktiv strøm — klienten kobler til igjen selv."
+
+["overview.host.relaunch_hint"]
+en = "Restarts the host to apply config changes."
+nb = "Starter verten på nytt for å ta i bruk konfigurasjonsendringer."
+
+["overview.host.relaunching"]
+en = "Relaunching host…"
+nb = "Starter vert på nytt …"
+
+["overview.host.relaunch_confirm"]
+en = "Relaunch now? This interrupts the active stream."
+nb = "Starte på nytt nå? Dette avbryter den aktive strømmen."
+
+["overview.host.relaunch_confirm_yes"]
+en = "Relaunch"
+nb = "Start på nytt"
+
+["overview.host.relaunch_confirm_yes_desc"]
+en = "Confirm: restart the host now, interrupting the active stream."
+nb = "Bekreft: start verten på nytt nå, og avbryt den aktive strømmen."
+
+["overview.host.cancel_btn"]
+en = "Cancel"
+nb = "Avbryt"
+
+# --- Host control: launch debounce + version gate -------------------------
+["overview.host.launching_btn"]
+en = "Starting…"
+nb = "Starter …"
+
+["overview.host.relaunching_btn"]
+en = "Relaunching…"
+nb = "Starter på nytt …"
+
+["overview.host.launching_hint"]
+en = "Host is starting up — give it a moment."
+nb = "Verten starter opp — gi den et øyeblikk."
+
+["overview.host.too_old"]
+en = "Host too old for remote control"
+nb = "Vert for gammel for fjernstyring"
+
+["overview.host.too_old_hint"]
+en = "This host predates pairing/relaunch over the control socket. Restart it with a current pharos-compositor to enable them."
+nb = "Denne verten er eldre enn paring/omstart over kontrollsocketen. Start den på nytt med en oppdatert pharos-compositor for å aktivere dem."

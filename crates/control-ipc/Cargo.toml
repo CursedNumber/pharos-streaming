@@ -1,0 +1,18 @@
+[package]
+name = "control-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Control + telemetry protocol shared between the hosts (compositor server /
+# pharos-win) and the clients (panel + tray). A lean leaf: newline-delimited JSON
+# over a Unix socket (local Linux) or TCP (Windows / remote) — no tokio, no QUIC,
+# no host-core. Carries the wire types, both transports, the render-loop-free
+# serve_status server, AND the reconnecting `client` poller both panel and tray use.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = "1"
+dirs = "5"
+# Default port constants (ports::CONTROL) for the client's local TCP fallback.
+core-proto = { path = "../core-proto" }

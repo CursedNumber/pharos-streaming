@@ -1,0 +1,25 @@
+# Rust
+/target
+
+# Capture/stream test artifacts
+*.hevc
+*.mp4
+# …but the tiny embedded probe sample IS source (include_bytes!), keep it.
+!crates/media-decode/src/sample.hevc
+
+# Generated UniFFI bindings (reproducible from the Rust core)
+/client/shared/generated/
+
+# Android / Gradle
+/client/**/build/
+/client/.gradle/
+/client/local.properties
+/client/**/*.so
+
+# iOS (built on macOS)
+/client/iosApp/*.xcframework/
+
+# Editor / OS
+.idea/
+*.iml
+.DS_Store

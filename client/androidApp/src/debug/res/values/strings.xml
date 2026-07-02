@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug-variant resource override. The `debug` source set replaces matching
+     keys from src/main for the debug build type only, so the e2e test build is
+     labelled "Trireme Debug" in the launcher and is visually distinct from the
+     side-by-side release install (different applicationId, see build.gradle.kts). -->
+<resources>
+    <string name="app_name">Trireme Debug</string>
+</resources>

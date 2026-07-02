@@ -1,0 +1,451 @@
+# rust-i18n locale file (v2) for the Settings tab.
+# English is the default + fallback. Every user-facing string in
+# crates/pharos-panel/src/tabs/settings.rs is keyed here under the "settings.*"
+# namespace so keys never clash with another tab's strings. To add a language,
+# add its code (e.g. `"fr"`) alongside `en` under each key.
+#
+# Two keys this tab also reads — `settings.appearance.language` and
+# `settings.appearance.language_desc` — live in app.toml (owned there) and are
+# intentionally NOT redefined here to avoid duplicate-key collisions.
+#
+# Purely dynamic values (numbers, MAC addresses, file paths, the pairing
+# command) stay as Rust formatting — only the static labels and descriptions
+# around them live here.
+_version = 2
+
+# --- Page header ------------------------------------------------------------
+["settings.heading"]
+en = "Settings"
+nb = "Innstillinger"
+
+["settings.intro_desc"]
+en = "Appearance plus every knob the host owns: how it composes, encodes, and serves your displays, who may connect, which network interface it binds, Home Assistant / MQTT reporting, and where its configuration files live."
+nb = "Utseende pluss alle innstillingene verten styrer: hvordan den komponerer, enkoder og leverer skjermene dine, hvem som kan koble til, hvilket nettverkskort (NIC) den binder seg til, Home Assistant / MQTT-rapportering, og hvor konfigurasjonsfilene ligger."
+
+# --- Appearance -------------------------------------------------------------
+["settings.appearance.title"]
+en = "Appearance"
+nb = "Utseende"
+
+["settings.startup.title"]
+en = "Startup"
+nb = "Oppstart"
+
+["settings.startup.start_on_boot"]
+en = "Start Pharos on login"
+nb = "Start Pharos ved innlogging"
+
+["settings.startup.start_on_boot_desc"]
+en = "Launch the Pharos host (and tray) automatically when you log in, via a freedesktop autostart entry. Same toggle as the tray menu's 'Start on boot'."
+nb = "Start Pharos-verten (og systemkurv-ikonet) automatisk når du logger inn, via en freedesktop autostart-oppføring. Samme veksling som «Start ved oppstart» i systemkurv-menyen."
+
+["settings.appearance.desc"]
+en = "Theme and text size for this control panel — every change previews live; use Save runtime below to keep it."
+nb = "Tema og tekststørrelse for dette kontrollpanelet — hver endring forhåndsvises direkte; bruk Lagre kjøretid nedenfor for å beholde den."
+
+["settings.appearance.theme"]
+en = "Theme"
+nb = "Tema"
+
+["settings.appearance.text_size"]
+en = "Text size"
+nb = "Tekststørrelse"
+
+["settings.appearance.text_size_small_desc"]
+en = "Original compact size (the size shipped first)."
+nb = "Opprinnelig kompakt størrelse (størrelsen som ble levert først)."
+
+["settings.appearance.text_size_medium_desc"]
+en = "Default — about 18% larger; comfortable at a desk."
+nb = "Standard — omtrent 18 % større; behagelig ved et skrivebord."
+
+["settings.appearance.text_size_large_desc"]
+en = "Largest — about 40% larger, for couch / distance viewing."
+nb = "Størst — omtrent 40 % større, for visning fra sofa / på avstand."
+
+# --- Resolution / refresh policy --------------------------------------------
+["settings.resolution.title"]
+en = "Resolution policy"
+nb = "Oppløsningspolicy"
+
+["settings.resolution.desc"]
+en = "How the host fits the source desktop onto differently-sized client displays. This shapes the whole pipeline: it decides each client display's resolution and how the source is scaled to fit it."
+nb = "Hvordan verten tilpasser kildeskrivebordet til klientskjermer med ulik størrelse. Dette former hele kjeden: det avgjør oppløsningen til hver klientskjerm og hvordan kilden skaleres for å passe."
+
+["settings.resolution.scaling"]
+en = "Scaling"
+nb = "Skalering"
+
+["settings.resolution.refresh"]
+en = "Refresh"
+nb = "Oppdateringsfrekvens"
+
+["settings.resolution.recommended"]
+en = "RECOMMENDED"
+nb = "ANBEFALT"
+
+["settings.resolution.why_title"]
+en = "Why these defaults"
+nb = "Hvorfor disse standardene"
+
+["settings.resolution.why_body"]
+en = "• Native per display keeps every screen crisp at its own resolution — best for a heterogeneous mix (4K monitor + 1080p TV).\n• Lowest-common refresh shares one pacer across displays, so frames are emitted in lock-step and you get no cross-display tearing — the compositor only runs a single fps clock anyway."
+nb = "• Native per skjerm holder hver skjerm skarp i sin egen oppløsning — best for en blandet sammensetning (4K-skjerm + 1080p TV).\n• Laveste felles oppdateringsfrekvens deler én pacer på tvers av skjermene, slik at bilder sendes i takt og du får ingen riving mellom skjermer — Compositor kjører uansett bare én fps-klokke."
+
+# --- Streaming / encoding ---------------------------------------------------
+["settings.streaming.title"]
+en = "Streaming / encoding"
+nb = "Strømming / enkoding"
+
+["settings.streaming.desc"]
+en = "Low-latency tuning. These map onto the host's PHAROS_* environment variables."
+nb = "Justering for lav ventetid. Disse tilsvarer vertens PHAROS_*-miljøvariabler."
+
+["settings.streaming.bitrate"]
+en = "Bitrate"
+nb = "Bitrate"
+
+["settings.streaming.bitrate_label_desc"]
+en = "PHAROS_BITRATE_KBPS — target encoder bitrate."
+nb = "PHAROS_BITRATE_KBPS — ønsket bitrate for enkoder."
+
+["settings.streaming.bitrate_desc"]
+en = "Higher = sharper but more bandwidth + risk of backlog on slow links. 20000 (20 Mbit/s) is a good 1080p120 default."
+nb = "Høyere = skarpere, men mer båndbredde + risiko for opphopning på trege forbindelser. 20000 (20 Mbit/s) er en god standard for 1080p120."
+
+["settings.streaming.window"]
+en = "QUIC window"
+nb = "QUIC-vindu"
+
+["settings.streaming.window_label_desc"]
+en = "PHAROS_STREAM_WINDOW_KB — the latency-critical knob."
+nb = "PHAROS_STREAM_WINDOW_KB — den ventetidskritiske innstillingen."
+
+["settings.streaming.window_desc"]
+en = "QUIC flow-control window. Too large buffers ~seconds of video and adds lag; keep it small (256 KiB) for interactive use. This was the original ~2 s bottleneck."
+nb = "QUIC flytkontrollvindu. For stort bufrer ~sekunder med video og gir forsinkelse; hold det lite (256 KiB) for interaktiv bruk. Dette var den opprinnelige flaskehalsen på ~2 s."
+
+["settings.streaming.queue"]
+en = "Queue frames"
+nb = "Købilder"
+
+["settings.streaming.queue_label_desc"]
+en = "PHAROS_QUEUE_FRAMES — encoder queue depth."
+nb = "PHAROS_QUEUE_FRAMES — kødybde for enkoder."
+
+["settings.streaming.queue_desc"]
+en = "How many frames the encoder may buffer. Lower = lower latency but more prone to stutter under load; 8 is a sane balance."
+nb = "Hvor mange bilder enkoderen kan bufre. Lavere = lavere ventetid, men mer utsatt for hakking under belastning; 8 er en fornuftig balanse."
+
+["settings.streaming.encoder_tip"]
+en = "Tip: the encoder itself (NVENC / Quick Sync / AMF / software) is chosen on the Video tab."
+nb = "Tips: selve enkoderen (NVENC / Quick Sync / AMF / programvare) velges under Video-fanen."
+
+# --- Security ---------------------------------------------------------------
+["settings.security.title"]
+en = "Security"
+nb = "Sikkerhet"
+
+["settings.security.desc"]
+en = "Who may connect to this host, and how clients pair. Leave unpaired access off for normal use."
+nb = "Hvem som kan koble til denne verten, og hvordan klienter parer. La tilgang for uparede klienter være av ved normal bruk."
+
+["settings.security.allow_unpaired"]
+en = "Allow unpaired clients"
+nb = "Tillat uparede klienter"
+
+["settings.security.allow_unpaired_desc"]
+en = "PHAROS_ALLOW_UNPAIRED — accept clients that have not paired."
+nb = "PHAROS_ALLOW_UNPAIRED — godta klienter som ikke har paret."
+
+["settings.security.warning"]
+en = "Anyone who can reach this host can stream your desktop and inject input."
+nb = "Hvem som helst som kan nå denne verten, kan strømme skrivebordet ditt og sende inndata."
+
+["settings.security.warning_detail"]
+en = "Only enable on a trusted, isolated network (e.g. a lab LAN). Leave off for normal use."
+nb = "Slå kun på i et betrodd, isolert nettverk (f.eks. et lab-LAN). La være av ved normal bruk."
+
+["settings.security.pairing"]
+en = "Pairing"
+nb = "Paring"
+
+["settings.security.pairing_desc"]
+en = "Pairing is a one-time PAKE handshake. Run it from the host shell:"
+nb = "Paring er et engangs PAKE-håndtrykk. Kjør det fra vertens skall:"
+
+["settings.security.paired_listed"]
+en = "Paired clients are listed on the Status tab."
+nb = "Parede klienter er listet under Status-fanen."
+
+["settings.security.paired_listed_desc"]
+en = "Open the Status tab to see the clients paired with this host."
+nb = "Åpne Status-fanen for å se klientene som er paret med denne verten."
+
+# Session lifecycle (moved here from Streaming/encoding — it's a connection
+# timeout, not an encode parameter).
+["settings.security.client_wait"]
+en = "Client wait"
+nb = "Klientventing"
+
+["settings.security.client_wait_label_desc"]
+en = "How long the host holds the pipeline open waiting for a client."
+nb = "Hvor lenge verten holder kjeden åpen i påvente av en klient."
+
+["settings.security.client_wait_desc"]
+en = "Seconds the host waits for a client to (re)connect before tearing the session down."
+nb = "Antall sekunder verten venter på at en klient skal koble til (på nytt) før økten avsluttes."
+
+# --- Gamepad ----------------------------------------------------------------
+["settings.gamepad.title"]
+en = "Gamepad"
+nb = "Spillkontroller"
+
+["settings.gamepad.desc"]
+en = "The host-wide controller fallback. Per-controller overrides live on the Controllers tab and win when set."
+nb = "Reservevalget for kontrollere på hele verten. Overstyringer per kontroller ligger under Kontrollere-fanen og gjelder når de er satt."
+
+["settings.gamepad.fallback"]
+en = "Global fallback"
+nb = "Globalt reservevalg"
+
+["settings.gamepad.swap_face"]
+en = "Swap A/B face buttons (global fallback)"
+nb = "Bytt om A/B-knappene (globalt reservevalg)"
+
+["settings.gamepad.swap_face_desc"]
+en = "Swaps A↔B on the host's virtual pad for every controller that has no per-controller override. Nintendo-style pads label A/B (and X/Y) opposite to Xbox."
+nb = "Bytter A↔B på vertens virtuelle kontroller for alle kontrollere uten overstyring per kontroller. Nintendo-kontrollere merker A/B (og X/Y) motsatt av Xbox."
+
+# --- Network ----------------------------------------------------------------
+["settings.network.title"]
+en = "Network"
+nb = "Nettverk"
+
+["settings.network.desc"]
+en = "Pin the QUIC listener to one NIC by MAC, or leave blank to bind all interfaces. Saved with the Home Assistant / MQTT block (config.toml)."
+nb = "Fest QUIC-lytteren til ett nettverkskort (NIC) via MAC, eller la stå tomt for å binde alle grensesnitt. Lagres sammen med Home Assistant / MQTT-blokken (config.toml)."
+
+["settings.network.bind_mac"]
+en = "Bind MAC"
+nb = "Bind MAC"
+
+["settings.network.bind_mac_desc"]
+en = "[network] bind_mac — empty binds every interface."
+nb = "[network] bind_mac — tomt binder alle grensesnitt."
+
+["settings.network.all_interfaces"]
+en = "All interfaces"
+nb = "Alle grensesnitt"
+
+["settings.network.or_type"]
+en = "or type"
+nb = "eller skriv"
+
+["settings.network.or_type_desc"]
+en = "Free-text for a MAC not advertised by this host."
+nb = "Fritekst for en MAC som ikke annonseres av denne verten."
+
+["settings.network.mac_hint"]
+en = "aa:bb:cc:dd:ee:ff (blank = all)"
+nb = "aa:bb:cc:dd:ee:ff (tomt = alle)"
+
+["settings.network.no_nics"]
+en = "No NICs advertised by this host — type a MAC manually if you need pinning."
+nb = "Ingen nettverkskort (NIC) annonseres av denne verten — skriv inn en MAC manuelt hvis du trenger å feste den."
+
+["settings.network.mac_malformed"]
+en = "⚠ Not a valid MAC (expected aa:bb:cc:dd:ee:ff)."
+nb = "⚠ Ikke en gyldig MAC (forventet aa:bb:cc:dd:ee:ff)."
+
+["settings.network.mac_malformed_desc"]
+en = "This MAC is malformed, so the host can't pin its QUIC listener to a NIC — it would fail to bind on start. Use six colon-separated hex pairs, or clear the field to bind every interface."
+nb = "Denne MAC-en er feilformatert, så verten kan ikke feste QUIC-lytteren til et nettverkskort — den vil ikke kunne binde ved oppstart. Bruk seks kolon-separerte heksadesimale par, eller tøm feltet for å binde alle grensesnitt."
+
+# --- Home Assistant / MQTT --------------------------------------------------
+["settings.mqtt.title"]
+en = "Home Assistant / MQTT"
+nb = "Home Assistant / MQTT"
+
+["settings.mqtt.desc"]
+en = "Publish the host as a Home Assistant device (MQTT Discovery) for status + Wake-on-LAN."
+nb = "Publiser verten som en Home Assistant-enhet (MQTT Discovery) for status + Wake-on-LAN."
+
+["settings.mqtt.enable"]
+en = "Enable MQTT integration"
+nb = "Aktiver MQTT-integrasjon"
+
+["settings.mqtt.broker_host"]
+en = "Broker host"
+nb = "Megler-vert"
+
+["settings.mqtt.broker_host_desc"]
+en = "MQTT broker address (e.g. your HA Mosquitto)."
+nb = "Adresse til MQTT-megler (f.eks. din HA Mosquitto)."
+
+["settings.mqtt.port"]
+en = "Port"
+nb = "Port"
+
+["settings.mqtt.username"]
+en = "Username"
+nb = "Brukernavn"
+
+["settings.mqtt.username_desc"]
+en = "Optional — leave blank for an anonymous broker."
+nb = "Valgfritt — la stå tomt for en anonym megler."
+
+["settings.mqtt.password"]
+en = "Password"
+nb = "Passord"
+
+["settings.mqtt.password_desc"]
+en = "Stored in plain text in config.toml."
+nb = "Lagres i klartekst i config.toml."
+
+["settings.mqtt.optional_hint"]
+en = "(optional)"
+nb = "(valgfritt)"
+
+["settings.mqtt.node_id"]
+en = "Node id"
+nb = "Node-id"
+
+["settings.mqtt.node_id_desc"]
+en = "Unique id for this host in HA. Blank = derived from hostname."
+nb = "Unik id for denne verten i HA. Tomt = utledet fra vertsnavnet."
+
+["settings.mqtt.node_id_default_host"]
+en = "pharos-host"
+nb = "pharos-host"
+
+["settings.mqtt.discovery_prefix"]
+en = "Discovery prefix"
+nb = "Discovery-prefiks"
+
+["settings.mqtt.discovery_prefix_desc"]
+en = "HA's MQTT Discovery topic prefix — almost always \"homeassistant\"."
+nb = "HAs prefiks for MQTT Discovery-emner — nesten alltid \"homeassistant\"."
+
+["settings.mqtt.discovery_prefix_hint"]
+en = "homeassistant"
+nb = "homeassistant"
+
+["settings.mqtt.publish_interval"]
+en = "Publish interval"
+nb = "Publiseringsintervall"
+
+["settings.mqtt.publish_interval_desc"]
+en = "How often the host pushes its status to the broker."
+nb = "Hvor ofte verten sender statusen sin til megleren."
+
+["settings.mqtt.disabled_note"]
+en = "MQTT is off — the fields above are saved but inactive."
+nb = "MQTT er av — feltene ovenfor lagres, men er inaktive."
+
+# --- Paths ------------------------------------------------------------------
+["settings.paths.title"]
+en = "Paths"
+nb = "Stier"
+
+["settings.paths.desc"]
+en = "Where the panel reads and writes its configuration. Writes are atomic (temp file + rename), so a crash mid-save can't corrupt a config."
+nb = "Hvor panelet leser og skriver konfigurasjonen sin. Skriving er atomisk (midlertidig fil + omdøping), så et krasj midt i lagringen kan ikke ødelegge en konfigurasjon."
+
+["settings.paths.config_dir"]
+en = "Config dir"
+nb = "Konfigmappe"
+
+["settings.paths.config_dir_override"]
+en = "Override with the PHAROS_CONFIG_DIR environment variable."
+nb = "Overstyr med miljøvariabelen PHAROS_CONFIG_DIR."
+
+["settings.paths.files_title"]
+en = "Files the panel reads / writes"
+nb = "Filer panelet leser / skriver"
+
+["settings.paths.this_tab"]
+en = "this tab"
+nb = "denne fanen"
+
+["settings.paths.read_only"]
+en = "read-only here"
+nb = "skrivebeskyttet her"
+
+["settings.paths.file_config_desc"]
+en = "MQTT + network bind — this tab"
+nb = "MQTT + nettverksbinding — denne fanen"
+
+["settings.paths.file_panel_desc"]
+en = "runtime tuning + input mirror — this tab + Input"
+nb = "kjøretidsjustering + inndataspeiling — denne fanen + Inndata"
+
+["settings.paths.file_peers_desc"]
+en = "paired clients (shared with the host)"
+nb = "parede klienter (delt med verten)"
+
+["settings.paths.file_profiles_desc"]
+en = "per-controller feel — Controllers tab"
+nb = "følelse per kontroller — Kontrollere-fanen"
+
+["settings.paths.file_multi_desc"]
+en = "compositor virtual-display layout — Compositor tab"
+nb = "virtuell-skjerm-oppsett for Compositor — Compositor-fanen"
+
+# --- Save bar ---------------------------------------------------------------
+["settings.save.host"]
+en = "Save host config"
+nb = "Lagre vertskonfigurasjon"
+
+["settings.save.host_desc"]
+en = "Write MQTT + network settings to config.toml."
+nb = "Skriv MQTT- + nettverksinnstillinger til config.toml."
+
+["settings.save.runtime"]
+en = "Save runtime"
+nb = "Lagre kjøretid"
+
+["settings.save.runtime_desc"]
+en = "Write policy + streaming tuning to panel.toml."
+nb = "Skriv policy + strømmejustering til panel.toml."
+
+["settings.save.all"]
+en = "Save all changes"
+nb = "Lagre alle endringer"
+
+["settings.save.all_desc"]
+en = "Persist every unsaved Settings change."
+nb = "Lagre alle ulagrede endringer i Innstillinger."
+
+["settings.save.unsaved"]
+en = "● unsaved"
+nb = "● ulagret"
+
+["settings.save.saved"]
+en = "✓ saved"
+nb = "✓ lagret"
+
+# --- Status / error notes ---------------------------------------------------
+["settings.status.saved_host"]
+en = "Saved host config (config.toml)."
+nb = "Lagret vertskonfigurasjon (config.toml)."
+
+["settings.status.saved_runtime"]
+en = "Saved runtime settings (panel.toml)."
+nb = "Lagret kjøretidsinnstillinger (panel.toml)."
+
+["settings.status.saved_all"]
+en = "Saved all Settings changes."
+nb = "Lagret alle endringer i Innstillinger."
+
+["settings.error.save_config"]
+en = "save config.toml"
+nb = "lagre config.toml"
+
+["settings.error.save_panel"]
+en = "save panel.toml"
+nb = "lagre panel.toml"
+
+["settings.error.save_failed"]
+en = "save failed"
+nb = "lagring mislyktes"

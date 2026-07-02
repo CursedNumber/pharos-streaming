@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Hold a low-latency WiFi lock during USB export so power-save doesn't
+         park the radio and spike the input round-trip. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Keep forwarding enrolled USB devices to the host from a foreground
+         service, so it survives leaving the export screen / runs while streaming. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- A TV has no touchscreen; don't let that gate installation. -->
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <!-- USB host (OTG) so Trireme can export attached USB devices to Pharos. -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+
+    <application
+        android:name=".stream.TriremeApp"
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:banner="@drawable/trireme_banner"
+        android:theme="@style/Theme.Trireme"
+        android:supportsRtl="true"
+        android:enableOnBackInvokedCallback="true">
+        <!-- The shell IS the launcher: a single full-screen immersive activity that
+             hosts the live stream + the navbar (Stream / Hosts / Apps / Settings).
+             The old ServerSelectorActivity is gone; its host picker became the Hosts
+             pane. LEANBACK_LAUNCHER keeps the TV launcher entry, using the banner. -->
+        <!-- `keyboard|navigation` in configChanges are ESSENTIAL: a game controller is
+             a keyboard/navigation-class input device, so plugging/unplugging it (or a
+             wireless pad sleeping/waking) fires a config change. Without them, Android
+             DESTROYS + recreates MainActivity on every controller on/off — tearing down
+             the live stream (black frames + audio drop) and nulling StreamHub's
+             ControllerManager, which kills gamepad forwarding to the game while the UI
+             still reads the pad. Declaring them keeps the Activity, stream, and input
+             path alive across controller events. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:banner="@drawable/trireme_banner"
+            android:screenOrientation="fullUser"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|smallestScreenSize|screenLayout|uiMode|density">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- The USB_DEVICE_ATTACHED handler, scoped to res/xml/device_filter (the
+             enrolled controllers only — never the TV remote). Being the handler is what
+             makes Android offer "use by default" when this visible screen requests
+             permission for a device — the only route to a persistent grant on this TV.
+             NOT a launcher: it has no MAIN/LAUNCHER/LEANBACK filter, so the TV launcher
+             shows ONE Trireme tile (MainActivity) — two leanback entries made the
+             package launch ambiguous (→ ResolverActivity), which is why Projectivy
+             couldn't open the app. It's still reached from Settings → USB export (by
+             component) and auto-surfaced on a device plug. -->
+        <activity
+            android:name=".UsbExportActivity"
+            android:exported="true"
+            android:label="Trireme USB"
+            android:theme="@style/Theme.Trireme">
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/device_filter" />
+        </activity>
+
+        <!-- Forwards enrolled USB devices to the host; auto-started at app launch
+             so controllers reconnect without opening the USB screen. -->
+        <service
+            android:name=".UsbExportService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+    </application>
+</manifest>

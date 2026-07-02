@@ -1,0 +1,15 @@
+[package]
+name = "pharos-assets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Shared Pharos branding: the lighthouse logo art (one source) + a tiny SVG→RGBA
+# rasterizer. The tray, the compositor's idle screen, and any future surface
+# render the SAME mark from here instead of each embedding/rasterizing its own.
+
+[dependencies]
+anyhow = "1"
+usvg = "0.45"
+resvg = "0.45"
+tiny-skia = "0.11"

@@ -1,0 +1,86 @@
+# Audio tab (stub). English default + fallback.
+_version = 2
+
+["audio.heading"]
+en = "Audio"
+nb = "Lyd"
+
+["audio.intro"]
+en = "Host audio capture and streaming."
+nb = "Lydfangst og strømming på verten."
+
+["audio.intro_desc"]
+en = "Settings for the host's audio path — the desktop/loopback audio it captures and streams to clients. Not configurable from the panel yet; this tab outlines what's coming."
+nb = "Innstillinger for vertens lydbane — skrivebords-/loopback-lyden den fanger og strømmer til klienter. Kan ikke konfigureres fra panelet ennå; denne fanen skisserer hva som kommer."
+
+["audio.status_heading"]
+en = "Audio path"
+nb = "Lydbane"
+
+["audio.coming_soon"]
+en = "Coming soon — not configurable yet"
+nb = "Kommer snart — kan ikke konfigureres ennå"
+
+["audio.current_path"]
+en = "Today the host captures system audio and streams it as Opus over QUIC datagrams, alongside video; there are no panel controls for it yet."
+nb = "I dag fanger verten systemlyden og strømmer den som Opus over QUIC-datagrammer, sammen med video; det finnes ingen panelkontroller for det ennå."
+
+["audio.current_path_desc"]
+en = "The Opus audio path (48 kHz stereo, low-latency) is wired in the host and runs automatically during a stream. This tab will surface its controls once they're exposed to the config."
+nb = "Opus-lydbanen (48 kHz stereo, lav latens) er koblet inn i verten og kjører automatisk under en strøm. Denne fanen vil vise kontrollene når de blir tilgjengelige i konfigurasjonen."
+
+["audio.see_video"]
+en = "See the live Opus codec status on the Video tab →"
+nb = "Se sanntidsstatus for Opus-kodeken på Video-fanen →"
+
+["audio.see_video_desc"]
+en = "The encode → transport → decode pipeline (including the live Opus audio codec and its performance rank) is shown on the Video tab. Click to open it."
+nb = "Pipelinen enkode → transport → dekode (inkludert den aktive Opus-lydkodeken og dens ytelsesrangering) vises på Video-fanen. Klikk for å åpne den."
+
+["audio.planned_heading"]
+en = "Planned controls"
+nb = "Planlagte kontroller"
+
+["audio.planned_heading_desc"]
+en = "What this tab is expected to expose in a future revision."
+nb = "Hva denne fanen forventes å tilby i en fremtidig revisjon."
+
+["audio.plan.device"]
+en = "Capture device / source"
+nb = "Fangstenhet / kilde"
+
+["audio.plan.device_desc"]
+en = "Pick which output (sink monitor / loopback) the host captures — useful when multiple audio devices are present."
+nb = "Velg hvilken utgang (sink monitor / loopback) verten fanger — nyttig når flere lydenheter er til stede."
+
+["audio.plan.codec"]
+en = "Codec & quality"
+nb = "Kodek og kvalitet"
+
+["audio.plan.codec_desc"]
+en = "Opus is the codec today; this would expose sample rate / frame size and any future codec choices."
+nb = "Opus er kodeken i dag; dette ville gitt tilgang til samplingsfrekvens / rammestørrelse og eventuelle fremtidige kodekvalg."
+
+["audio.plan.bitrate"]
+en = "Bitrate"
+nb = "Bitrate"
+
+["audio.plan.bitrate_desc"]
+en = "Target Opus bitrate (kbit/s) — trade audio quality against bandwidth."
+nb = "Mål-bitrate for Opus (kbit/s) — avvei lydkvalitet mot båndbredde."
+
+["audio.plan.mute"]
+en = "Mute / enable"
+nb = "Demp / aktiver"
+
+["audio.plan.mute_desc"]
+en = "Toggle host audio streaming on or off without stopping the video stream."
+nb = "Slå lydstrømming fra verten på eller av uten å stoppe videostrømmen."
+
+["audio.plan.routing"]
+en = "Per-client routing"
+nb = "Ruting per klient"
+
+["audio.plan.routing_desc"]
+en = "Which clients receive audio when several are connected (once multi-client streaming lands)."
+nb = "Hvilke klienter som mottar lyd når flere er tilkoblet (når strømming til flere klienter kommer)."

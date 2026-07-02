@@ -1,0 +1,38 @@
+# Pharos multi-output capture config — vestigial open door.
+#
+#   pharos-compositor capture-zc-multi multi.example.toml
+#
+# One compositor, one Wayland socket, one shared GLES renderer + CUDA context,
+# and N independent NVENC sessions + QUIC streamers. Each output is its own
+# virtual monitor in the same `Space`, mapped at `(x, y)` with size `w × h`.
+#
+# Notes:
+#  * Consumer NVIDIA GPUs cap concurrent NVENC sessions at ~3 — keep N small.
+#  * Outputs default to overlapping at (0,0), which means every output sees the
+#    same composited windows (useful for "same view to N clients"). Configure
+#    distinct x offsets to make each output its own region; current
+#    XdgShellHandler maps every new window at (0,0), so put a window on the
+#    right output by setting that output's (x,y) to (0,0) or by extending the
+#    shell handler (future work — the door is open, not yet walked through).
+#  * `addr = "quic://host:port"` streams over QUIC; anything else writes the
+#    raw HEVC elementary stream to that path.
+
+fps = 60
+frames = 1200            # 0 = unlimited (run until killed)
+launch = "alacritty"     # optional client launched into the compositor socket
+
+[[output]]
+name = "left"
+w = 1920
+h = 1080
+x = 0
+y = 0
+addr = "quic://0.0.0.0:15777"
+
+[[output]]
+name = "right"
+w = 1920
+h = 1080
+x = 0
+y = 0
+addr = "quic://0.0.0.0:15779"

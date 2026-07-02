@@ -1,0 +1,29 @@
+[package]
+name = "app-launcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The Pharos application launcher — a lean, pure-Rust leaf shared by every part
+# that touches "apps": the Smithay `compositor` (which actually spawns the child
+# into the virtual display), `pharos-panel` (the visual Create-app editor + easy
+# mode), the `launch-app` CLI verb, and the host's relay of the app catalog to
+# Trireme clients.
+#
+# Deliberately dependency-light — NO tokio/QUIC/Smithay/image — so the
+# cross-platform panel can depend on it without dragging in the host stack
+# (mirrors the `host-info` / `control-ipc` "lean leaf" rule). Steam/desktop
+# scanning is hand-rolled (a tolerant KeyValues reader) rather than pulling an
+# external, version-fragile crate, so this builds clean on Linux, Windows, and
+# ARM with the same five deps.
+
+[dependencies]
+serde = { workspace = true }
+toml = "0.8"
+dirs = "5"
+anyhow = "1"
+thiserror = { workspace = true }
+tracing = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"

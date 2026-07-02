@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Hosts pane strings (host picker migrated from the old ServerSelector). Owned by
+  the Navbar agent (contract C). Common verbs (cancel/save/connect/back) live in
+  the asset agent's strings.xml; only host-specific copy lives here.
+-->
+<resources>
+    <string name="hosts_title">Hosts</string>
+    <string name="hosts_subtitle">Connect to a Pharos host. The active host feeds the stream.</string>
+
+    <!-- Empty state. -->
+    <string name="hosts_empty_title">No hosts remembered yet.</string>
+    <string name="hosts_empty_hint">Press Add to enroll a Pharos host.</string>
+
+    <!-- Row actions / controls. -->
+    <string name="hosts_add">Add host</string>
+    <string name="hosts_add_desc">Add a Pharos host</string>
+    <string name="hosts_edit">Edit</string>
+    <string name="hosts_delete">Delete</string>
+    <string name="hosts_pair">Pair…</string>
+    <string name="hosts_repair">Re-pair…</string>
+    <string name="hosts_connect">Connect</string>
+    <string name="hosts_disconnect">Disconnect</string>
+    <string name="hosts_set_active">Make active</string>
+    <string name="hosts_more">More actions</string>
+    <string name="hosts_more_desc">More actions for %1$s</string>
+
+    <!-- Pairing badge. -->
+    <string name="hosts_paired">Paired</string>
+    <string name="hosts_unpaired">Unpaired</string>
+
+    <!-- Live connection-status badges (spoken via a polite live region). -->
+    <string name="hosts_status_connecting">Connecting…</string>
+    <string name="hosts_status_live">Live</string>
+    <string name="hosts_status_reconnecting">Reconnecting…</string>
+    <string name="hosts_status_failed">Failed</string>
+    <string name="hosts_status_disconnected">Not connected</string>
+    <!-- Yielded the single streaming slot to another device; re-select to reclaim. -->
+    <string name="hosts_status_preempted">Another device active</string>
+    <!-- The active host carries the stream — flagged in the row. -->
+    <string name="hosts_status_active">Active</string>
+    <!-- Combined status announcement for the live region, e.g. "homepc: Live". -->
+    <string name="hosts_status_announce">%1$s: %2$s</string>
+
+    <!-- Add/Edit dialog (copied from ServerSelectorActivity, themed). -->
+    <string name="hosts_dialog_add_title">Add host</string>
+    <string name="hosts_dialog_edit_title">Edit host</string>
+    <string name="hosts_field_host">Host (LAN)</string>
+    <string name="hosts_field_port">Port</string>
+    <string name="hosts_field_alias">Alias (optional)</string>
+    <string name="hosts_field_external_host">External address / WAN (optional)</string>
+    <string name="hosts_field_external_port">External port (optional, defaults to Port)</string>
+    <string name="hosts_dialog_add_confirm">Add</string>
+
+    <!-- Delete confirmation. -->
+    <string name="hosts_delete_title">Delete host?</string>
+    <string name="hosts_delete_body">Forget “%1$s”?</string>
+
+    <!-- Pair dialog. -->
+    <string name="hosts_pair_title">Pair with %1$s</string>
+    <string name="hosts_pair_hint">Run `pharos-compositor pair` on the host to see the PIN.</string>
+    <string name="hosts_pair_pin_label">PIN (6 digits)</string>
+    <string name="hosts_pair_running">Running SPAKE2 handshake…</string>
+    <string name="hosts_pair_ok">Paired ✓  (%1$s…)</string>
+    <string name="hosts_pair_failed">Failed: %1$s</string>
+    <string name="hosts_pair_start">Start</string>
+    <string name="hosts_pair_close">Close</string>
+
+    <!-- Discovered (mDNS auto-discovery) section. -->
+    <string name="hosts_discovered_title">Discovered on your network</string>
+    <string name="hosts_discovered_badge">Discovered</string>
+    <!-- Content description / action: tap a discovered host to add + pair it. -->
+    <string name="hosts_discovered_desc">%1$s — add and pair</string>
+
+    <!-- pairErrorMessage() mappings (one per PairException variant). -->
+    <string name="pair_err_pin_mismatch">PIN didn’t match</string>
+    <string name="pair_err_host_aborted">Host aborted: %1$s</string>
+    <string name="pair_err_network">Network: %1$s</string>
+    <string name="pair_err_protocol">Protocol: %1$s</string>
+    <string name="pair_err_bad_address">Bad address: %1$s</string>
+    <string name="pair_err_identity">Identity: %1$s</string>
+    <string name="pair_err_unknown">unknown error</string>
+</resources>

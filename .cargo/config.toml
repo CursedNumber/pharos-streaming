@@ -1,0 +1,5 @@
+# cudarc's build script doesn't recognize CUDA toolkit 13.x yet; pin the binding
+# set to 12.8 (the CUDA driver API is backward-compatible, and cudarc loads
+# libcuda dynamically at runtime). Needed for the zero-copy NVENC path.
+[env]
+CUDARC_CUDA_VERSION = "12080"

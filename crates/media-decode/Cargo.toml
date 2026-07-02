@@ -1,0 +1,16 @@
+[package]
+name = "media-decode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# HEVC hardware-decoder capability probe. Picks the best ffmpeg HW decoder for
+# the box at runtime (NVDEC / Quick Sync / Rockchip MPP / V4L2 stateless / …)
+# and exposes the per-method capability list a settings UI can grey-out from.
+# Pure std + a child `ffmpeg` (no media libs linked).
+
+[dependencies]
+anyhow = "1"
+tracing = "0.1"
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

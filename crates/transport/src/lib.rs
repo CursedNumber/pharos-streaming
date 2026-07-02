@@ -1,0 +1,4258 @@
+//! QUIC transport (quinn) for Pharos → Trireme.
+//!
+//! #2 step 1: prove the encoded HEVC bitstream round-trips over QUIC. The host
+//! streams NAL units over a unidirectional stream; the client reassembles them.
+//! Host↔compositor wiring (an mpsc of encoded frames) and the Android client
+//! follow.
+
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use anyhow::Result;
+use quinn::crypto::rustls::QuicClientConfig;
+use quinn::{ClientConfig, Endpoint, ServerConfig};
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use tokio::sync::mpsc;
+
+/// The single deliberate Pharos connect/stream port — the one port a user ever
+/// sees, enters, or port-forwards. Chosen mid-range (≈ the 4433↔27000 midpoint),
+/// in a quiet IANA gap, clear of QUIC-dev 4433, Steam 27015+, and Sunshine
+/// 47984+. Pairing (4432) + USB/IP import (4434) stay on their own hidden ports.
+pub const PHAROS_STREAM_PORT: u16 = 15777;
+
+/// Sibling ports an auto-failover bind must never steal (pairing + USB/IP import).
+const RESERVED_PORTS: &[u16] = &[4432, 4434];
+
+/// QUIC application close code the host sends when a NEW client PRE-EMPTS the
+/// current one (single streaming slot). Distinct from the plain `0` used by the
+/// done/auth closes so the *losing* client can tell "another device took the
+/// slot" apart from an ordinary drop and YIELD (stop auto-redialing) instead of
+/// instantly reconnecting — otherwise two connected clients ping-pong forever,
+/// each pre-empting the other. The client matches this exact code; the reason
+/// bytes are advisory.
+pub const PREEMPT_CLOSE_CODE: u32 = 0x9;
+
+/// Scan upward from `base`+1 for a free UDP port to host a QUIC server on,
+/// skipping [`RESERVED_PORTS`]. Last-resort when the configured port is durably
+/// taken by another service — better than failing the output or hanging forever.
+fn bind_free_from(base: SocketAddr) -> Option<(Endpoint, SocketAddr)> {
+    let mut p = base.port();
+    for _ in 0..64 {
+        p = p.wrapping_add(1);
+        if p == 0 || RESERVED_PORTS.contains(&p) {
+            continue;
+        }
+        let cand = SocketAddr::new(base.ip(), p);
+        if let Ok(cfg) = server_config() {
+            if let Ok(ep) = Endpoint::server(cfg, cand) {
+                return Some((ep, cand));
+            }
+        }
+    }
+    None
+}
+
+/// A self-signed server config + the cert (for loopback / pinning).
+fn server_config() -> Result<ServerConfig> {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
+    let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+    let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    let mut cfg = ServerConfig::with_single_cert(vec![cert_der], key.into())?;
+    cfg.transport_config(transport_config()?);
+    Ok(cfg)
+}
+
+/// Shared QUIC transport tuning for both ends.
+///
+/// **Idle timeout = 20s.** QUIC identifies a connection by its connection ID, not
+/// the UDP 4-tuple, so when a peer's address changes — a client roaming
+/// WiFi↔Ethernet, a DHCP renew, NAT rebinding, or the dual-homed `.201` host —
+/// the connection *migrates* to the new path instead of dropping, **as long as the
+/// gap stays under the idle timeout**. 5s (the old value) was too tight to ride
+/// out a NIC switch (link-down + DHCP can take several seconds); 20s gives margin.
+/// The client binds a wildcard socket (`0.0.0.0:0`) so the OS silently moves egress
+/// to the new interface on a route change — no app action needed — and the server
+/// validates the new path (quinn allows address migration by default).
+///
+/// Trade-off: an *ungracefully* dropped client (crash / cable yank, no close) is
+/// now detected in ~20s rather than ~5s, so the multi-shot accept loop frees up for
+/// the next client that much later. Keep-alive pings (2s) refresh the idle timer
+/// during quiet video so a stalled-but-alive peer isn't reaped.
+fn transport_config() -> Result<Arc<quinn::TransportConfig>> {
+    let mut t = quinn::TransportConfig::default();
+    t.max_idle_timeout(Some(quinn::IdleTimeout::try_from(
+        std::time::Duration::from_secs(20),
+    )?));
+    t.keep_alive_interval(Some(std::time::Duration::from_secs(2)));
+    // Bound the QUIC flow-control windows. quinn's default per-stream receive
+    // window (~1.25MB) lets the sender buffer ~1-2s of encoded video before
+    // flow-control blocks it — a fixed *byte* buffer, so a LOWER bitrate makes the
+    // latency WORSE in seconds (window/bitrate). Capping the window bounds the
+    // in-flight+buffered video to ~window/bitrate. PHAROS_STREAM_WINDOW_KB tunes it
+    // (default 256KB ≈ 200ms @10Mbps; lower = less latency, less jitter tolerance).
+    // The window must comfortably exceed the bandwidth-delay product (~75KB at
+    // 20Mbps over WiFi) or throughput throttles.
+    let win_kb: u32 = std::env::var("PHAROS_STREAM_WINDOW_KB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&k| k > 0)
+        .unwrap_or(256);
+    let win_bytes = win_kb.saturating_mul(1024);
+    let win = quinn::VarInt::from_u32(win_bytes);
+    t.stream_receive_window(win);
+    t.receive_window(win);
+    t.send_window(u64::from(win_bytes));
+    tracing::info!("QUIC flow-control window: {win_kb} KB (PHAROS_STREAM_WINDOW_KB to tune)");
+    Ok(Arc::new(t))
+}
+
+/// Insecure verifier — accepts any server cert. Loopback/testing only; the real
+/// client pins Pharos's long-term identity (see core-crypto pairing).
+#[derive(Debug)]
+struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+fn client_config() -> Result<ClientConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(rustls::DEFAULT_VERSIONS)?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(SkipServerVerification(provider)))
+        .with_no_client_auth();
+    let mut cfg = ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?));
+    // Same idle/keep-alive as the server so the negotiated timeout is long enough
+    // for the client to survive its own NIC/IP changes (connection migration).
+    cfg.transport_config(transport_config()?);
+    Ok(cfg)
+}
+
+/// Split a `host:port` (or `[v6]:port`) string into its host and port parts.
+fn split_host_port(s: &str) -> Option<(&str, u16)> {
+    if let Some(rest) = s.strip_prefix('[') {
+        // Bracketed IPv6 literal: `[::1]:4433`.
+        let (h, p) = rest.split_once("]:")?;
+        Some((h, p.parse().ok()?))
+    } else {
+        let (h, p) = s.rsplit_once(':')?;
+        Some((h, p.parse().ok()?))
+    }
+}
+
+/// Resolve a `host:port` string to a `SocketAddr`, **IDNA-aware**.
+///
+/// Plain `to_socket_addrs()` / `addr.parse::<SocketAddr>()` hand the host to the
+/// OS resolver unchanged, and `getaddrinfo` does NOT do IDNA — so a Unicode
+/// domain like `bücher.example` never resolves (and `parse` rejects *any* non-IP host
+/// outright). We split off the port, run the host through IDNA ToASCII
+/// (`bücher.example` → `xn--bcher-kva.example`) unless it is already an IP literal, then
+/// resolve. IP literals and plain-ASCII names pass straight through.
+pub fn resolve_addr(addr: &str) -> std::io::Result<SocketAddr> {
+    use std::io::{Error, ErrorKind};
+    let (host, port) = split_host_port(addr)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, format!("no host:port in `{addr}`")))?;
+    // IP literals (incl. bracketed IPv6) must skip IDNA — feed them as-is.
+    let host_ascii = if host.parse::<std::net::IpAddr>().is_ok() {
+        host.to_string()
+    } else {
+        idna::domain_to_ascii(host)
+            .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("idna `{host}`: {e}")))?
+    };
+    (host_ascii.as_str(), port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("no addresses for `{addr}`")))
+}
+
+/// Resolve each `host:port` candidate (IDNA-aware), preserving order and
+/// dropping duplicates + any that fail to resolve. Unreachable-name warnings are
+/// logged, not fatal — the surviving candidates are what [`connect_first`] races.
+pub fn resolve_candidates(addrs: &[String]) -> Vec<SocketAddr> {
+    let mut out = Vec::new();
+    for a in addrs {
+        match resolve_addr(a) {
+            Ok(sa) if !out.contains(&sa) => out.push(sa),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("resolve `{a}`: {e}"),
+        }
+    }
+    out
+}
+
+/// Connect to the first reachable candidate, trying each in order with a short
+/// per-attempt timeout. This is where **LAN-first / WAN-fallback** lives: the
+/// caller passes `[lan, wan]` and an unreachable LAN address fails fast (the
+/// timeout) before WAN is tried. The TLS server-name is irrelevant here
+/// ([`SkipServerVerification`] — trust is the Ed25519 channel binding), so we
+/// pass a fixed `"localhost"`.
+async fn connect_first(endpoint: &Endpoint, addrs: &[SocketAddr]) -> Result<quinn::Connection> {
+    use std::time::Duration;
+    const PER_ATTEMPT: Duration = Duration::from_secs(4);
+    let mut last_err: Option<anyhow::Error> = None;
+    for (i, addr) in addrs.iter().enumerate() {
+        let attempt = async {
+            let conn = endpoint.connect(*addr, "localhost")?.await?;
+            Ok::<_, anyhow::Error>(conn)
+        };
+        match tokio::time::timeout(PER_ATTEMPT, attempt).await {
+            Ok(Ok(conn)) => {
+                if i > 0 {
+                    tracing::info!("connected to fallback candidate {addr} (#{i})");
+                }
+                return Ok(conn);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("connect {addr}: {e}");
+                last_err = Some(e);
+            }
+            Err(_) => {
+                tracing::warn!("connect {addr}: timed out after {PER_ATTEMPT:?}");
+                last_err = Some(anyhow::anyhow!("connect {addr}: timed out"));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no candidate addresses to connect")))
+}
+
+/// Send `data` from an in-process QUIC server to a QUIC client over a uni stream
+/// and return what the client received. Proves the transport end to end.
+pub fn quic_loopback(data: Vec<u8>) -> Result<Vec<u8>> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    rt.block_on(async move {
+        let server = Endpoint::server(server_config()?, (Ipv4Addr::LOCALHOST, 0).into())?;
+        let addr: SocketAddr = server.local_addr()?;
+
+        let payload = data.clone();
+        let server_task = tokio::spawn(async move {
+            let incoming = server
+                .accept()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("no incoming connection"))?;
+            let conn = incoming.await?;
+            let mut send = conn.open_uni().await?;
+            send.write_all(&payload).await?;
+            send.finish()?;
+            conn.closed().await;
+            anyhow::Ok(())
+        });
+
+        let mut client = Endpoint::client((Ipv4Addr::LOCALHOST, 0).into())?;
+        client.set_default_client_config(client_config()?);
+        let conn = client.connect(addr, "localhost")?.await?;
+        let mut recv = conn.accept_uni().await?;
+        let received = recv.read_to_end(64 * 1024 * 1024).await?;
+        conn.close(0u32.into(), b"done");
+
+        let _ = server_task.await;
+        Ok(received)
+    })
+}
+
+/// Domain-separated label fed to QUIC's TLS exporter so client and host
+/// derive the same 32-byte value over the same TLS leg. A relay attacker
+/// terminating TLS on each side computes different values, so the host's
+/// signature won't verify on the client.
+const VIDEO_AUTH_EXPORTER_LABEL: &[u8] = b"trireme-video-auth-v1 exporter";
+
+/// 4-byte magic that a v2+ client writes BEFORE its 32-byte auth nonce so the
+/// host can detect "this client speaks the extended handshake" without breaking
+/// the v1 wire shape (which began with the raw nonce). The host reads the first
+/// 4 bytes: if they match `AUTH_PROTO_MAGIC`, it's v2; otherwise treat those 4
+/// bytes as the first 4 bytes of the v1 nonce.
+///
+/// The collision risk — a v1 client's random nonce starting with this exact
+/// 32-bit value — is 1/2^32 (≈ 2.3e-10). On a false positive the v1 client's
+/// handshake fails and the user reconnects; no security impact (the auth
+/// signatures still bind to the full TLS exporter).
+///
+/// The byte sequence is deliberately invalid as the first 4 bytes of an
+/// Ed25519 public key context, but the auth-stream uses raw bytes anyway.
+const AUTH_PROTO_MAGIC: [u8; 4] = [0x54, 0x52, 0x21, 0x02]; // "TR!\x02"
+
+/// Wire-version selected after the magic match. Increment when the handshake
+/// extension shape changes. v2 = magic + version + nonce + pubkey + wants_gyro
+/// byte. v3 appends a 12-byte `StreamMode` block (client→host requested
+/// width/height/refresh_mhz). The host accepts BOTH v2 and v3 (an older v2
+/// client just gets no per-client mode); host→client side is unchanged.
+const AUTH_PROTO_VERSION: u32 = 4;
+/// Oldest client wire version this host still accepts (kept for the v2 clients
+/// — older phone/MiBox APKs — that don't send a `StreamMode` block).
+const AUTH_PROTO_VERSION_MIN: u32 = 2;
+
+/// Decides whether a connecting client may receive the stream. It's handed the
+/// client's *verified* long-term pubkey (`Some` once the client has proven it
+/// holds that Ed25519 key over the per-connection challenge), or `None` for an
+/// anonymous client that presented no identity. Return `true` to admit.
+///
+/// Trust lives in the identity layer: the QUIC TLS cert is a throwaway, opaque
+/// tunnel (see [`SkipServerVerification`]) — never a trust anchor — so this
+/// hook, not certificate validation, is the host's gate on who may connect.
+/// Host binaries build it from their paired-peers list.
+pub type ClientAuthorizer = Arc<dyn Fn(Option<[u8; 32]>) -> bool + Send + Sync>;
+
+/// An authorizer that admits any client. The connecting client still has to
+/// *prove* any identity it presents, but membership isn't checked — this is the
+/// permissive default; host binaries opt into peer enforcement explicitly.
+pub fn allow_any_client() -> ClientAuthorizer {
+    Arc::new(|_| true)
+}
+
+/// One queued video access unit, optionally carrying the latency bench's per-frame
+/// stage meta so the `wire_send` stamp can be taken inline — at the same instant
+/// the AU's bytes hit `write_all` — rather than in a separate, racing channel.
+///
+/// `meta` is `None` for normal streaming (the common path: [`QuicStreamer::send`]),
+/// so an idle session's wire shape is byte-for-byte unchanged. During an on-demand
+/// bench window the compositor uses [`QuicStreamer::send_with_meta`], which sets
+/// `meta = Some(..)`; the transport fills `meta.wire_send_ns` just before the AU's
+/// `write_all`, postcard-encodes it, and sends it as a `DG_FRAME_META` datagram
+/// 1:1 with the AU.
+#[derive(Clone)]
+struct VideoChunk {
+    /// `Arc<[u8]>` (not `Vec<u8>`) so the mirror dispatcher can fan ONE encoded
+    /// AU out to N per-connection queues with a refcount bump instead of N deep
+    /// copies. Wire-transparent: `&chunk.au` deref-coerces to `&[u8]` for
+    /// `write_all`, and the single-client path never clones (mpsc moves it).
+    au: std::sync::Arc<[u8]>,
+    /// True when this AU is an IDR/I keyframe (from NVENC's `pictureType`). The
+    /// bounded video queue reserves headroom for keyframes so a backlog of
+    /// P-frames can never shut an IDR out: dropping an IDR strands the decoder
+    /// with no clean reference for a whole GOP (~1s of propagating "pink block"
+    /// corruption), whereas a dropped P-frame is resynced by the next IDR.
+    /// `false` for callers that don't surface the picture type (the Windows
+    /// host, tests), which preserves the historical drop-newest behaviour.
+    keyframe: bool,
+    meta: Option<core_proto::FrameStageMeta>,
+}
+
+/// Slots held in reserve, on top of `PHAROS_QUEUE_FRAMES`, exclusively for
+/// keyframes. P-frames are admitted only while the queue holds < qdepth of them;
+/// an IDR may additionally use these slots, so a momentary P-frame backlog can
+/// never force the one frame that resyncs the decoder to be dropped. 2 leaves
+/// room for a periodic IDR plus a forced one to slip past a full queue before it
+/// drains, at a worst-case cost of ~2 extra frames of latency for keyframes only.
+const KF_RESERVE: usize = 2;
+
+/// Host-side QUIC streamer. Runs a quinn server on a background thread, accepts
+/// one Trireme client, signs an Ed25519 challenge with its long-term identity
+/// so the client can pin it, then forwards encoded chunks pushed via
+/// [`QuicStreamer::send`] over a unidirectional stream.
+///
+/// Optionally also exposes an **input event** receiver: when the client opens
+/// the input bidi stream (see [`run_video_client_with_input`]), each decoded
+/// [`core_proto::InputEvent`] is forwarded to this receiver. The compositor
+/// drains it from inside its event loop and dispatches to the smithay seat.
+pub struct QuicStreamer {
+    tx: mpsc::Sender<VideoChunk>,
+    /// Count of video AUs the bounded `tx` queue has dropped because it was full,
+    /// split by picture type. `dropped_pframes` ticking up means the link is
+    /// briefly slower than the encode rate — the direct cause of reference-frame
+    /// ("pink block") corruption the client sees; lower the resolution/bitrate.
+    /// `dropped_keyframes` should stay 0 (keyframes get a reserve, see
+    /// [`Self::send_frame`]); a non-zero value is the smoking gun for sustained
+    /// corruption. Read via [`Self::dropped_frames`]; the drop is also logged
+    /// (previously it was a completely silent `let _ = try_send`).
+    dropped_pframes: Arc<std::sync::atomic::AtomicU64>,
+    dropped_keyframes: std::sync::atomic::AtomicU64,
+    /// Set when an on-demand IDR is wanted: by the host itself whenever it drops
+    /// a video AU (the reference chain just broke), and by the client via
+    /// `DG_REQUEST_IDR`. The compositor swaps it out each frame
+    /// ([`Self::take_idr_request`], rate-limited) and forces the next encode to
+    /// be a keyframe, collapsing the post-loss smear from ~1s (next periodic IDR)
+    /// to ~1 frame. `Arc` so the serve thread's datagram task can set it too.
+    request_idr: Arc<AtomicBool>,
+    /// Opus packets, sent as unreliable QUIC datagrams (see [`Self::send_audio`]).
+    /// BOUNDED (drop-newest) so audio latency can't grow without limit when the
+    /// datagram sender is briefly starved by a slow video `write_all` (they share
+    /// one `select!` loop) — see the channel creation in `start_with_authorizer`.
+    audio_tx: mpsc::Sender<Vec<u8>>,
+    /// Gyro calibration samples, unreliable datagrams (see [`Self::send_gyro`]).
+    gyro_tx: mpsc::UnboundedSender<Vec<u8>>,
+    connected: Arc<AtomicBool>,
+    /// The currently-connected client's *verified* long-term pubkey (the same
+    /// 32 bytes the authorizer admitted), or `None` when idle / connected
+    /// anonymously. Lets the host attribute the live stream to a specific paired
+    /// peer in its status (so the panel can show that peer as Streaming rather
+    /// than Unknown). Set at connect, cleared on disconnect.
+    peer_pubkey: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
+    /// The currently-connected client's remote socket address (the UDP peer the
+    /// quinn connection sees), or `None` when idle. Surfaced into `HostStatus`
+    /// so the panel can show *where* the live client is dialing from, not just
+    /// which paired key it is. Set at connect, cleared on disconnect — the addr
+    /// companion to [`Self::peer_pubkey`].
+    peer_addr: Arc<std::sync::Mutex<Option<SocketAddr>>>,
+    /// Stream-time opt-in from the connected client: does it want raw IMU gyro
+    /// relayed at all? Set during the auth handshake (v2 wire), cleared on
+    /// disconnect or by any v1 client (which has no such field — default off).
+    /// The compositor's per-frame gyro paths read this and skip both the
+    /// integrate-to-mouse and the raw-sample stream when every connected client
+    /// has opted out, so the IMU reader thread itself goes idle.
+    wants_gyro: Arc<AtomicBool>,
+    /// Does the connected client want a 10-bit HDR (Main10) stream? Set during
+    /// the v4 auth handshake, cleared on disconnect or by any older client (which
+    /// has no such field — default off). The compositor reads this via
+    /// [`Self::wants_hdr`] and only engages HDR when it AND host capability AND an
+    /// app-declared HDR surface all agree — a 10-bit stream an SDR-only client
+    /// can't decode must never be forced on.
+    wants_hdr: Arc<AtomicBool>,
+    /// The connected client's panel refresh in whole Hz (0 = unknown / not
+    /// reported). Read from the v3 auth handshake `StreamMode`; the compositor
+    /// caps its encode fps to this so it never feeds the panel more frames than
+    /// it can show (the fix for the 144→60 Hz decoder-overload corruption).
+    /// Set at connect, cleared (0) on disconnect — companion to [`Self::wants_gyro`].
+    client_refresh_hz: Arc<std::sync::atomic::AtomicU32>,
+    /// The connected client's panel native resolution, packed `(w<<32)|h` (0 =
+    /// unknown / not reported). Read from the v3 auth handshake `StreamMode`; the
+    /// compositor reads it via [`Self::client_panel_res`] to decide whether the
+    /// encode envelope must grow to render at the panel's native size (Phase 3c,
+    /// restart-into-panel-res). Set at connect, cleared (0) on disconnect.
+    client_panel: Arc<std::sync::atomic::AtomicU64>,
+    /// The connected client's requested resolution range (Phase 2), packed
+    /// `(target_h<<32)|floor_h` (0 = unset / Auto+no-floor). Set from
+    /// `DG_CLIENT_RESPREF`; the compositor reads it via [`Self::client_res_pref`]
+    /// and applies it as the per-output ceiling/floor. Cleared (0) on disconnect.
+    client_res_pref: Arc<std::sync::atomic::AtomicU64>,
+    /// The connected client's requested bitrate range (Phase 3), packed
+    /// `(min_kbps<<32)|max_kbps` (0 = unset; max=0 = uncapped). Set from
+    /// `DG_CLIENT_BITRATEPREF`; the compositor reads it via
+    /// [`Self::client_bitrate_pref`] as the controller's bitrate bounds. Cleared
+    /// on disconnect.
+    client_bitrate_pref: Arc<std::sync::atomic::AtomicU64>,
+    /// The connected client's requested framerate range (Phase 3), packed
+    /// `(min_fps<<32)|max_fps` (0 = unset / Auto). Set from `DG_CLIENT_FPSPREF`;
+    /// the compositor reads it via [`Self::client_fps_pref`] as the encode-pace
+    /// ceiling + adaptation floor. Cleared on disconnect.
+    client_fps_pref: Arc<std::sync::atomic::AtomicU64>,
+    /// Taken out once via [`Self::take_input_rx`].
+    input_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<core_proto::InputEvent>>>,
+    /// Decoded [`core_proto::WireLatencyReport`]s sent back by the client at the
+    /// end of a bench window. Taken out once via [`Self::take_latency_rx`].
+    latency_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<core_proto::WireLatencyReport>>>,
+    /// Continuous [`core_proto::ClientQos`] reports (delivered fps + decode ms)
+    /// the client emits ~1×/s. Taken out once via [`Self::take_qos_rx`]; the
+    /// compositor drains it to make pacing network-aware.
+    qos_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<core_proto::ClientQos>>>,
+    /// Latest app catalog to push to clients on the app relay stream. `watch` so
+    /// a late-joining client gets the current value and each change re-sends.
+    app_catalog_tx: tokio::sync::watch::Sender<Vec<core_proto::AppInfo>>,
+    /// App-launch requests (`apps.toml` slugs) the client sent on the app relay
+    /// stream. Taken out once via [`Self::take_app_launch_rx`]; the compositor
+    /// drains it and launches into the virtual display.
+    app_launch_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<core_proto::AppMsg>>>,
+    /// Current encoder output geometry, packed `(w<<32)|h` (0 = unset). The
+    /// compositor sets it via [`Self::set_geometry`]; the stream loop announces it
+    /// to the client as `DG_STREAM_GEOMETRY` so the client sizes its decoder to
+    /// the real resolution (and re-announces on change for the res actuator).
+    geom: Arc<std::sync::atomic::AtomicU64>,
+    /// Forward-path packet loss permille over the last ~1s, from quinn's PathStats.
+    /// Read by the compositor as a host-side congestion signal (works even when the
+    /// client sends no QoS). See [`Self::loss_permille`].
+    loss_permille: Arc<std::sync::atomic::AtomicU32>,
+    /// Live per-connection registry — populated ONLY by the mirror keep-N path;
+    /// empty in single mode (so [`Self::connected_clients`] falls back to the
+    /// scalar peer fields). The compositor snapshots it to publish one
+    /// `ClientStatus` per mirrored client + a truthful `MirrorClamp.client_count`.
+    clients: Arc<std::sync::Mutex<Vec<ClientSlot>>>,
+}
+
+/// One live mirrored client: its identity/addr for status, a per-client bounded
+/// video queue (`tx`) the dispatcher fans AUs into (drop-newest, never blocks
+/// the others), and self-measured counters. `id` is monotonic so "primary"
+/// (the input/app driver) can be derived as `min(id)` — which auto-reassigns to
+/// the next-oldest when a primary disconnects, no explicit hand-off.
+struct ClientSlot {
+    id: u64,
+    peer_pubkey: Option<[u8; 32]>,
+    peer_addr: SocketAddr,
+    /// Live connection handle (cheap clone) so the dispatcher can fan audio/gyro
+    /// datagrams without owning the actor's send stream.
+    conn: quinn::Connection,
+    /// Bounded per-client AU queue; the actor task drains it onto the wire.
+    tx: mpsc::Sender<VideoChunk>,
+    /// Wire fps measured by the actor over ~1s windows (0 until first window).
+    fps_ewma: Arc<std::sync::atomic::AtomicU32>,
+    frames_sent: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// A status-facing snapshot of one connected client, uniform across single and
+/// mirror so the compositor builds `ClientStatus` the same way in both.
+pub struct ClientSnapshot {
+    pub addr: Option<String>,
+    pub pubkey: Option<String>,
+    pub fps: u32,
+    pub frames_sent: u64,
+}
+
+impl QuicStreamer {
+    /// `identity` is the host's long-term Ed25519 keypair. The client uses
+    /// its (pinned) pubkey to verify the challenge-response on connect.
+    ///
+    /// Admits any authenticated client. Use [`Self::start_with_authorizer`] to
+    /// restrict streaming to paired peers.
+    pub fn start(addr: SocketAddr, identity: Arc<core_crypto::Identity>) -> Result<Self> {
+        // No mirror flag wired → always single-client (a fresh always-false flag).
+        Self::start_with_authorizer(
+            addr,
+            identity,
+            allow_any_client(),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    /// Like [`Self::start`] but gates every client through `authorizer` (e.g.
+    /// "must be in peers.toml") *after* it has cryptographically proven its
+    /// identity. The host still signs its own challenge, so host→client pinning
+    /// is unchanged — this only adds the reverse direction.
+    ///
+    /// `mirror` is the compositor-owned fan-out flag (panel `SetStreamMode`):
+    /// `false` = single-client/pre-empt (validated default), `true` = keep-N.
+    pub fn start_with_authorizer(
+        addr: SocketAddr,
+        identity: Arc<core_crypto::Identity>,
+        authorizer: ClientAuthorizer,
+        mirror: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // Bounded video queue: cap the in-flight frames so latency can't grow
+        // without limit when the link is briefly slower than the encode rate.
+        // Depth trades latency vs smoothness — PHAROS_QUEUE_FRAMES tunes it
+        // (default 8 ≈ 130ms @60fps); P-frames are dropped-newest when full.
+        // The channel is sized qdepth + KF_RESERVE: P-frames are admitted only
+        // while < qdepth are queued, but a keyframe may also use the reserve, so
+        // an IDR is never shut out by a P-frame backlog (see `enqueue`).
+        let qdepth = std::env::var("PHAROS_QUEUE_FRAMES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(8);
+        let (tx, rx) = mpsc::channel::<VideoChunk>(qdepth + KF_RESERVE);
+        // Bounded audio queue — the audio analogue of the video queue above. The
+        // datagram sender drains this in the SAME `select!` loop as the reliable,
+        // flow-controlled video `write_all`; while a slow video write is awaited,
+        // audio can't drain. An UNBOUNDED channel turned that transient into a
+        // permanent 1–1.5s backlog (it tracked the QUIC stream window). A small
+        // bound sheds stale audio (drop-newest in `send_audio`) so latency stays
+        // capped; PHAROS_AUDIO_QUEUE_PACKETS tunes it (default 8 ≈ 160ms @ 20ms/pkt).
+        let audio_depth = std::env::var("PHAROS_AUDIO_QUEUE_PACKETS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(8);
+        let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(audio_depth);
+        let (gyro_tx, gyro_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (input_tx, input_rx) = mpsc::unbounded_channel::<core_proto::InputEvent>();
+        let (latency_tx, latency_rx) = mpsc::unbounded_channel::<core_proto::WireLatencyReport>();
+        let (qos_tx, qos_rx) = mpsc::unbounded_channel::<core_proto::ClientQos>();
+        let (app_catalog_tx, app_catalog_rx) =
+            tokio::sync::watch::channel::<Vec<core_proto::AppInfo>>(Vec::new());
+        let (app_launch_tx, app_launch_rx) = mpsc::unbounded_channel::<core_proto::AppMsg>();
+        let connected = Arc::new(AtomicBool::new(false));
+        let connected_thread = connected.clone();
+        // Verified pubkey of whoever's connected (None when idle). Set/cleared
+        // alongside `connected` inside serve_stream's accept loop.
+        let peer_pubkey = Arc::new(std::sync::Mutex::new(None));
+        let peer_pubkey_thread = peer_pubkey.clone();
+        // Remote addr of whoever's connected (None when idle). Set/cleared
+        // alongside `peer_pubkey` inside serve_stream's accept loop.
+        let peer_addr = Arc::new(std::sync::Mutex::new(None));
+        let peer_addr_thread = peer_addr.clone();
+        // Defaults to false: a fresh streamer with no connected client wants
+        // no gyro. Set true in serve_stream during a v2 client's auth when its
+        // wants_gyro flag is on; cleared on disconnect.
+        let wants_gyro = Arc::new(AtomicBool::new(false));
+        let wants_gyro_thread = wants_gyro.clone();
+        // Client's HDR request (v4 auth). Defaults false; set in serve_stream.
+        let wants_hdr = Arc::new(AtomicBool::new(false));
+        let wants_hdr_thread = wants_hdr.clone();
+        // Connected client's panel refresh (Hz, 0 = unknown). Set in serve_stream
+        // from the v3 auth handshake; the compositor reads it to cap fps.
+        let client_refresh_hz = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let client_refresh_hz_thread = client_refresh_hz.clone();
+        // Client's panel native resolution (Phase 3c), packed (w<<32)|h.
+        let client_panel = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let client_panel_thread = client_panel.clone();
+        // Client's requested resolution range (Phase 2), packed (target_h<<32)|floor_h.
+        let client_res_pref = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let client_res_pref_thread = client_res_pref.clone();
+        // Client's requested bitrate range (Phase 3), packed (min_kbps<<32)|max_kbps.
+        let client_bitrate_pref = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let client_bitrate_pref_thread = client_bitrate_pref.clone();
+        // Client's requested framerate range (Phase 3), packed (min_fps<<32)|max_fps.
+        let client_fps_pref = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let client_fps_pref_thread = client_fps_pref.clone();
+        let geom = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let geom_thread = geom.clone();
+        let loss_permille = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let loss_thread = loss_permille.clone();
+        // P-frame drop counter, shared with the serve thread so its connection
+        // loop can emit the DG_LINK_HEALTH heartbeat (the producer-side note_drop
+        // increments it). Monotonic — the emit side resets its own per-connection
+        // baseline. (dropped_keyframes stays a plain field; only this feeds health.)
+        let dropped_pframes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let drops_thread = dropped_pframes.clone();
+        // On-demand IDR request flag, shared with the serve thread so its client
+        // datagram task can set it on `DG_REQUEST_IDR` (the host also sets it
+        // itself on a queue drop, via `note_drop`).
+        let request_idr = Arc::new(AtomicBool::new(false));
+        let request_idr_thread = request_idr.clone();
+        // The mirror flag is read only by the serve thread (the streamer struct
+        // never needs it back), so it moves straight in — no struct field.
+        let clients: Arc<std::sync::Mutex<Vec<ClientSlot>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let clients_thread = clients.clone();
+        std::thread::Builder::new()
+            .name("quic-streamer".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::error!("quic runtime: {e}");
+                        return;
+                    }
+                };
+                if let Err(e) = rt.block_on(serve_stream(
+                    addr,
+                    rx,
+                    audio_rx,
+                    gyro_rx,
+                    connected_thread,
+                    peer_pubkey_thread,
+                    peer_addr_thread,
+                    wants_gyro_thread,
+                    wants_hdr_thread,
+                    client_refresh_hz_thread,
+                    client_panel_thread,
+                    client_res_pref_thread,
+                    client_bitrate_pref_thread,
+                    client_fps_pref_thread,
+                    identity,
+                    input_tx,
+                    latency_tx,
+                    qos_tx,
+                    app_catalog_rx,
+                    app_launch_tx,
+                    authorizer,
+                    geom_thread,
+                    loss_thread,
+                    drops_thread,
+                    request_idr_thread,
+                    mirror,
+                    clients_thread,
+                )) {
+                    tracing::error!("quic streamer: {e:?}");
+                }
+            })?;
+        Ok(Self {
+            tx,
+            dropped_pframes,
+            dropped_keyframes: std::sync::atomic::AtomicU64::new(0),
+            request_idr,
+            audio_tx,
+            gyro_tx,
+            connected,
+            peer_pubkey,
+            peer_addr,
+            wants_gyro,
+            wants_hdr,
+            client_refresh_hz,
+            client_panel,
+            client_res_pref,
+            client_bitrate_pref,
+            client_fps_pref,
+            input_rx: std::sync::Mutex::new(Some(input_rx)),
+            latency_rx: std::sync::Mutex::new(Some(latency_rx)),
+            qos_rx: std::sync::Mutex::new(Some(qos_rx)),
+            app_catalog_tx,
+            app_launch_rx: std::sync::Mutex::new(Some(app_launch_rx)),
+            geom,
+            loss_permille,
+            clients,
+        })
+    }
+
+    /// Forward-path packet loss (permille, 0–1000) over the last ~1s, from quinn's
+    /// PathStats. A host-side congestion signal the pacer uses when the client
+    /// reports no QoS. 0 when idle / no client.
+    pub fn loss_permille(&self) -> u32 {
+        self.loss_permille
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Tell the streamer the encoder's current output geometry. Announced to the
+    /// connected client as `DG_STREAM_GEOMETRY` (at stream open + on change), so
+    /// the client sizes its decoder to the true resolution. Safe to call before
+    /// any client connects (the value is latched and sent on the next connect).
+    pub fn set_geometry(&self, w: u32, h: u32) {
+        self.geom.store(
+            ((w as u64) << 32) | h as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Queue an encoded video chunk for delivery. Non-blocking. Picture type
+    /// unknown → treated as a droppable P-frame (drop-newest when full), the
+    /// historical behaviour. Used by callers that don't surface NVENC's
+    /// `pictureType` (the Windows host, tests). The Linux/NVENC path uses
+    /// [`Self::send_frame`] so IDRs get the keyframe reserve.
+    pub fn send(&self, bytes: Vec<u8>) {
+        self.enqueue(bytes.into(), false, None);
+    }
+
+    /// Like [`Self::send`] but tags the AU with its keyframe flag (from NVENC's
+    /// `pictureType`) so the bounded queue never drops an IDR in favour of a
+    /// P-frame backlog. Non-blocking.
+    pub fn send_frame(&self, bytes: Vec<u8>, keyframe: bool) {
+        self.enqueue(bytes.into(), keyframe, None);
+    }
+
+    /// Queue an encoded video chunk *with* its latency-bench stage meta, riding the
+    /// same channel as [`Self::send`] so the AU and its meta stay 1:1 and in order.
+    /// `meta.wire_send_ns` is left for the transport to fill at `write_all` time
+    /// (the encoder can't know when the bytes actually hit the wire). Non-blocking.
+    ///
+    /// The compositor calls this ONLY during an on-demand bench window — emitting
+    /// the *first* meta is itself the signal that tells the client to start the
+    /// benchmark (no separate control message). When no bench is running,
+    /// [`Self::send_frame`] is used instead.
+    pub fn send_with_meta(&self, bytes: Vec<u8>, keyframe: bool, meta: core_proto::FrameStageMeta) {
+        self.enqueue(bytes.into(), keyframe, Some(meta));
+    }
+
+    /// Shared admission path for [`Self::send`] / [`Self::send_frame`] /
+    /// [`Self::send_with_meta`]. Drop-newest when the queue is full — EXCEPT a
+    /// keyframe may also use the `KF_RESERVE` slots so it is never shut out by
+    /// queued P-frames (losing an IDR = a whole GOP of propagating corruption;
+    /// losing a P-frame is resynced by the next IDR). Every drop is counted and
+    /// logged so the shed is observable — it used to be a silent `let _ = try_send`.
+    fn enqueue(
+        &self,
+        au: std::sync::Arc<[u8]>,
+        keyframe: bool,
+        meta: Option<core_proto::FrameStageMeta>,
+    ) {
+        // `capacity()` = free slots right now. The channel is sized qdepth+KF_RESERVE,
+        // so "> KF_RESERVE free" means fewer than qdepth frames are queued. A keyframe
+        // is admitted as long as ANY slot is free, dipping into the reserve.
+        let free = self.tx.capacity();
+        let admit = if keyframe {
+            free > 0
+        } else {
+            free > KF_RESERVE
+        };
+        if admit && self.tx.try_send(VideoChunk { au, keyframe, meta }).is_ok() {
+            return;
+        }
+        self.note_drop(keyframe);
+    }
+
+    /// Record + log a dropped video AU (the bounded queue was full). P-frame drops
+    /// are throttled to ~1 log line per 30; a keyframe drop always warns (it should
+    /// not happen given the reserve, and directly explains visible corruption).
+    fn note_drop(&self, keyframe: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // A dropped AU only matters while a client is consuming the stream. When
+        // idle the queue fills and "drops" every frame — meaningless, and it would
+        // both spam the log and churn on-demand IDRs. Only count/log/recover when
+        // connected.
+        if !self.connected.load(Relaxed) {
+            return;
+        }
+        if keyframe {
+            let n = self.dropped_keyframes.fetch_add(1, Relaxed) + 1;
+            tracing::warn!(
+                target: "transport::queue",
+                "video queue dropped a KEYFRAME (total={n}) — keyframe reserve exhausted; \
+                 client will smear until the next periodic IDR"
+            );
+        } else {
+            let n = self.dropped_pframes.fetch_add(1, Relaxed) + 1;
+            if n == 1 || n.is_multiple_of(30) {
+                tracing::warn!(
+                    target: "transport::queue",
+                    "video queue full: dropped {n} P-frames total (link briefly slower than the \
+                     encode rate → reference-frame corruption; lower the resolution/bitrate)"
+                );
+            }
+        }
+        // The reference chain just broke — ask the encoder for an on-demand IDR so
+        // the client resyncs in ~1 frame instead of waiting for the periodic one.
+        // The compositor rate-limits the actual force (see `take_idr_request`).
+        self.request_idr.store(true, Relaxed);
+    }
+
+    /// Video AUs the bounded queue has dropped since start: `(p_frames, keyframes)`.
+    /// `keyframes` should be 0; a non-zero value is the smoking gun for sustained
+    /// "pink block" corruption. Cheap atomic loads — safe to poll for status.
+    pub fn dropped_frames(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.dropped_pframes.load(Relaxed),
+            self.dropped_keyframes.load(Relaxed),
+        )
+    }
+
+    /// Take (and clear) a pending on-demand IDR request — returns true if the
+    /// compositor should force the next encode to be a keyframe. Set by the host
+    /// on a queue drop ([`Self::note_drop`]) and by the client via `DG_REQUEST_IDR`.
+    /// The compositor rate-limits how often it actually forces one.
+    pub fn take_idr_request(&self) -> bool {
+        self.request_idr
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Queue one Opus audio packet. Delivered as an unreliable QUIC datagram
+    /// (deadline-aware — a dropped packet beats head-of-line-blocking video).
+    /// Non-blocking; only actually transmitted while a client is connected.
+    /// Drop-newest when the bounded queue is full (like [`Self::send`]) so a
+    /// backlog from a stalled video write can't accumulate into seconds of lag.
+    pub fn send_audio(&self, packet: Vec<u8>) {
+        let _ = self.audio_tx.try_send(packet);
+    }
+
+    /// Queue one gyro telemetry packet (12 bytes: 3×f32 LE, deg/s) for the
+    /// client's calibration visualizer. Unreliable datagram, non-blocking; only
+    /// transmitted while a client is connected.
+    pub fn send_gyro(&self, packet: Vec<u8>) {
+        let _ = self.gyro_tx.send(packet);
+    }
+
+    /// A cheap, clonable handle for an audio-capture thread to push Opus
+    /// packets. It does *not* keep the streamer alive — dropping the streamer
+    /// still ends the session via the video channel — so the capture thread can
+    /// outlive a client and resume on reconnect (gated by [`AudioHandle::is_connected`]).
+    pub fn audio_handle(&self) -> AudioHandle {
+        AudioHandle {
+            tx: self.audio_tx.clone(),
+            connected: self.connected.clone(),
+        }
+    }
+
+    /// True once a client has connected, passed the auth challenge, and the
+    /// send stream is open. The host gates its encode loop on this so frames
+    /// aren't buffered pre-connect.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    /// Lowercase-hex of the connected client's verified pubkey, or `None` when
+    /// idle / connected anonymously. The hex shape matches `peers.toml`, so the
+    /// host can join a live stream to a specific paired peer in its status.
+    pub fn connected_pubkey(&self) -> Option<String> {
+        let bytes = (*self.peer_pubkey.lock().ok()?)?;
+        Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
+    }
+
+    /// The connected client's remote socket address as a string (e.g.
+    /// `192.0.2.10:51234`), or `None` when idle. The addr companion to
+    /// [`Self::connected_pubkey`]; the panel shows it as the live peer's
+    /// address instead of `—`.
+    pub fn connected_addr(&self) -> Option<String> {
+        Some((*self.peer_addr.lock().ok()?)?.to_string())
+    }
+
+    /// Uniform view of the connected client(s) for the compositor's status push.
+    /// In MIRROR mode this snapshots the per-connection registry (one entry per
+    /// mirrored client, with self-measured fps/frames). In SINGLE mode the
+    /// registry is empty, so it falls back to the scalar peer fields and yields
+    /// ≤1 entry — the compositor keeps using its own `measured_fps_ewma`/frame
+    /// counter for that one, so single-mode status output is unchanged.
+    pub fn connected_clients(&self) -> Vec<ClientSnapshot> {
+        if let Ok(slots) = self.clients.lock() {
+            if !slots.is_empty() {
+                return slots
+                    .iter()
+                    .map(|s| ClientSnapshot {
+                        addr: Some(s.peer_addr.to_string()),
+                        pubkey: s
+                            .peer_pubkey
+                            .map(|b| b.iter().map(|x| format!("{x:02x}")).collect()),
+                        fps: s.fps_ewma.load(Ordering::Relaxed),
+                        frames_sent: s.frames_sent.load(Ordering::Relaxed),
+                    })
+                    .collect();
+            }
+        }
+        // Single mode: derive the 0/1-element view from the scalar peer fields.
+        if self.is_connected() {
+            vec![ClientSnapshot {
+                addr: self.connected_addr(),
+                pubkey: self.connected_pubkey(),
+                fps: 0,
+                frames_sent: 0,
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// True when the currently-connected client opted in to gyro relay during
+    /// the v2 auth handshake. Stays false for the v1 wire (the client had no
+    /// way to ask) and for any session with no client connected. The
+    /// compositor reads this each frame and skips the gyro IMU drain + raw
+    /// sample stream when no streamer wants gyro, taking the IMU reader to
+    /// an idle 500ms sleep.
+    pub fn wants_gyro(&self) -> bool {
+        self.wants_gyro.load(Ordering::Acquire)
+    }
+
+    /// Does the connected client want a 10-bit HDR stream? Set from the v4 auth
+    /// handshake; false for older clients and when no client is connected. The
+    /// compositor gates HDR (10-bit Main10 session) on this AND host capability
+    /// AND an app-declared HDR surface.
+    pub fn wants_hdr(&self) -> bool {
+        self.wants_hdr.load(Ordering::Acquire)
+    }
+
+    /// The connected client's panel refresh in whole Hz, or 0 if unknown / no
+    /// client. The compositor caps its encode fps to this (never feeding a panel
+    /// more frames than it shows). Set from the v3 auth handshake `StreamMode`.
+    pub fn client_refresh_hz(&self) -> u32 {
+        self.client_refresh_hz.load(Ordering::Acquire)
+    }
+
+    /// The connected client's panel native resolution as `(w, h)` in px; `(0, 0)`
+    /// = unknown / no client (a v2 client that sent no `StreamMode` w/h, or a
+    /// client that reported 0). The compositor reads it on connect to decide
+    /// whether the encode envelope must grow to render at panel-native size
+    /// (Phase 3c). Set from the v3 auth handshake, cleared on disconnect.
+    pub fn client_panel_res(&self) -> (u32, u32) {
+        let v = self.client_panel.load(Ordering::Acquire);
+        ((v >> 32) as u32, v as u32)
+    }
+
+    /// The connected client's requested resolution range (Phase 2) as
+    /// `(target_h, floor_h)` in px; `(0, 0)` = unset (Auto + no floor). The
+    /// compositor reads it each window and applies it as the per-output ceiling
+    /// and minimum. Set from `DG_CLIENT_RESPREF`, cleared on disconnect.
+    pub fn client_res_pref(&self) -> (u32, u32) {
+        let v = self.client_res_pref.load(Ordering::Relaxed);
+        ((v >> 32) as u32, v as u32)
+    }
+
+    /// The connected client's requested bitrate range (Phase 3) as
+    /// `(min_kbps, max_kbps)`; `(0, 0)` = unset, `max_kbps == 0` = uncapped. The
+    /// compositor reads it as the controller's bitrate bounds. Cleared on disconnect.
+    pub fn client_bitrate_pref(&self) -> (u32, u32) {
+        let v = self.client_bitrate_pref.load(Ordering::Relaxed);
+        ((v >> 32) as u32, v as u32)
+    }
+
+    /// The connected client's requested framerate range (Phase 3) as
+    /// `(min_fps, max_fps)`; `(0, 0)` = unset, `max_fps == 0` = Auto (panel
+    /// refresh). The compositor reads it as the encode-pace ceiling + adaptation
+    /// floor. Cleared on disconnect.
+    pub fn client_fps_pref(&self) -> (u32, u32) {
+        let v = self.client_fps_pref.load(Ordering::Relaxed);
+        ((v >> 32) as u32, v as u32)
+    }
+
+    /// Take the InputEvent receiver — call exactly once. Subsequent calls
+    /// return `None`. The compositor pulls events from this and dispatches
+    /// them to the smithay seat.
+    pub fn take_input_rx(&self) -> Option<mpsc::UnboundedReceiver<core_proto::InputEvent>> {
+        self.input_rx.lock().ok().and_then(|mut g| g.take())
+    }
+
+    /// Take the latency-report receiver — call exactly once. Subsequent calls
+    /// return `None`. The panel/compositor drains it to surface each
+    /// [`core_proto::WireLatencyReport`] the client sends back at the end of a
+    /// bench window.
+    pub fn take_latency_rx(
+        &self,
+    ) -> Option<mpsc::UnboundedReceiver<core_proto::WireLatencyReport>> {
+        self.latency_rx.lock().ok().and_then(|mut g| g.take())
+    }
+
+    /// Take the client-QoS receiver — call exactly once. The compositor drains it
+    /// to feed delivered-fps into the pacer (network-aware quality).
+    pub fn take_qos_rx(&self) -> Option<mpsc::UnboundedReceiver<core_proto::ClientQos>> {
+        self.qos_rx.lock().ok().and_then(|mut g| g.take())
+    }
+
+    /// Publish the app catalog to push to clients on the app relay stream.
+    /// Cheap; the latest value is retained and (re-)sent to each connected and
+    /// future client. Non-blocking — safe to call even with no client connected.
+    pub fn send_app_catalog(&self, apps: Vec<core_proto::AppInfo>) {
+        let _ = self.app_catalog_tx.send(apps);
+    }
+
+    /// Take the app-launch receiver — call exactly once. Subsequent calls return
+    /// `None`. The compositor drains it and launches each requested slug into the
+    /// virtual display (the client-tile path, mirroring the panel/CLI `LaunchApp`).
+    pub fn take_app_launch_rx(&self) -> Option<mpsc::UnboundedReceiver<core_proto::AppMsg>> {
+        self.app_launch_rx.lock().ok().and_then(|mut g| g.take())
+    }
+}
+
+/// Clonable audio side of a [`QuicStreamer`] (see [`QuicStreamer::audio_handle`]).
+#[derive(Clone)]
+pub struct AudioHandle {
+    tx: mpsc::Sender<Vec<u8>>,
+    connected: Arc<AtomicBool>,
+}
+
+impl AudioHandle {
+    /// True while a client is connected — the host gates audio capture on this.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    /// Queue one Opus packet (sent as a datagram; dropped if no client, and
+    /// drop-newest when the bounded queue is full so audio latency stays capped).
+    pub fn send(&self, packet: Vec<u8>) {
+        let _ = self.tx.try_send(packet);
+    }
+}
+
+/// Lock-free decode/present latency taps for the Trireme player.
+///
+/// The network-centric stages (compose→encode→host-send on the host, plus the
+/// RTT-derived `nexus` wire time) are measured entirely inside
+/// [`run_video_client_with_input`], so they're always available. The
+/// *client-local* decode + present stages, by contrast, are known only to the
+/// player (play.rs) which owns the decoder + presentation timing. This struct is
+/// the bridge: the player calls [`Self::record_decode_ms`]/[`Self::record_present_ms`]
+/// as frames flow, and the bench reads back the **min** and **mean** when it
+/// builds the report.
+///
+/// We accumulate (min + mean) rather than an EMA. The submit→emerge residency is
+/// the **in-flight buffer**: ffmpeg's output is back-pressured by the 60 fps
+/// render so each AU waits the full buffer depth, masking the GPU decode kernel —
+/// even the min is the buffer floor, not pure decode. The bench therefore reports
+/// `buffer_ms` = mean residency (buffer + decode, buffer-dominated) and folds the
+/// unisolable decode kernel into it; `present_ms` = mean present. (`decode_min_ms`
+/// is kept for diagnostics.)
+///
+/// Sums are kept as integer nanoseconds in `AtomicU64`s (so concurrent
+/// `fetch_add`s never race an f32 read-modify-write), and the running decode min
+/// is an `AtomicU32` of the sample's f32 bits — positive-float bit patterns order
+/// the same as the floats, so `fetch_min` on the bits *is* the numeric min. Cheap
+/// (relaxed atomics, no lock) so the player can update on the hot path. Wrap in an
+/// `Arc` and pass `Some(arc)` to the client; `None` leaves those report fields at
+/// 0.0. The bench calls [`Self::reset`] at window open so each run is independent.
+#[derive(Debug)]
+pub struct LatencyTaps {
+    /// f32 bits of the minimum decode-ms seen since the last reset (+inf sentinel
+    /// when none — its bit pattern is the largest finite-ordering value so the
+    /// first real `fetch_min` always wins).
+    decode_min_bits: std::sync::atomic::AtomicU32,
+    /// Sum of decode-ms samples, as integer nanoseconds (ms × 1e6).
+    decode_sum_ns: std::sync::atomic::AtomicU64,
+    decode_count: std::sync::atomic::AtomicU32,
+    /// Sum of present-ms samples, as integer nanoseconds.
+    present_sum_ns: std::sync::atomic::AtomicU64,
+    present_count: std::sync::atomic::AtomicU32,
+    /// Host-announced video geometry, packed `(w<<32)|h` (0 = not yet learned).
+    /// Set from the `DG_STREAM_GEOMETRY` datagram; read by the client's raw-frame
+    /// reader to size NV12 frames to the real resolution. Deliberately NOT cleared
+    /// by [`Self::reset`] — it's session geometry, not a per-bench-window stat.
+    geometry: std::sync::atomic::AtomicU64,
+}
+
+impl Default for LatencyTaps {
+    fn default() -> Self {
+        Self {
+            decode_min_bits: std::sync::atomic::AtomicU32::new(f32::INFINITY.to_bits()),
+            decode_sum_ns: std::sync::atomic::AtomicU64::new(0),
+            decode_count: std::sync::atomic::AtomicU32::new(0),
+            present_sum_ns: std::sync::atomic::AtomicU64::new(0),
+            present_count: std::sync::atomic::AtomicU32::new(0),
+            geometry: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl LatencyTaps {
+    /// A fresh, empty tap set (decode-min seeded to +inf).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Zero every accumulator and reset the decode min back to +inf. The bench
+    /// calls this when a window opens so a later run isn't contaminated by an
+    /// earlier one.
+    pub fn reset(&self) {
+        self.decode_min_bits
+            .store(f32::INFINITY.to_bits(), Ordering::Relaxed);
+        self.decode_sum_ns.store(0, Ordering::Relaxed);
+        self.decode_count.store(0, Ordering::Relaxed);
+        self.present_sum_ns.store(0, Ordering::Relaxed);
+        self.present_count.store(0, Ordering::Relaxed);
+    }
+
+    /// ms → integer nanoseconds (saturating, never negative).
+    fn ms_to_ns(ms: f32) -> u64 {
+        (ms.max(0.0) as f64 * 1.0e6) as u64
+    }
+
+    /// Record one decode-stage measurement (ms): time from handing the AU to the
+    /// decoder until a frame comes out. Updates the min, sum, and count.
+    pub fn record_decode_ms(&self, ms: f32) {
+        // Min on the f32 bit pattern — valid because we only ever store finite
+        // non-negative samples (clamped below), whose bit patterns order as ints.
+        let bits = ms.max(0.0).to_bits();
+        self.decode_min_bits.fetch_min(bits, Ordering::Relaxed);
+        self.decode_sum_ns
+            .fetch_add(Self::ms_to_ns(ms), Ordering::Relaxed);
+        self.decode_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one present-stage measurement (ms): time from decode output until
+    /// the frame is on screen. Updates the sum and count.
+    pub fn record_present_ms(&self, ms: f32) {
+        self.present_sum_ns
+            .fetch_add(Self::ms_to_ns(ms), Ordering::Relaxed);
+        self.present_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Minimum decode-stage time in ms since the last reset (0.0 if never
+    /// recorded). This is the ≈pure-decode floor.
+    pub fn decode_min_ms(&self) -> f32 {
+        if self.decode_count.load(Ordering::Relaxed) == 0 {
+            return 0.0;
+        }
+        f32::from_bits(self.decode_min_bits.load(Ordering::Relaxed))
+    }
+
+    /// Mean decode-stage time in ms since the last reset (0.0 if never recorded).
+    pub fn decode_mean_ms(&self) -> f32 {
+        let n = self.decode_count.load(Ordering::Relaxed);
+        if n == 0 {
+            return 0.0;
+        }
+        let sum_ns = self.decode_sum_ns.load(Ordering::Relaxed);
+        (sum_ns as f64 / n as f64 / 1.0e6) as f32
+    }
+
+    /// Mean present-stage time in ms since the last reset (0.0 if never recorded).
+    pub fn present_mean_ms(&self) -> f32 {
+        let n = self.present_count.load(Ordering::Relaxed);
+        if n == 0 {
+            return 0.0;
+        }
+        let sum_ns = self.present_sum_ns.load(Ordering::Relaxed);
+        (sum_ns as f64 / n as f64 / 1.0e6) as f32
+    }
+
+    /// Record the host-announced stream geometry (decoded from a
+    /// `DG_STREAM_GEOMETRY` datagram). `w`/`h` of 0 is ignored.
+    pub fn set_geometry(&self, w: u32, h: u32) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        self.geometry
+            .store(((w as u64) << 32) | h as u64, Ordering::Relaxed);
+    }
+
+    /// The host-announced stream geometry, or `None` until the first
+    /// `DG_STREAM_GEOMETRY` arrives. The raw-frame reader sizes NV12 frames from
+    /// this; falling back to a configured default only when it stays `None`.
+    pub fn geometry(&self) -> Option<(u32, u32)> {
+        let v = self.geometry.load(Ordering::Relaxed);
+        if v == 0 {
+            None
+        } else {
+            Some(((v >> 32) as u32, (v & 0xffff_ffff) as u32))
+        }
+    }
+}
+
+// Datagram type tags (first byte). Audio and gyro both ride unreliable
+// datagrams over the one connection, so a single client read loop dispatches by
+// this tag — without it the two would race the same datagram queue.
+const DG_AUDIO: u8 = 0x00;
+const DG_GYRO: u8 = 0x01;
+// Latency-benchmark datagrams (see `core_proto::latency`). All four are inert in
+// normal streaming: the host only emits DG_FRAME_META during a bench window
+// (driven by `send_with_meta`), and the client only initiates the clock
+// exchange + report once it sees that meta start. So an idle session never
+// touches these paths.
+//   DG_CLOCK_PING  — client → host: NTP-style probe (initiator send t0).
+//   DG_CLOCK_PONG  — host → client: responder echo (recv t1, send t2).
+//   DG_FRAME_META  — host → client: per-frame capture/encode/send stamps.
+//   DG_LATENCY_REPORT — client → host: the final per-stage attribution.
+const DG_CLOCK_PING: u8 = 0x02;
+const DG_CLOCK_PONG: u8 = 0x03;
+const DG_FRAME_META: u8 = 0x04;
+const DG_LATENCY_REPORT: u8 = 0x05;
+// Host → client, additive (older clients ignore unknown tags, so no protocol
+// break for already-deployed APKs): the encoder's current output geometry as
+// `w:u32 BE || h:u32 BE`. Sent at stream open and re-sent on change / ~1×/s, so
+// a client can size its raw-frame reader to the TRUE resolution instead of
+// guessing (the cause of the green/sheared NV12 on a non-1080p stream). The
+// resolution actuator re-sends it whenever it live-changes the encode size.
+const DG_STREAM_GEOMETRY: u8 = 0x06;
+// Client → host, additive: periodic quality-of-service report (delivered fps +
+// decode time) so the host can adapt its send rate to the actual path, not just
+// its own encode cadence. See `core_proto::latency::ClientQos`.
+const DG_CLIENT_QOS: u8 = 0x07;
+// Client→host: "I lost a reference / my decode looks corrupt — send an IDR NOW."
+// Tiny, unreliable (a lost request just means the client re-asks on its next bad
+// frame); orthogonal to the host self-trigger on queue drops, so a client that
+// never sends it (older APK) still recovers via the periodic/drop-driven IDR.
+const DG_REQUEST_IDR: u8 = 0x08;
+// Host→client link-health heartbeat (~2×/s). 1-byte payload: 1 = the host dropped
+// video AUs in the last ~500ms window (link slower than the encode rate → the
+// client lights a "degraded" indicator), 0 = clean. Additive: older clients
+// ignore the unknown tag. Unreliable — a lost beat self-heals on the next tick.
+const DG_LINK_HEALTH: u8 = 0x09;
+// Client→host resolution preference (Phase 2): postcard `ClientResPref`
+// (target_h, floor_h) for the adaptive ladder. Sent ~1×/s (continuous, like
+// DG_CLIENT_QOS) so a lost one self-heals; the host stores it and the compositor
+// applies it idempotently. Additive: older hosts ignore the unknown tag.
+const DG_CLIENT_RESPREF: u8 = 0x0a;
+// Client→host bitrate preference (Phase 3): postcard `ClientBitratePref`
+// (min_kbps, max_kbps; max=0=uncapped) — the primary adaptive lever. Same
+// continuous ~1×/s self-healing send as DG_CLIENT_RESPREF. Additive.
+const DG_CLIENT_BITRATEPREF: u8 = 0x0b;
+// Client→host framerate preference (Phase 3): postcard `ClientFpsPref`
+// (min_fps, max_fps; max=0=Auto/panel) — caps the encode pace + adaptation floor.
+// Same continuous ~1×/s self-healing send as DG_CLIENT_RESPREF. Additive.
+const DG_CLIENT_FPSPREF: u8 = 0x0c;
+
+/// UNIX-epoch nanoseconds from the wall clock. Used for every timestamp that
+/// crosses the link (ClockPing/Pong t0..t3, FrameStageMeta stamps): a monotonic
+/// `Instant` has no shared epoch across two machines, so subtracting the host's
+/// `send_ns` from the client's `recv_ns` would be garbage unless both ends read
+/// the *same* clock domain. SystemTime gives that shared (UNIX) epoch. Per-stage
+/// *deltas* measured entirely on one machine may still use `Instant`.
+fn unix_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// Prefix a datagram payload with its type tag.
+fn tagged_datagram(tag: u8, payload: &[u8]) -> bytes::Bytes {
+    let mut d = Vec::with_capacity(payload.len() + 1);
+    d.push(tag);
+    d.extend_from_slice(payload);
+    bytes::Bytes::from(d)
+}
+
+/// Run the mutual-auth handshake on a freshly-accepted connection, bounded by a
+/// 5s timeout. Returns the client's verified pubkey (`None` = anonymous) and its
+/// `wants_gyro` flag, or `Err` on any failure (the caller closes the connection
+/// and moves on). Shared verbatim by the single-client accept path and the
+/// mirror keep-N path so the wire handshake is byte-identical in both — see the
+/// inline doc at the original single-client call site for the v1/v2 wire detail.
+async fn authenticate(
+    conn: &quinn::Connection,
+    identity: &core_crypto::Identity,
+) -> Result<(Option<[u8; 32]>, bool, bool, core_proto::StreamMode)> {
+    let auth_fut = async {
+        use rand::RngCore;
+        let (mut auth_send, mut auth_recv) = conn.accept_bi().await?;
+        let mut head = [0u8; 4];
+        auth_recv.read_exact(&mut head).await?;
+        let (wants_gyro_flag, wants_hdr_flag, mut client_nonce);
+        let mut wire_version: u32 = 1; // v1 = no magic prefix (none in-tree)
+        if head == AUTH_PROTO_MAGIC {
+            let mut ver_buf = [0u8; 4];
+            auth_recv.read_exact(&mut ver_buf).await?;
+            wire_version = u32::from_be_bytes(ver_buf);
+            // Accept the whole supported range so older v2 clients (no StreamMode
+            // block) keep working against this newer host.
+            if !(AUTH_PROTO_VERSION_MIN..=AUTH_PROTO_VERSION).contains(&wire_version) {
+                anyhow::bail!("unsupported auth wire version {wire_version}");
+            }
+            client_nonce = [0u8; 32];
+            auth_recv.read_exact(&mut client_nonce).await?;
+        } else {
+            client_nonce = [0u8; 32];
+            client_nonce[..4].copy_from_slice(&head);
+            auth_recv.read_exact(&mut client_nonce[4..]).await?;
+        }
+        let mut client_pub = [0u8; 32];
+        auth_recv.read_exact(&mut client_pub).await?;
+        let mut stream_mode = core_proto::StreamMode::default();
+        if head == AUTH_PROTO_MAGIC {
+            let mut g = [0u8; 1];
+            auth_recv.read_exact(&mut g).await?;
+            wants_gyro_flag = g[0] != 0;
+            // v3+: a 12-byte requested-mode block (w, h, refresh_mhz) follows the
+            // gyro byte. The host caps fps to its refresh and (Tier-3) targets w×h.
+            if wire_version >= 3 {
+                let mut mode_buf = [0u8; 12];
+                auth_recv.read_exact(&mut mode_buf).await?;
+                stream_mode = core_proto::StreamMode::from_bytes(&mode_buf);
+            }
+            // v4+: a trailing 1-byte wants_hdr flag after the mode block. The
+            // client advertises it wants a 10-bit HDR stream; the host only
+            // engages HDR when this AND host capability AND app-declared HDR agree.
+            if wire_version >= 4 {
+                let mut h = [0u8; 1];
+                auth_recv.read_exact(&mut h).await?;
+                wants_hdr_flag = h[0] != 0;
+            } else {
+                wants_hdr_flag = false;
+            }
+        } else {
+            wants_gyro_flag = false;
+            wants_hdr_flag = false;
+        }
+
+        let mut exporter = [0u8; 32];
+        conn.export_keying_material(&mut exporter, VIDEO_AUTH_EXPORTER_LABEL, &[])
+            .map_err(|e| anyhow::anyhow!("export_keying_material: {e:?}"))?;
+
+        let sig = core_crypto::sign_video_auth(identity, &client_nonce, &exporter);
+        let mut host_nonce = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut host_nonce);
+        auth_send.write_all(&sig).await?;
+        auth_send.write_all(&identity.public_bytes()).await?;
+        auth_send.write_all(&host_nonce).await?;
+        auth_send.finish().ok();
+
+        let mut client_sig = [0u8; 64];
+        auth_recv.read_exact(&mut client_sig).await?;
+        if client_pub == [0u8; 32] {
+            // anonymous — presented no identity
+            Ok((None, wants_gyro_flag, wants_hdr_flag, stream_mode))
+        } else {
+            core_crypto::verify_client_auth(&host_nonce, &exporter, &client_sig, &client_pub)
+                .map_err(|e| anyhow::anyhow!("client auth: {e}"))?;
+            Ok((
+                Some(client_pub),
+                wants_gyro_flag,
+                wants_hdr_flag,
+                stream_mode,
+            ))
+        }
+    };
+    // Bound auth: a peer that completes the QUIC handshake but never sends the
+    // auth frame (a half-dead pre-empting client, a port probe) must not hang
+    // the accept loop — it fails out in 5s.
+    match tokio::time::timeout(std::time::Duration::from_secs(5), auth_fut).await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::anyhow!("auth timed out")),
+    }
+}
+
+/// Hard cap on simultaneous mirrored clients. Mirror is ONE encode, so this
+/// bounds per-connection task cost + the N× unicast UPLINK (mirror saves GPU
+/// encode, not wire bytes) — a little headroom over the ~3-NVENC-session bar.
+const MIRROR_MAX_CLIENTS: usize = 4;
+/// Close code for a client rejected because the mirror is full — distinct from
+/// PREEMPT (0x9) so the client surfaces "host full", not "another device active".
+const CAPACITY_CLOSE_CODE: u32 = 0xA;
+/// Close code when the host switches stream mode (mirror↔single): the client
+/// treats it as a benign reconnect, NOT a pre-emption.
+const MODE_SWITCH_CLOSE_CODE: u32 = 0xB;
+
+/// Per-device input gate: the set of client pubkeys whose input forwarding is
+/// DISABLED (default empty → every device's input reaches the seat, today's
+/// behavior). A plain process-global because the host is one process with one
+/// smithay seat; the compositor's control handler flips entries via
+/// [`set_input_enabled`] when the panel toggles a device card. Read by the
+/// per-connection input tasks ([`input_allowed`]) just before forwarding. This
+/// REPLACES the mirror primary-only heuristic with the user's explicit choice.
+static INPUT_DISABLED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<[u8; 32]>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Enable/disable input forwarding for one client pubkey, live. Called from the
+/// compositor control handler on a panel `SetInputEnabled`.
+pub fn set_input_enabled(pubkey: [u8; 32], enabled: bool) {
+    if let Ok(mut s) = INPUT_DISABLED.lock() {
+        if enabled {
+            s.remove(&pubkey);
+        } else {
+            s.insert(pubkey);
+        }
+    }
+}
+
+/// Whether this connection's input should reach the seat. Anonymous clients
+/// (no pinned pubkey — not representable as a canvas card) are always allowed;
+/// a pinned device is allowed unless the panel disabled it.
+fn input_allowed(pubkey: Option<[u8; 32]>) -> bool {
+    match pubkey {
+        None => true,
+        Some(pk) => INPUT_DISABLED
+            .lock()
+            .map(|s| !s.contains(&pk))
+            .unwrap_or(true),
+    }
+}
+
+/// Removes a mirrored client's registry slot on ANY actor exit (closed / send
+/// error / panic), so a dead client can't wedge a slot or hold the connected
+/// gate. Clears `connected`/`wants_gyro` when the last client leaves.
+struct SlotGuard {
+    clients: Arc<std::sync::Mutex<Vec<ClientSlot>>>,
+    connected: Arc<AtomicBool>,
+    wants_gyro: Arc<AtomicBool>,
+    wants_hdr: Arc<AtomicBool>,
+    id: u64,
+}
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slots) = self.clients.lock() {
+            let before = slots.len();
+            slots.retain(|s| s.id != self.id);
+            // Only clear the shared gate if WE actually removed our own slot AND
+            // the registry is now empty. A straggler whose slot was already
+            // cleared by the mode-switch teardown (removed == false) must NOT
+            // clobber a `connected` flag the single-client path has since
+            // re-armed — otherwise it blacks out the new single stream.
+            let removed = slots.len() < before;
+            if removed && slots.is_empty() {
+                self.connected.store(false, Ordering::Release);
+                self.wants_gyro.store(false, Ordering::Release);
+                self.wants_hdr.store(false, Ordering::Release);
+            }
+        }
+    }
+}
+
+/// Send the encoder geometry to one client as a `DG_STREAM_GEOMETRY` datagram —
+/// identical wire shape to the single-client announce (w_be ‖ h_be, 8 bytes).
+fn announce_geom_to(g: u64, conn: &quinn::Connection) {
+    if g != 0 {
+        let payload = [((g >> 32) as u32).to_be_bytes(), (g as u32).to_be_bytes()].concat();
+        let _ = conn.send_datagram(tagged_datagram(DG_STREAM_GEOMETRY, &payload));
+    }
+}
+
+/// Video queue depth (frames) — same `PHAROS_QUEUE_FRAMES` knob as the single
+/// path, applied per mirrored client.
+fn video_qdepth() -> usize {
+    std::env::var("PHAROS_QUEUE_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(8)
+}
+
+/// MIRROR keep-N fan-out loop. Borrows `&mut rx` (the SAME producer channel the
+/// single path uses — never moved) and `select!`s over: accept (auth + admit a
+/// new client in a spawned task so a slow handshake can't stall video), the
+/// encoder channel (fan each AU to every client's bounded queue, drop-newest,
+/// never blocking), and audio/gyro datagrams. Returns when the mode flag flips
+/// back to single (closing all clients with `MODE_SWITCH_CLOSE_CODE`), so the
+/// caller falls back into the validated single-client loop.
+#[allow(clippy::too_many_arguments)]
+async fn run_mirror_loop(
+    endpoint: &Endpoint,
+    rx: &mut mpsc::Receiver<VideoChunk>,
+    audio_rx: &mut mpsc::Receiver<Vec<u8>>,
+    gyro_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+    mirror: &Arc<AtomicBool>,
+    clients: &Arc<std::sync::Mutex<Vec<ClientSlot>>>,
+    identity: &Arc<core_crypto::Identity>,
+    authorizer: &ClientAuthorizer,
+    first_conn: quinn::Connection,
+    first_id: Option<[u8; 32]>,
+    first_wants_gyro: bool,
+    first_wants_hdr: bool,
+    connected: &Arc<AtomicBool>,
+    wants_gyro: &Arc<AtomicBool>,
+    wants_hdr: &Arc<AtomicBool>,
+    geom: &Arc<std::sync::atomic::AtomicU64>,
+    input_tx: &mpsc::UnboundedSender<core_proto::InputEvent>,
+) {
+    tracing::info!("mirror: entering keep-N fan-out loop");
+    // Drop any single-session backlog so newcomers don't decode stale AUs.
+    while rx.try_recv().is_ok() {}
+    while audio_rx.try_recv().is_ok() {}
+
+    let next_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Admit the first (already-authed) connection that brought us into mirror.
+    admit_mirror_client(
+        first_conn,
+        first_id,
+        first_wants_gyro,
+        first_wants_hdr,
+        clients,
+        &next_id,
+        connected,
+        wants_gyro,
+        wants_hdr,
+        geom,
+        input_tx,
+        mirror,
+    );
+
+    loop {
+        // Mode flipped back to single → tear down all mirrored clients (a benign
+        // reconnect for them) and return so the caller re-enters the single loop.
+        if !mirror.load(Ordering::Acquire) {
+            let mut slots = match clients.lock() {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            tracing::info!("mirror: mode off, closing {} client(s)", slots.len());
+            for s in slots.iter() {
+                s.conn.close(MODE_SWITCH_CLOSE_CODE.into(), b"mode switch");
+            }
+            slots.clear();
+            drop(slots);
+            connected.store(false, Ordering::Release);
+            wants_gyro.store(false, Ordering::Release);
+            wants_hdr.store(false, Ordering::Release);
+            while rx.try_recv().is_ok() {}
+            return;
+        }
+
+        tokio::select! {
+            biased;
+            // A new client connects → auth + admit in a spawned task so a slow
+            // 5s handshake never stalls the video fan-out below.
+            inc = endpoint.accept() => {
+                if let Some(inc) = inc {
+                    let clients = clients.clone();
+                    let next_id = next_id.clone();
+                    let identity = identity.clone();
+                    let authorizer = authorizer.clone();
+                    let connected = connected.clone();
+                    let wants_gyro = wants_gyro.clone();
+                    let wants_hdr = wants_hdr.clone();
+                    let geom = geom.clone();
+                    let input_tx = input_tx.clone();
+                    let mirror = mirror.clone();
+                    tokio::spawn(async move {
+                        let conn = match inc.await {
+                            Ok(c) => c,
+                            Err(e) => { tracing::warn!("mirror incoming: {e:?}"); return; }
+                        };
+                        // Cheap fast-reject before the 5s auth (the authoritative
+                        // capacity + mode gate is under the lock in admit).
+                        if clients.lock().map(|c| c.len()).unwrap_or(usize::MAX) >= MIRROR_MAX_CLIENTS {
+                            tracing::warn!("mirror full ({MIRROR_MAX_CLIENTS}); rejecting {}", conn.remote_address());
+                            conn.close(CAPACITY_CLOSE_CODE.into(), b"host full");
+                            return;
+                        }
+                        let (cid, cwg, cwh, _cmode) = match authenticate(&conn, &identity).await {
+                            Ok(v) => v,
+                            Err(e) => { tracing::warn!("mirror auth failed: {e:?}"); conn.close(0u32.into(), b"auth"); return; }
+                        };
+                        if !authorizer(cid) {
+                            tracing::warn!("mirror client rejected (not paired)");
+                            conn.close(0u32.into(), b"unauthorized");
+                            return;
+                        }
+                        // Mode may have flipped off during the auth await — early
+                        // reject so we don't resurrect a slot; admit re-checks under
+                        // the lock too (belt-and-braces against the teardown race).
+                        if !mirror.load(Ordering::Acquire) {
+                            conn.close(MODE_SWITCH_CLOSE_CODE.into(), b"mode switch");
+                            return;
+                        }
+                        admit_mirror_client(conn, cid, cwg, cwh, &clients, &next_id, &connected, &wants_gyro, &wants_hdr, &geom, &input_tx, &mirror);
+                    });
+                }
+            }
+            // A fresh encoded AU → fan to every client's bounded queue. Drop-newest
+            // on full (a slow client sheds frames for ITSELF; ≤1s IDR resyncs it);
+            // try_send never awaits, so one stalled client can't block the others.
+            chunk = rx.recv() => {
+                let Some(chunk) = chunk else { return; }; // producer gone (shutdown)
+                if let Ok(slots) = clients.lock() {
+                    for s in slots.iter() {
+                        // Same keyframe-protecting admission as the single-client
+                        // queue: a P-frame is dropped-newest when this client's
+                        // queue is full, but an IDR may use the KF_RESERVE slots so
+                        // a momentarily slow client never loses the one frame that
+                        // resyncs it (queue sized video_qdepth()+KF_RESERVE below).
+                        let free = s.tx.capacity();
+                        let admit = if chunk.keyframe { free > 0 } else { free > KF_RESERVE };
+                        if admit {
+                            let _ = s.tx.try_send(chunk.clone());
+                        }
+                    }
+                }
+            }
+            // Audio → fan as datagrams to ALL clients (output; small + unreliable).
+            pkt = audio_rx.recv() => {
+                if let Some(pkt) = pkt {
+                    if let Ok(slots) = clients.lock() {
+                        for s in slots.iter() {
+                            let _ = s.conn.send_datagram(tagged_datagram(DG_AUDIO, &pkt));
+                        }
+                    }
+                }
+            }
+            // Gyro telemetry → PRIMARY only (it's the calibrating client's).
+            pkt = gyro_rx.recv() => {
+                if let Some(pkt) = pkt {
+                    if let Ok(slots) = clients.lock() {
+                        if let Some(p) = slots.iter().min_by_key(|s| s.id) {
+                            let _ = p.conn.send_datagram(tagged_datagram(DG_GYRO, &pkt));
+                        }
+                    }
+                }
+            }
+            // Periodic wake so the mode-flip check above runs even when idle.
+            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+        }
+    }
+}
+
+/// Register one authenticated connection as a mirrored client and spawn its
+/// per-connection actor (drains its bounded queue onto a uni stream, measures
+/// fps, RAII-deregisters on exit) + its input task (forwards events only while
+/// PRIMARY). The dispatcher in [`run_mirror_loop`] feeds the queue.
+#[allow(clippy::too_many_arguments)]
+fn admit_mirror_client(
+    conn: quinn::Connection,
+    client_id: Option<[u8; 32]>,
+    client_wants_gyro: bool,
+    client_wants_hdr: bool,
+    clients: &Arc<std::sync::Mutex<Vec<ClientSlot>>>,
+    next_id: &Arc<std::sync::atomic::AtomicU64>,
+    connected: &Arc<AtomicBool>,
+    wants_gyro: &Arc<AtomicBool>,
+    wants_hdr: &Arc<AtomicBool>,
+    geom: &Arc<std::sync::atomic::AtomicU64>,
+    input_tx: &mpsc::UnboundedSender<core_proto::InputEvent>,
+    mirror: &Arc<AtomicBool>,
+) {
+    let id = next_id.fetch_add(1, Ordering::Relaxed);
+    let (slot_tx, mut slot_rx) = mpsc::channel::<VideoChunk>(video_qdepth() + KF_RESERVE);
+    let fps_ewma = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let frames_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let addr = conn.remote_address();
+    // Authoritative admission: the capacity bound AND the mode re-check happen
+    // UNDER the same lock as the push (and the same lock the mode-off teardown
+    // takes), so a burst of concurrent admit tasks can't overshoot
+    // MIRROR_MAX_CLIENTS (TOCTOU), and an admit whose 5s auth straddled a
+    // mirror→single flip can't resurrect a phantom slot. The cheap pre-auth
+    // check in run_mirror_loop stays a fast-reject; this is the real gate.
+    {
+        let mut slots = match clients.lock() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if !mirror.load(Ordering::Acquire) {
+            drop(slots);
+            conn.close(MODE_SWITCH_CLOSE_CODE.into(), b"mode switch");
+            return;
+        }
+        if slots.len() >= MIRROR_MAX_CLIENTS {
+            drop(slots);
+            tracing::warn!("mirror full ({MIRROR_MAX_CLIENTS}); rejecting {addr}");
+            conn.close(CAPACITY_CLOSE_CODE.into(), b"host full");
+            return;
+        }
+        slots.push(ClientSlot {
+            id,
+            peer_pubkey: client_id,
+            peer_addr: addr,
+            conn: conn.clone(),
+            tx: slot_tx,
+            fps_ewma: fps_ewma.clone(),
+            frames_sent: frames_sent.clone(),
+        });
+        connected.store(true, Ordering::Release);
+        if client_wants_gyro {
+            wants_gyro.store(true, Ordering::Release);
+        }
+        // Mirror HDR: OR across clients (matching gyro). A mixed SDR/HDR mirror is
+        // an edge case the session-switch gate (with wants_hdr) must still resolve
+        // conservatively; here we only record that some client asked.
+        if client_wants_hdr {
+            wants_hdr.store(true, Ordering::Release);
+        }
+        tracing::info!("mirror: admitted {addr} (id={id}, total={})", slots.len());
+    }
+
+    // Per-connection ACTOR: drains the bounded queue onto a uni stream.
+    let clients_actor = clients.clone();
+    let connected_actor = connected.clone();
+    let wants_gyro_actor = wants_gyro.clone();
+    let wants_hdr_actor = wants_hdr.clone();
+    let geom_actor = geom.clone();
+    let conn_actor = conn.clone();
+    tokio::spawn(async move {
+        // RAII: removes the slot + updates gates on ANY exit path.
+        let _guard = SlotGuard {
+            clients: clients_actor,
+            connected: connected_actor,
+            wants_gyro: wants_gyro_actor,
+            wants_hdr: wants_hdr_actor,
+            id,
+        };
+        let mut send = match conn_actor.open_uni().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("mirror open_uni: {e:?}");
+                return;
+            }
+        };
+        let mut last_geom_m = geom_actor.load(Ordering::Relaxed);
+        announce_geom_to(last_geom_m, &conn_actor);
+        // Frames left in a dense re-send burst armed on a geometry change (mirror
+        // shares one coded size across clients; the ladder can still move it).
+        let mut geom_change_resend: u32 = 0;
+        let mut n: u64 = 0;
+        let mut win_start = tokio::time::Instant::now();
+        let mut win_frames: u32 = 0;
+        loop {
+            tokio::select! {
+                biased;
+                _ = conn_actor.closed() => break,
+                chunk = slot_rx.recv() => {
+                    let Some(chunk) = chunk else { break };
+                    let len_be = (chunk.au.len() as u32).to_be_bytes();
+                    // Race the write against the connection closing so a dead-but-
+                    // kept-alive client frees its own slot without wedging others.
+                    let write_fut = async {
+                        send.write_all(&len_be).await?;
+                        send.write_all(&chunk.au).await?;
+                        anyhow::Ok(())
+                    };
+                    tokio::select! {
+                        biased;
+                        _ = conn_actor.closed() => break,
+                        r = write_fut => { if r.is_err() { break; } }
+                    }
+                    frames_sent.fetch_add(1, Ordering::Relaxed);
+                    n = n.wrapping_add(1);
+                    win_frames += 1;
+                    // Re-announce geometry on a CHANGE (dense burst so a mirror
+                    // client sees a ladder step promptly, not up to ~1s later) and
+                    // ~1×/s as a steady backstop vs a lost datagram.
+                    let g = geom_actor.load(Ordering::Relaxed);
+                    if g != last_geom_m {
+                        geom_change_resend = 8;
+                        last_geom_m = g;
+                    }
+                    if geom_change_resend > 0 || n.is_multiple_of(60) {
+                        announce_geom_to(g, &conn_actor);
+                    }
+                    geom_change_resend = geom_change_resend.saturating_sub(1);
+                }
+                // Window tick: publish this client's measured wire fps every 1s
+                // — INCLUDING zero-frame windows, so a stalled client decays to 0
+                // instead of freezing at its last good rate.
+                _ = tokio::time::sleep_until(win_start + std::time::Duration::from_secs(1)) => {
+                    let el = win_start.elapsed().as_secs_f32();
+                    let fps = if el > 0.0 { (win_frames as f32 / el).round() as u32 } else { 0 };
+                    fps_ewma.store(fps, Ordering::Relaxed);
+                    win_frames = 0;
+                    win_start = tokio::time::Instant::now();
+                }
+            }
+        }
+        // _guard Drop deregisters the slot.
+    });
+
+    // Per-connection INPUT task: forward decoded events to the seat only when
+    // THIS device's input is enabled (the panel's per-device toggle). Default
+    // is enabled; a disabled device's input is drained + discarded so N mirror
+    // viewers don't fight over the one seat — the user picks the driver(s).
+    let input_tx_conn = input_tx.clone();
+    let conn_input = conn;
+    let input_pubkey = client_id;
+    tokio::spawn(async move {
+        loop {
+            let mut recv = match conn_input.accept_bi().await {
+                Ok((_send, recv)) => recv,
+                Err(_) => return, // connection ended
+            };
+            let tx = input_tx_conn.clone();
+            tokio::spawn(async move {
+                let mut len_buf = [0u8; 4];
+                loop {
+                    if recv.read_exact(&mut len_buf).await.is_err() {
+                        return;
+                    }
+                    let len = u32::from_be_bytes(len_buf) as usize;
+                    if len > 4096 {
+                        tracing::warn!("input event too large ({len} bytes); dropping stream");
+                        return;
+                    }
+                    let mut buf = vec![0u8; len];
+                    if recv.read_exact(&mut buf).await.is_err() {
+                        return;
+                    }
+                    if !input_allowed(input_pubkey) {
+                        continue; // disabled device: drain + discard
+                    }
+                    match core_proto::decode_input(&buf) {
+                        Ok(ev) => {
+                            if tx.send(ev).is_err() {
+                                return;
+                            }
+                        }
+                        Err(e) => tracing::warn!("decode input: {e}"),
+                    }
+                }
+            });
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_stream(
+    addr: SocketAddr,
+    mut rx: mpsc::Receiver<VideoChunk>,
+    mut audio_rx: mpsc::Receiver<Vec<u8>>,
+    mut gyro_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    connected: Arc<AtomicBool>,
+    peer_pubkey: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
+    peer_addr: Arc<std::sync::Mutex<Option<SocketAddr>>>,
+    wants_gyro: Arc<AtomicBool>,
+    wants_hdr: Arc<AtomicBool>,
+    client_refresh_hz: Arc<std::sync::atomic::AtomicU32>,
+    client_panel: Arc<std::sync::atomic::AtomicU64>,
+    client_res_pref: Arc<std::sync::atomic::AtomicU64>,
+    client_bitrate_pref: Arc<std::sync::atomic::AtomicU64>,
+    client_fps_pref: Arc<std::sync::atomic::AtomicU64>,
+    identity: Arc<core_crypto::Identity>,
+    input_tx: mpsc::UnboundedSender<core_proto::InputEvent>,
+    latency_tx: mpsc::UnboundedSender<core_proto::WireLatencyReport>,
+    qos_tx: mpsc::UnboundedSender<core_proto::ClientQos>,
+    app_catalog_rx: tokio::sync::watch::Receiver<Vec<core_proto::AppInfo>>,
+    app_launch_tx: mpsc::UnboundedSender<core_proto::AppMsg>,
+    authorizer: ClientAuthorizer,
+    geom: Arc<std::sync::atomic::AtomicU64>,
+    loss: Arc<std::sync::atomic::AtomicU32>,
+    drops: Arc<std::sync::atomic::AtomicU64>,
+    request_idr: Arc<AtomicBool>,
+    mirror: Arc<AtomicBool>,
+    clients: Arc<std::sync::Mutex<Vec<ClientSlot>>>,
+) -> Result<()> {
+    // Retry on EADDRINUSE: a host Relaunch re-execs in place, and the previous
+    // image's UDP socket can still be releasing when the new one rebinds — so
+    // wait it out (up to ~3s) instead of failing the whole host.
+    let endpoint = {
+        let mut attempt = 0u32;
+        loop {
+            let cfg = server_config()?;
+            match Endpoint::server(cfg, addr) {
+                Ok(ep) => break ep,
+                Err(e) if e.to_string().to_lowercase().contains("in use") && attempt < 20 => {
+                    attempt += 1;
+                    tracing::warn!("stream bind {addr} busy (attempt {attempt}); retrying…");
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                }
+                // Durably taken (another service owns it, not our own releasing
+                // socket). Auto-resolve to a free port + log LOUDLY rather than
+                // leave the host dead — this is the failure the panel's
+                // walked-into-usbimport bug produced.
+                Err(e) if e.to_string().to_lowercase().contains("in use") => {
+                    match bind_free_from(addr) {
+                        Some((ep, used)) => {
+                            tracing::error!(
+                                "stream bind {addr} is taken by another service; \
+                                 auto-failed-over to {used} — point the client at \
+                                 {} or free {addr}",
+                                used.port()
+                            );
+                            break ep;
+                        }
+                        None => return Err(e.into()),
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    };
+    tracing::info!("QUIC streamer listening on {}", endpoint.local_addr()?);
+    // Multi-shot accept: when a client drops we go back to accept(), so the
+    // host stays up across reconnects. Frames queued during the gap get
+    // drained (they're for the previous session and would corrupt the
+    // newcomer's decoder). The compositor gates its encoder on `connected`,
+    // so the queue should be empty by the time we re-accept; the drain is
+    // belt-and-braces against the encode-in-flight race window.
+    //
+    // NOTE: the per-session NVENC encoder on the host keeps running across
+    // reconnects, so the first frames a new client sees may be P-frames
+    // referencing the prior session. The encoder is now configured for a
+    // 1-second IDR period with repeated VPS/SPS/PPS (see the encode-config
+    // setup in compositor `lib.rs`/`multi.rs`), so a reconnecting decoder
+    // resyncs within ≤1s instead of stalling forever on `PPS id out of range`.
+    // A new client can PRE-EMPT the active session: the inner streaming loop
+    // stashes the newcomer's raw `Incoming` here, closes the incumbent, and
+    // breaks, so the next turn serves the newcomer. This frees the single-client
+    // slot the instant a replacement connects — covering both a deliberate device
+    // switch AND a crashed/powered-off client whose dead connection would
+    // otherwise hold the slot until the 20s idle timer (and sometimes far longer,
+    // while 2s keep-alives keep the corpse warm). The newcomer is still
+    // authenticated (with a timeout) at the loop top before it gets any frames.
+    let mut pending_incoming: Option<quinn::Incoming> = None;
+    loop {
+        let incoming = match pending_incoming.take() {
+            Some(i) => i,
+            None => match endpoint.accept().await {
+                Some(i) => i,
+                None => {
+                    tracing::info!("endpoint closed");
+                    return Ok(());
+                }
+            },
+        };
+        let conn = match incoming.await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("incoming.await: {e:?}");
+                continue;
+            }
+        };
+        tracing::info!("Trireme connected from {}", conn.remote_address());
+
+        // Mutual auth, both directions channel-bound to the TLS exporter:
+        //   client → host: [optional v2 prefix: 4-byte magic + u32 version]
+        //                  client nonce + client pubkey (all-zero = anonymous)
+        //                  [v2 only: 1-byte wants_gyro flag]
+        //   host → client: host signature + host pubkey + host challenge nonce
+        //   client → host: client signature over the host challenge
+        //
+        // **v1/v2 detection:** the host reads the first 4 bytes. If they match
+        // [`AUTH_PROTO_MAGIC`] it's a v2 client and we then read the version u32
+        // + the rest of the v2 frame. Otherwise those 4 bytes are the first 4
+        // bytes of the v1 nonce — read the remaining 28 bytes and proceed
+        // exactly as the v1 wire, with wants_gyro defaulting to false.
+        //
+        // Collision: a v1 client's random nonce matching the magic is 1/2^32.
+        // On that vanishingly-rare false positive the client's "version" reads
+        // as random bytes, auth fails, the user reconnects. No security impact —
+        // the signatures still bind to the TLS exporter.
+        //
+        // The host always proves itself (host→client pinning unchanged); the
+        // client proves itself too, and we then *authorize* the verified
+        // pubkey. Trust is entirely in these Ed25519 identities — the TLS cert
+        // is just the tunnel (see `SkipServerVerification`), never a trust
+        // anchor (avoids the Nova/Polaris self-signed-cert pitfall).
+        //
+        // The handshake itself lives in [`authenticate`] (shared verbatim with the
+        // mirror accept path); failure here closes the connection and awaits the
+        // next. We then *authorize* the verified pubkey below.
+        let (client_id, client_wants_gyro, client_wants_hdr, client_mode) =
+            match authenticate(&conn, &identity).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("auth failed: {e:?}; awaiting next client");
+                    conn.close(0u32.into(), b"auth");
+                    continue;
+                }
+            };
+        if !authorizer(client_id) {
+            tracing::warn!(
+                "client rejected ({}); not in paired peers",
+                if client_id.is_some() {
+                    "presented identity"
+                } else {
+                    "anonymous"
+                }
+            );
+            conn.close(0u32.into(), b"unauthorized");
+            continue;
+        }
+
+        // MIRROR keep-N: hand this authed connection to the fan-out loop, which
+        // admits it + accepts more, sharing ONE encode across all. Returns when
+        // the mode flips back to single; then `continue` re-enters the validated
+        // pre-empt path below (which is byte-identical — reached only when the
+        // mirror flag is off, the default). See MIRROR_EXTEND_PLAN.md.
+        if mirror.load(Ordering::Acquire) {
+            run_mirror_loop(
+                &endpoint,
+                &mut rx,
+                &mut audio_rx,
+                &mut gyro_rx,
+                &mirror,
+                &clients,
+                &identity,
+                &authorizer,
+                conn,
+                client_id,
+                client_wants_gyro,
+                client_wants_hdr,
+                &connected,
+                &wants_gyro,
+                &wants_hdr,
+                &geom,
+                &input_tx,
+            )
+            .await;
+            continue;
+        }
+
+        // Drain leftover video frames + audio packets queued for the previous
+        // client (audio is unreliable, so stale packets are simply dropped). The
+        // video drain also clears any leftover bench meta — it now rides inline on
+        // each VideoChunk, so there's no separate channel to flush.
+        while rx.try_recv().is_ok() {}
+        while audio_rx.try_recv().is_ok() {}
+
+        let mut send = match conn.open_uni().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("open_uni: {e:?}");
+                continue;
+            }
+        };
+        wants_gyro.store(client_wants_gyro, Ordering::Release);
+        wants_hdr.store(client_wants_hdr, Ordering::Release);
+        // Per-client panel refresh (Hz) for the compositor's fps cap. 0 from a v2
+        // client (no StreamMode) → the compositor leaves fps at its config ceiling.
+        client_refresh_hz.store(client_mode.refresh_hz(), Ordering::Release);
+        // Panel native resolution (Phase 3c): packed (w<<32)|h, 0 from a v2 client.
+        // The compositor reads it on connect to decide whether to grow the encode
+        // envelope (restart-into-panel-res). 0×0 leaves the envelope at config.
+        client_panel.store(
+            (u64::from(client_mode.width) << 32) | u64::from(client_mode.height),
+            Ordering::Release,
+        );
+        tracing::info!(
+            "client requested mode: {}x{} @ {}Hz (refresh_mhz={}) — fps caps to refresh when >0",
+            client_mode.width,
+            client_mode.height,
+            client_mode.refresh_hz(),
+            client_mode.refresh_mhz
+        );
+        // Attribute the stream to its verified peer (None for an anonymous
+        // client) so the host's status can name who's connected, and record the
+        // remote addr it dialed from.
+        if let Ok(mut g) = peer_pubkey.lock() {
+            *g = client_id;
+        }
+        if let Ok(mut g) = peer_addr.lock() {
+            *g = Some(conn.remote_address());
+        }
+        connected.store(true, Ordering::Release);
+        tracing::info!(
+            "streaming to client (wants_gyro={}, wants_hdr={})",
+            client_wants_gyro,
+            client_wants_hdr
+        );
+
+        // Spawn a per-connection task that accepts the input bidi stream (if
+        // the client opens one) and forwards each decoded InputEvent to the
+        // compositor via `input_tx`. The stream is optional — clients without
+        // input capture (trireme-kms, trireme decode) just never open it.
+        // When the connection ends, the read loop ends with an error and the
+        // task exits cleanly.
+        let input_tx_conn = input_tx.clone();
+        let conn_input = conn.clone();
+        let input_pubkey = client_id;
+        tokio::spawn(async move {
+            loop {
+                let mut recv = match conn_input.accept_bi().await {
+                    Ok((_send, recv)) => recv,
+                    Err(_) => return, // connection ended
+                };
+                let tx = input_tx_conn.clone();
+                tokio::spawn(async move {
+                    let mut len_buf = [0u8; 4];
+                    loop {
+                        if recv.read_exact(&mut len_buf).await.is_err() {
+                            return;
+                        }
+                        let len = u32::from_be_bytes(len_buf) as usize;
+                        // Sanity ceiling — postcard'd events are tens of bytes.
+                        if len > 4096 {
+                            tracing::warn!("input event too large ({len} bytes); dropping stream");
+                            return;
+                        }
+                        let mut buf = vec![0u8; len];
+                        if recv.read_exact(&mut buf).await.is_err() {
+                            return;
+                        }
+                        // Per-device gate: drain + discard if the panel disabled
+                        // this device's input (default = allowed).
+                        if !input_allowed(input_pubkey) {
+                            continue;
+                        }
+                        match core_proto::decode_input(&buf) {
+                            Ok(ev) => {
+                                if tx.send(ev).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(e) => tracing::warn!("decode input: {e}"),
+                        }
+                    }
+                });
+            }
+        });
+
+        // Spawn the per-connection APP RELAY task. The host *opens* a dedicated
+        // bidi stream (a direction the client only accepts, so it never collides
+        // with the input/video streams). It pushes the catalog (host→client,
+        // re-sent on change) and reads launch requests (client→host). Both are
+        // `AppMsg` framed as `u32 BE len || postcard`. Clients that don't speak
+        // the app protocol simply never accept the stream — harmless.
+        let conn_app = conn.clone();
+        let mut cat_rx = app_catalog_rx.clone();
+        let launch_tx_conn = app_launch_tx.clone();
+        tokio::spawn(async move {
+            let (mut send, mut recv) = match conn_app.open_bi().await {
+                Ok(s) => s,
+                Err(_) => return, // connection ended
+            };
+            tracing::info!("apprelay-host: app stream opened to client");
+            // Reader: client → host launch requests.
+            let read = async move {
+                let mut len_buf = [0u8; 4];
+                loop {
+                    if recv.read_exact(&mut len_buf).await.is_err() {
+                        tracing::info!("apprelay-host: app recv closed/err (read loop exit)");
+                        return;
+                    }
+                    let len = u32::from_be_bytes(len_buf) as usize;
+                    tracing::info!("apprelay-host: read {len}b frame from client");
+                    // Launch messages are tiny; cap defensively.
+                    if len > 64 * 1024 {
+                        tracing::warn!("app msg too large ({len} bytes); dropping stream");
+                        return;
+                    }
+                    let mut buf = vec![0u8; len];
+                    if recv.read_exact(&mut buf).await.is_err() {
+                        return;
+                    }
+                    match core_proto::decode_app(&buf) {
+                        // Forward every client→host action (Launch/SwitchTo/EndProcess)
+                        // to the compositor; Catalog flows the other way (ignore).
+                        Ok(msg @ core_proto::AppMsg::Launch { .. })
+                        | Ok(msg @ core_proto::AppMsg::SwitchTo { .. })
+                        | Ok(msg @ core_proto::AppMsg::EndProcess { .. }) => {
+                            tracing::info!("app relay: received {msg:?}");
+                            if launch_tx_conn.send(msg).is_err() {
+                                return;
+                            }
+                        }
+                        Ok(_) => {} // Catalog flows the other way; ignore.
+                        Err(e) => tracing::warn!("decode app msg: {e}"),
+                    }
+                }
+            };
+            // Writer: host → client catalog, current value first then on change.
+            let write = async move {
+                loop {
+                    let apps = cat_rx.borrow_and_update().clone();
+                    if !apps.is_empty() {
+                        match core_proto::encode_app(&core_proto::AppMsg::Catalog { apps }) {
+                            Ok(buf) => {
+                                let len_be = (buf.len() as u32).to_be_bytes();
+                                if send.write_all(&len_be).await.is_err()
+                                    || send.write_all(&buf).await.is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(e) => tracing::warn!("encode catalog: {e}"),
+                        }
+                    }
+                    if cat_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+                // Signal EOF to the client's catalog reader on teardown.
+                send.finish().ok();
+            };
+            tokio::join!(read, write);
+        });
+
+        // Spawn a per-connection INBOUND datagram task. The host normally only
+        // *sends* datagrams (audio/gyro/frame-meta); this reads the latency
+        // benchmark's two client→host datagram kinds:
+        //   DG_CLOCK_PING  — answer immediately with a DG_CLOCK_PONG carrying the
+        //                    echoed t0, our receive instant (t1) and send instant
+        //                    (t2) so the client can do the NTP-style offset/RTT calc.
+        //   DG_LATENCY_REPORT — decode the final WireLatencyReport and forward it.
+        // On `read_datagram` error the connection has ended, so we return (no leak
+        // across reconnects — a fresh task is spawned for the next client). Inert
+        // when no bench runs: the client never sends these unprompted.
+        let latency_tx_conn = latency_tx.clone();
+        let qos_tx_conn = qos_tx.clone();
+        let conn_dg = conn.clone();
+        let request_idr_dg = request_idr.clone();
+        let client_res_pref_dg = client_res_pref.clone();
+        let client_bitrate_pref_dg = client_bitrate_pref.clone();
+        let client_fps_pref_dg = client_fps_pref.clone();
+        tokio::spawn(async move {
+            loop {
+                let dg = match conn_dg.read_datagram().await {
+                    Ok(d) => d,
+                    Err(_) => return, // connection ended
+                };
+                match dg.first().copied() {
+                    Some(DG_CLOCK_PING) => {
+                        let t1 = unix_nanos();
+                        let ping = match core_proto::latency::decode_clock_ping(&dg[1..]) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::debug!("decode clock ping: {e}");
+                                continue;
+                            }
+                        };
+                        let pong = core_proto::ClockPong {
+                            seq: ping.seq,
+                            t0_nanos: ping.t0_nanos,
+                            t1_nanos: t1,
+                            t2_nanos: unix_nanos(),
+                        };
+                        match core_proto::latency::encode_clock_pong(&pong) {
+                            Ok(b) => {
+                                if let Err(e) =
+                                    conn_dg.send_datagram(tagged_datagram(DG_CLOCK_PONG, &b))
+                                {
+                                    tracing::debug!("clock pong datagram dropped: {e}");
+                                }
+                            }
+                            Err(e) => tracing::debug!("encode clock pong: {e}"),
+                        }
+                    }
+                    Some(DG_LATENCY_REPORT) => {
+                        match core_proto::latency::decode_wire_latency(&dg[1..]) {
+                            Ok(report) => {
+                                let _ = latency_tx_conn.send(report);
+                            }
+                            Err(e) => tracing::debug!("decode latency report: {e}"),
+                        }
+                    }
+                    Some(DG_CLIENT_QOS) => match core_proto::latency::decode_client_qos(&dg[1..]) {
+                        Ok(qos) => {
+                            let _ = qos_tx_conn.send(qos);
+                        }
+                        Err(e) => tracing::debug!("decode client qos: {e}"),
+                    },
+                    Some(DG_REQUEST_IDR) => {
+                        // Client saw corruption / a lost reference — force the next
+                        // encode to be an IDR (the compositor rate-limits it).
+                        request_idr_dg.store(true, Ordering::Relaxed);
+                    }
+                    Some(DG_CLIENT_RESPREF) => {
+                        // Client's requested resolution range (Phase 2). Store packed
+                        // (target_h<<32)|floor_h; the compositor reads it each window
+                        // and applies it as the per-output ceiling/floor.
+                        match core_proto::latency::decode_client_res_pref(&dg[1..]) {
+                            Ok(p) => {
+                                let packed = (u64::from(p.target_h) << 32) | u64::from(p.floor_h);
+                                client_res_pref_dg.store(packed, Ordering::Relaxed);
+                            }
+                            Err(e) => tracing::debug!("decode client res pref: {e}"),
+                        }
+                    }
+                    Some(DG_CLIENT_BITRATEPREF) => {
+                        // Client's requested bitrate range (Phase 3). Store packed
+                        // (min_kbps<<32)|max_kbps; the compositor reads it as the
+                        // controller's bitrate bounds (max=0 = uncapped).
+                        match core_proto::latency::decode_client_bitrate_pref(&dg[1..]) {
+                            Ok(p) => {
+                                let packed = (u64::from(p.min_kbps) << 32) | u64::from(p.max_kbps);
+                                client_bitrate_pref_dg.store(packed, Ordering::Relaxed);
+                            }
+                            Err(e) => tracing::debug!("decode client bitrate pref: {e}"),
+                        }
+                    }
+                    Some(DG_CLIENT_FPSPREF) => {
+                        // Client's requested framerate range (Phase 3). Store packed
+                        // (min_fps<<32)|max_fps; the compositor reads it as the
+                        // encode-pace ceiling + adaptation floor (max=0 = Auto/panel).
+                        match core_proto::latency::decode_client_fps_pref(&dg[1..]) {
+                            Ok(p) => {
+                                let packed = (u64::from(p.min_fps) << 32) | u64::from(p.max_fps);
+                                client_fps_pref_dg.store(packed, Ordering::Relaxed);
+                            }
+                            Err(e) => tracing::debug!("decode client fps pref: {e}"),
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        // Stream until the client drops or the channel closes. We have to
+        // race the send-loop against `conn.closed()` — the compositor stops
+        // pushing the moment we flip `connected=false` further down, so a
+        // bare `rx.recv().await` would block past the disconnect. The
+        // `closed()` future resolves the instant the connection ends.
+        enum LoopEnd {
+            PeerDropped,
+            CompositorClosed,
+            SendError(anyhow::Error),
+            // A newer client connected and took the slot; `pending_incoming`
+            // holds its raw Incoming to serve on the next loop turn.
+            Preempted,
+        }
+        // Announce the encoder geometry to the client up front (before any AU) so
+        // it can size its decoder to the true resolution; then re-announce on
+        // change and ~1×/s (it's an unreliable datagram, so a periodic resend
+        // recovers a lost one — one tiny datagram/sec is negligible).
+        let mut geom_resend: u32 = 0;
+        // Frames remaining in a dense re-send burst armed on a geometry CHANGE
+        // (the resolution ladder). The connect-time `geom_resend <= 8` burst only
+        // covers the first frames of the connection; a mid-stream change needs its
+        // own burst so the client receives the new size promptly under loss
+        // instead of betting on one datagram + the ~1s periodic backstop.
+        let mut geom_change_resend: u32 = 0;
+        let mut last_lost: u64 = 0;
+        let mut last_sent: u64 = 0;
+        let announce_geom = |g: u64, conn: &quinn::Connection| {
+            if g != 0 {
+                let payload = [
+                    (((g >> 32) as u32).to_be_bytes()),
+                    ((g as u32).to_be_bytes()),
+                ]
+                .concat();
+                let _ = conn.send_datagram(tagged_datagram(DG_STREAM_GEOMETRY, &payload));
+            }
+        };
+        let mut last_geom = {
+            let g = geom.load(Ordering::Relaxed);
+            announce_geom(g, &conn);
+            g
+        };
+
+        // Link-health heartbeat: every ~500ms tell the client whether we've shed any
+        // video AU since the last beat (the bounded queue dropped → reference loss →
+        // visible corruption). `last_drops` is seeded from the CURRENT counter so a
+        // previous session's accumulated drops don't make the first beat of this
+        // (per-connection) loop falsely report degraded.
+        let mut health_tick = tokio::time::interval(std::time::Duration::from_millis(500));
+        health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_drops = drops.load(Ordering::Relaxed);
+
+        let end_reason: LoopEnd;
+        loop {
+            tokio::select! {
+                biased;
+                _ = conn.closed() => {
+                    end_reason = LoopEnd::PeerDropped;
+                    break;
+                }
+                // Pre-emption (polled before video so a switch/replacement lands
+                // promptly even mid-stream): a new client connecting takes over.
+                // Stash its raw Incoming, drop the incumbent (instant switch; a dead
+                // client's slot frees without waiting on the 20s idle timer), and
+                // break — the newcomer is authenticated at the loop top.
+                inc = endpoint.accept() => {
+                    if let Some(inc) = inc {
+                        tracing::info!("new client connecting; pre-empting current session");
+                        // If mirror just turned on, this incumbent shouldn't yield
+                        // forever — close with MODE_SWITCH (a benign redial) so it
+                        // reconnects and rejoins as a co-client. Off (the default) =
+                        // PREEMPT 0x9, byte-identical single-client behaviour.
+                        let close_code = if mirror.load(Ordering::Acquire) {
+                            MODE_SWITCH_CLOSE_CODE
+                        } else {
+                            PREEMPT_CLOSE_CODE
+                        };
+                        conn.close(close_code.into(), b"preempted");
+                        pending_incoming = Some(inc);
+                        end_reason = LoopEnd::Preempted;
+                        break;
+                    }
+                }
+                _ = health_tick.tick() => {
+                    // Heartbeat: degraded iff a video AU was dropped since the last
+                    // beat. One tiny unreliable datagram; a lost beat self-heals next
+                    // tick, and the client holds the indicator briefly (hysteresis) so
+                    // a single-window blip doesn't flicker.
+                    let now = drops.load(Ordering::Relaxed);
+                    let degraded = now > last_drops;
+                    last_drops = now;
+                    let _ = conn.send_datagram(tagged_datagram(DG_LINK_HEALTH, &[degraded as u8]));
+                }
+                next = rx.recv() => {
+                    let Some(chunk) = next else {
+                        end_reason = LoopEnd::CompositorClosed;
+                        break;
+                    };
+                    // Re-announce geometry on change (the res actuator) and ~1×/s as
+                    // belt-and-braces against a lost geometry datagram.
+                    geom_resend = geom_resend.wrapping_add(1);
+                    let g = geom.load(Ordering::Relaxed);
+                    // Arm a dense re-send burst on a CHANGE (the res actuator), so the
+                    // client almost certainly receives the new geometry promptly even
+                    // under loss (it's unreliable + un-retransmitted) — a single
+                    // change-frame announce + the ~1s backstop would leave up to ~1s of
+                    // sheared/green frames per ladder step.
+                    if g != 0 && g != last_geom {
+                        geom_change_resend = 8;
+                        last_geom = g;
+                    }
+                    // Announce during the connect-time burst, during a change burst,
+                    // and ~1×/s thereafter as a steady backstop.
+                    if g != 0
+                        && (geom_change_resend > 0
+                            || geom_resend <= 8
+                            || geom_resend.is_multiple_of(120))
+                    {
+                        announce_geom(g, &conn);
+                    }
+                    geom_change_resend = geom_change_resend.saturating_sub(1);
+                    // Step 0 congestion observability: surface quinn's path stats
+                    // (RTT, cwnd, packet loss) ~1×/s. The pacer's network term is
+                    // driven by client-reported delivered fps; these localise WHERE
+                    // loss is (host link vs. last-mile) and are the cheapest free
+                    // host-side signal for a future loss-based term.
+                    if geom_resend.is_multiple_of(120) {
+                        let s = conn.stats().path;
+                        let dlost = s.lost_packets.saturating_sub(last_lost);
+                        let dsent = s.sent_packets.saturating_sub(last_sent);
+                        last_lost = s.lost_packets;
+                        last_sent = s.sent_packets;
+                        // Forward-path loss permille over the last window — the host's OWN
+                        // congestion signal, usable to adapt even for a client that sends
+                        // no DG_CLIENT_QOS (e.g. an older APK). Published for the pacer.
+                        let permille = dlost
+                            .saturating_mul(1000)
+                            .checked_div(dsent)
+                            .map_or(0, |v| v.min(1000) as u32);
+                        loss.store(permille, Ordering::Relaxed);
+                        tracing::info!(
+                            target: "compositor::wire",
+                            "quic path: rtt={:.0}ms cwnd={} lost_1s={} loss={}permille lost_total={}",
+                            s.rtt.as_secs_f32() * 1000.0,
+                            s.cwnd,
+                            dlost,
+                            permille,
+                            s.lost_packets,
+                        );
+                    }
+                    // Bench window only: stamp `wire_send_ns` at the LAST possible
+                    // host instant (right before the bytes go on the wire), then send
+                    // the meta as a DG_FRAME_META datagram 1:1 with this AU. Inert in
+                    // normal streaming — `meta` is None, so this whole block is skipped.
+                    if let Some(mut meta) = chunk.meta {
+                        meta.wire_send_ns = unix_nanos();
+                        match core_proto::latency::encode_frame_meta(&meta) {
+                            Ok(b) => {
+                                if let Err(e) =
+                                    conn.send_datagram(tagged_datagram(DG_FRAME_META, &b))
+                                {
+                                    tracing::debug!("frame-meta datagram dropped: {e}");
+                                }
+                            }
+                            Err(e) => tracing::debug!("encode frame meta: {e}"),
+                        }
+                    }
+                    let len_be = (chunk.au.len() as u32).to_be_bytes();
+                    let chunk_bytes = chunk.au.len();
+                    let write_t0 = std::time::Instant::now();
+                    // The video write can park INDEFINITELY feeding a dead-but-kept-
+                    // alive peer: the flow-control window exhausts, no ACKs return
+                    // credit, and the 2s keep-alives stop quinn's idle timer from ever
+                    // reaping the corpse — so a bare `write_all().await` here wedges the
+                    // whole single-client slot until a manual host restart (the bug we
+                    // are fixing). Race the send against the connection closing AND a
+                    // NEW client arriving: either frees the slot immediately, with no
+                    // dependence on the idle timer. Cancelling the half-written
+                    // length-prefixed stream is safe — we only do it while ABANDONING
+                    // this connection (PeerDropped/Preempted); the stream is never reused.
+                    let send_fut = async {
+                        send.write_all(&len_be).await?;
+                        send.write_all(&chunk.au).await?;
+                        anyhow::Ok(())
+                    };
+                    tokio::select! {
+                        biased;
+                        _ = conn.closed() => {
+                            end_reason = LoopEnd::PeerDropped;
+                            break;
+                        }
+                        inc = endpoint.accept() => {
+                            if let Some(inc) = inc {
+                                tracing::info!("new client connecting mid-send; pre-empting current session");
+                                // Mirror-on → MODE_SWITCH so the evicted incumbent
+                                // redials + rejoins; off (default) → PREEMPT 0x9.
+                                let close_code = if mirror.load(Ordering::Acquire) {
+                                    MODE_SWITCH_CLOSE_CODE
+                                } else {
+                                    PREEMPT_CLOSE_CODE
+                                };
+                                conn.close(close_code.into(), b"preempted");
+                                pending_incoming = Some(inc);
+                                end_reason = LoopEnd::Preempted;
+                                break;
+                            }
+                        }
+                        r = send_fut => {
+                            if let Err(e) = r {
+                                end_reason = LoopEnd::SendError(e);
+                                break;
+                            }
+                            // Wall-clock guard: a slow (but completed) write surfaces the
+                            // documented PHAROS_STREAM_WINDOW_KB flow-control cap as a named
+                            // log line, with chunk size + window setting for one-grep triage.
+                            let write_ms = write_t0.elapsed().as_millis();
+                            if write_ms > 200 {
+                                let win_kb: String = std::env::var("PHAROS_STREAM_WINDOW_KB")
+                                    .unwrap_or_else(|_| "256(default)".into());
+                                tracing::warn!(
+                                    "quic write_all slow ms={write_ms} stream_window_kb={win_kb} chunk_bytes={chunk_bytes}"
+                                );
+                            }
+                        }
+                    }
+                }
+                // Audio: each Opus packet as one unreliable datagram, tagged so
+                // the client can tell it from gyro telemetry. Drops on congestion
+                // (no retransmit) and never blocks the video stream.
+                Some(pkt) = audio_rx.recv() => {
+                    if let Err(e) = conn.send_datagram(tagged_datagram(DG_AUDIO, &pkt)) {
+                        tracing::debug!("audio datagram dropped: {e}");
+                    }
+                }
+                // Gyro telemetry: 12-byte sample, tagged, for the calibration UI.
+                Some(pkt) = gyro_rx.recv() => {
+                    if let Err(e) = conn.send_datagram(tagged_datagram(DG_GYRO, &pkt)) {
+                        tracing::debug!("gyro datagram dropped: {e}");
+                    }
+                }
+            }
+        }
+
+        connected.store(false, Ordering::Release);
+        if let Ok(mut g) = peer_pubkey.lock() {
+            *g = None;
+        }
+        if let Ok(mut g) = peer_addr.lock() {
+            *g = None;
+        }
+        // Clear the gyro opt-in too: the next client's auth will re-set it.
+        // Without this, a v1 client connecting after a v2 wants_gyro=true
+        // session would inherit the previous flag.
+        wants_gyro.store(false, Ordering::Release);
+        // Same for the HDR opt-in — the next client's v4 auth re-sets it.
+        wants_hdr.store(false, Ordering::Release);
+        // Same for the refresh cap — clear it so the next client (or a v2 client
+        // that reports none) doesn't inherit this one's panel refresh.
+        client_refresh_hz.store(0, Ordering::Release);
+        // And the panel native res, so a v2 client (no StreamMode w/h) connecting
+        // after this one doesn't inherit a stale panel size.
+        client_panel.store(0, Ordering::Release);
+        // And the resolution preference, so the next client starts at Auto.
+        client_res_pref.store(0, Ordering::Release);
+        // And the bitrate preference, so the next client starts at the host default.
+        client_bitrate_pref.store(0, Ordering::Release);
+        // And the framerate preference, so the next client starts at Auto/panel.
+        client_fps_pref.store(0, Ordering::Release);
+        match end_reason {
+            LoopEnd::CompositorClosed => {
+                send.finish().ok();
+                conn.closed().await;
+                return Ok(());
+            }
+            LoopEnd::PeerDropped => {
+                tracing::info!("peer dropped; awaiting next client");
+            }
+            LoopEnd::Preempted => {
+                tracing::info!("session pre-empted by a new client; handing over");
+                // The incumbent conn was already closed in the pre-emption arm;
+                // the stashed Incoming is served on the next loop turn.
+            }
+            LoopEnd::SendError(e) => {
+                tracing::info!("send error ({e:?}); awaiting next client");
+                let _ = send.reset(0u32.into());
+                conn.close(0u32.into(), b"send err");
+            }
+        }
+    }
+}
+
+/// Client: connect to a Pharos QUIC streamer and read the whole HEVC stream
+/// (until the host finishes). Returns the received bytes. For verification.
+/// Passes `expected_pubkey: None` so the pinning step is skipped (TOFU).
+pub fn fetch_stream(server_addr: SocketAddr, max: usize) -> Result<Vec<u8>> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async move {
+        let mut client = Endpoint::client((Ipv4Addr::UNSPECIFIED, 0).into())?;
+        client.set_default_client_config(client_config()?);
+        let conn = client.connect(server_addr, "localhost")?.await?;
+        do_video_auth(
+            &conn,
+            None,
+            None,
+            false,
+            false,
+            core_proto::StreamMode::default(),
+        )
+        .await?;
+        let mut recv = conn.accept_uni().await?;
+        // De-frame the length-prefixed access units back into a raw HEVC stream.
+        let mut out = Vec::new();
+        let mut len_buf = [0u8; 4];
+        while recv.read_exact(&mut len_buf).await.is_ok() {
+            let len = u32::from_be_bytes(len_buf) as usize;
+            if out.len() + len > max {
+                anyhow::bail!("stream exceeds max size");
+            }
+            let mut buf = vec![0u8; len];
+            recv.read_exact(&mut buf).await?;
+            out.extend_from_slice(&buf);
+        }
+        Ok(out)
+    })
+}
+
+/// Connect to a Pharos QUIC streamer and deliver each access unit (a complete
+/// HEVC NAL group) to `on_frame` as it arrives, until the host finishes.
+/// Blocking. The Trireme client calls this (via UniFFI) to feed MediaCodec.
+///
+/// `expected_pubkey` — Some(host_pub) pins to a previously paired key;
+/// any other key (or relay-attack signature) fails the connect. None falls
+/// back to TOFU (still validates the signature, but accepts any host_pub).
+///
+/// `client_identity` — Some(id) presents and proves our long-term identity so
+/// an enforcing host can authorize us against its peers list; None connects
+/// anonymously (admitted only by a permissive host).
+pub fn run_video_client<F: FnMut(Vec<u8>)>(
+    server_addr: SocketAddr,
+    expected_pubkey: Option<[u8; 32]>,
+    client_identity: Option<&core_crypto::Identity>,
+    mut on_frame: F,
+    // Phase 2: an optional one-shot resolution preference (target_h, floor_h) the
+    // probe sends right after auth so the headless `decode` path can exercise the
+    // client→host res ladder. `None` = don't send (plain probe).
+    res_pref: Option<core_proto::ClientResPref>,
+    // Phase 3: an optional one-shot bitrate preference (min,max kbps; max=0=uncapped)
+    // for the same headless test path. `None` = don't send.
+    bitrate_pref: Option<core_proto::ClientBitratePref>,
+    // Phase 3: an optional one-shot framerate preference (min,max fps; max=0=Auto)
+    // for the same headless test path. `None` = don't send.
+    fps_pref: Option<core_proto::ClientFpsPref>,
+) -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async move {
+        let mut client = Endpoint::client((Ipv4Addr::UNSPECIFIED, 0).into())?;
+        client.set_default_client_config(client_config()?);
+        let conn = client.connect(server_addr, "localhost")?.await?;
+        do_video_auth(
+            &conn,
+            expected_pubkey.as_ref(),
+            client_identity,
+            false,
+            false,
+            core_proto::StreamMode::default(),
+        )
+        .await?;
+        // Announce the requested resolution range a few times (unreliable datagram;
+        // the host applies it idempotently on its ~1s window poll).
+        if let Some(pref) = res_pref {
+            if let Ok(b) = core_proto::latency::encode_client_res_pref(&pref) {
+                for _ in 0..5 {
+                    let _ = conn.send_datagram(tagged_datagram(DG_CLIENT_RESPREF, &b));
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+        if let Some(pref) = bitrate_pref {
+            if let Ok(b) = core_proto::latency::encode_client_bitrate_pref(&pref) {
+                for _ in 0..5 {
+                    let _ = conn.send_datagram(tagged_datagram(DG_CLIENT_BITRATEPREF, &b));
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+        if let Some(pref) = fps_pref {
+            if let Ok(b) = core_proto::latency::encode_client_fps_pref(&pref) {
+                for _ in 0..5 {
+                    let _ = conn.send_datagram(tagged_datagram(DG_CLIENT_FPSPREF, &b));
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+        let mut recv = conn.accept_uni().await?;
+        let mut len_buf = [0u8; 4];
+        while recv.read_exact(&mut len_buf).await.is_ok() {
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut buf = vec![0u8; len];
+            recv.read_exact(&mut buf).await?;
+            on_frame(buf);
+        }
+        Ok(())
+    })
+}
+
+/// Same as [`run_video_client`] but also opens a reliable bidi stream over the
+/// same connection for client → host input events. The trireme player drives
+/// this — capture winit events, send through `input_rx`, the host's compositor
+/// dispatches via the smithay seat. Pass `None` to opt out (equivalent to the
+/// plain `run_video_client`).
+///
+/// `on_audio` — when `Some`, each Opus packet (carried as an unreliable QUIC
+/// datagram) is handed over for decode + playback; `None` ignores audio (the
+/// host's datagrams are simply dropped, no blocking).
+///
+/// `on_gyro` — when `Some`, each live gyro telemetry sample (gx, gy, gz in
+/// deg/s) is delivered for the calibration visualizer. Rides the same tagged
+/// datagram channel as audio.
+///
+/// `latency_taps` — when `Some`, an on-demand latency benchmark profiles the LIVE
+/// stream. The benchmark is *driven by the host*: the moment the host starts
+/// emitting `DG_FRAME_META` (which it only does inside a bench window) the client
+/// runs a short clock burst for RTT, accumulates the host stage stamps straight off
+/// each meta (pure host-clock subtractions), reads the player's decode min/mean +
+/// present mean from the taps, and sends back a [`core_proto::WireLatencyReport`].
+/// When `None` the host + wire stages are still computed (decode/buffer/present left
+/// 0.0). Either way this is **completely inert until the host begins a bench** — no
+/// pings, no report, identical wire behaviour to a plain session.
+/// Sink for decoded Opus audio packets (one per QUIC datagram).
+pub type AudioSink = Box<dyn FnMut(Vec<u8>) + Send>;
+/// Sink for live gyro telemetry samples (gx, gy, gz in deg/s).
+pub type GyroSink = Box<dyn FnMut(f32, f32, f32) + Send>;
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
+    server_addrs: Vec<SocketAddr>,
+    expected_pubkey: Option<[u8; 32]>,
+    client_identity: Option<&core_crypto::Identity>,
+    mut on_frame: F,
+    input_rx: Option<mpsc::UnboundedReceiver<core_proto::InputEvent>>,
+    mut on_audio: Option<AudioSink>,
+    mut on_gyro: Option<GyroSink>,
+    cancel: Option<Arc<AtomicBool>>,
+    latency_taps: Option<Arc<LatencyTaps>>,
+    on_catalog: Option<Box<dyn FnMut(Vec<core_proto::AppInfo>) + Send>>,
+    app_launch_rx: Option<mpsc::UnboundedReceiver<core_proto::AppMsg>>,
+    wants_gyro: bool,
+    // Whether the client wants a 10-bit HDR (Main10) stream — sent in the v4 auth
+    // handshake so the host gates HDR on client capability. Threaded from the FFI;
+    // currently always false until the client HDR toggle is wired (task 6).
+    wants_hdr: bool,
+    // Host→client link-health: invoked with `true` while the host is shedding
+    // frames, `false` when clean (DG_LINK_HEALTH heartbeat ~2×/s). The app drives a
+    // "degraded" indicator from it. `None` = ignore (older callers).
+    mut on_link_health: Option<Box<dyn FnMut(bool) + Send>>,
+    // Client→host on-demand IDR request: when the app sets this (e.g. its decoder
+    // hit a corrupt-stream error), the loop sends one DG_REQUEST_IDR and clears it.
+    // A backstop to the host's own drop-driven IDR; `None` = never request.
+    request_idr: Option<Arc<AtomicBool>>,
+    // Client→host requested stream mode (resolution + panel refresh), sent in the
+    // v3 auth handshake. `default()` (all zeros) = Auto/unknown → host keeps its
+    // native res and doesn't cap fps.
+    requested_mode: core_proto::StreamMode,
+    // Phase 2: the client's LIVE resolution range, packed (target_h<<32)|floor_h
+    // (0 = Auto + no floor). The app mutates this atomic from its settings UI; the
+    // loop sends it on each QoS tick as `DG_CLIENT_RESPREF` so the host adapts the
+    // ladder within [floor, target]. `None` = never send (Auto).
+    res_pref: Option<Arc<std::sync::atomic::AtomicU64>>,
+    // Phase 3: the client's LIVE bitrate range, packed (min_kbps<<32)|max_kbps
+    // (max=0 = uncapped). Mutated from the settings UI; re-sent each QoS tick as
+    // `DG_CLIENT_BITRATEPREF`. `None` = never send.
+    bitrate_pref: Option<Arc<std::sync::atomic::AtomicU64>>,
+    // Phase 3: the client's LIVE framerate range, packed (min_fps<<32)|max_fps
+    // (max=0 = Auto/panel). Mutated from the settings UI; re-sent each QoS tick as
+    // `DG_CLIENT_FPSPREF`. `None` = never send.
+    fps_pref: Option<Arc<std::sync::atomic::AtomicU64>>,
+) -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async move {
+        let mut client = Endpoint::client((Ipv4Addr::UNSPECIFIED, 0).into())?;
+        client.set_default_client_config(client_config()?);
+        let conn = connect_first(&client, &server_addrs).await?;
+        do_video_auth(
+            &conn,
+            expected_pubkey.as_ref(),
+            client_identity,
+            wants_gyro,
+            wants_hdr,
+            requested_mode,
+        )
+        .await?;
+
+        // Open the input bidi stream up front (when requested) so the server
+        // sees it before the first event needs to flow. The read half stays
+        // open but idle — we never receive from the host on this stream.
+        if let Some(mut input_rx) = input_rx {
+            let (mut send, _recv) = conn.open_bi().await?;
+            // Nudge the stream open so accept_bi() fires on the server even
+            // before the first real event (writes are buffered until needed).
+            send.write_all(&[]).await.ok();
+            tokio::spawn(async move {
+                while let Some(ev) = input_rx.recv().await {
+                    let buf = match core_proto::encode_input(&ev) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::warn!("encode input: {e}");
+                            continue;
+                        }
+                    };
+                    let len_be = (buf.len() as u32).to_be_bytes();
+                    if send.write_all(&len_be).await.is_err() || send.write_all(&buf).await.is_err()
+                    {
+                        return;
+                    }
+                }
+                send.finish().ok();
+            });
+        }
+
+        // App relay: the host opens a dedicated bidi stream; accept it to receive
+        // the catalog (host→client) and to send launch requests (client→host).
+        // Skipped entirely for clients that want neither.
+        if on_catalog.is_some() || app_launch_rx.is_some() {
+            let conn_app = conn.clone();
+            tokio::spawn(async move {
+                let (send, recv) = match conn_app.accept_bi().await {
+                    Ok(s) => s,
+                    Err(_) => return, // host never opened it / connection ended
+                };
+                // Writer: client → host app actions (Launch/SwitchTo/EndProcess).
+                let write = async move {
+                    let mut send = send;
+                    if let Some(mut rx) = app_launch_rx {
+                        while let Some(msg) = rx.recv().await {
+                            let buf = match core_proto::encode_app(&msg) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    tracing::warn!("encode app msg: {e}");
+                                    continue;
+                                }
+                            };
+                            let len_be = (buf.len() as u32).to_be_bytes();
+                            if send.write_all(&len_be).await.is_err()
+                                || send.write_all(&buf).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    // Signal EOF to the host's launch reader on teardown (matches
+                    // the input stream's finish()).
+                    send.finish().ok();
+                };
+                // Reader: host → client catalog.
+                let read = async move {
+                    let mut recv = recv;
+                    let mut on_catalog = on_catalog;
+                    let mut len_buf = [0u8; 4];
+                    loop {
+                        if recv.read_exact(&mut len_buf).await.is_err() {
+                            return;
+                        }
+                        let len = u32::from_be_bytes(len_buf) as usize;
+                        // Catalogs carry box-art bytes, so allow a few MB.
+                        if len > 16 * 1024 * 1024 {
+                            tracing::warn!("app catalog too large ({len} bytes); dropping");
+                            return;
+                        }
+                        let mut buf = vec![0u8; len];
+                        if recv.read_exact(&mut buf).await.is_err() {
+                            return;
+                        }
+                        if let Ok(core_proto::AppMsg::Catalog { apps }) =
+                            core_proto::decode_app(&buf)
+                        {
+                            if let Some(cb) = on_catalog.as_mut() {
+                                cb(apps);
+                            }
+                        }
+                    }
+                };
+                tokio::join!(write, read);
+            });
+        }
+
+        // The bench lives in the datagram loop alone now: host stages come straight
+        // off each FrameStageMeta (pure host-clock subtractions), the wire stage is
+        // RTT-derived, and the client stages are read from the player taps. There's
+        // no cross-clock frame join, so the video loop no longer has to stamp AU
+        // receive instants — it just forwards bytes. Wrapped in `Rc<RefCell<_>>`
+        // only because the datagram loop borrows it across `.await` points.
+        // The bench owns the taps; keep a clone so the datagram loop can stash the
+        // host-announced geometry into the same shared taps (read by the decoder).
+        let geom_taps = latency_taps.clone();
+        let bench = std::rc::Rc::new(std::cell::RefCell::new(BenchState::new(latency_taps)));
+        // Frames received since the last QoS report — the video task bumps it, the
+        // datagram task drains it ~1×/s into a `DG_CLIENT_QOS` report so the host
+        // can see the delivered rate (both blocks run on this one task, so a shared
+        // atomic suffices — no lock, no spawn bound).
+        let recv_count = std::sync::atomic::AtomicU32::new(0);
+
+        // Video on the uni stream; audio as unreliable datagrams. Both run
+        // concurrently on this one task (no spawn → no Send/'static bound on the
+        // callbacks); the video stream ending = session over.
+        let video = async {
+            let mut recv = conn.accept_uni().await?;
+            let mut len_buf = [0u8; 4];
+            while recv.read_exact(&mut len_buf).await.is_ok() {
+                let len = u32::from_be_bytes(len_buf) as usize;
+                let mut buf = vec![0u8; len];
+                // Break (don't `?`) on a mid-frame error so we always reach the
+                // close-reason check below — a host pre-emption can land between
+                // the length prefix and the body just as easily as between frames.
+                if recv.read_exact(&mut buf).await.is_err() {
+                    break;
+                }
+                on_frame(buf);
+                recv_count.fetch_add(1, Ordering::Relaxed);
+            }
+            // The stream ended. If the host CLOSED us to hand the single slot to a
+            // newly-connected client (PREEMPT_CLOSE_CODE), surface that as a
+            // distinct error so the client YIELDS instead of instantly redialing —
+            // two connected clients would otherwise pre-empt each other forever.
+            // An ordinary drop / idle-timeout leaves close_reason None or a
+            // different code, so the normal fast reconnect path is untouched.
+            if let Some(quinn::ConnectionError::ApplicationClosed(ac)) = conn.close_reason() {
+                if u64::from(ac.error_code) == PREEMPT_CLOSE_CODE as u64 {
+                    anyhow::bail!("preempted by another client");
+                }
+            }
+            anyhow::Ok(())
+        };
+        // One datagram loop dispatches by type tag — two readers would race the
+        // shared datagram queue. Always runs: besides audio/gyro it also carries
+        // the latency-bench datagrams (FRAME_META in, CLOCK_PONG in, and it sends
+        // the CLOCK_PING burst + final report). Cheap when idle — just a read loop.
+        let bench_dg = bench.clone();
+        let datagrams = async {
+            // Deadline that fires ~750ms after the last frame-meta so we can close
+            // the bench window even though no datagram arrives to wake the loop.
+            // Far in the future while no bench is active.
+            let idle_timer = tokio::time::sleep(std::time::Duration::from_secs(86_400));
+            tokio::pin!(idle_timer);
+            // Continuous QoS heartbeat: report delivered fps + decode-ms to the host
+            // ~1×/s so it can pace to the actual path. The first tick fires at once;
+            // a recv_fps of 0 right at connect is benign (the host's pacer ignores
+            // QoS until it has seen real frames).
+            let mut qos_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            qos_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Fast poll for a pending on-demand IDR request. A decode error sets the
+            // `request_idr` flag; we want the DG_REQUEST_IDR on the wire in ~1 RTT,
+            // NOT up to a full QoS tick (≤1s) later — otherwise the on-demand path is
+            // no faster than the periodic ~1s IDR it's meant to beat. 100ms keeps the
+            // worst case to ~0.1s + RTT, the empty datagrams are negligible, and the
+            // host coalesces forced IDRs via PHAROS_MIN_IDR_INTERVAL_MS (no storm).
+            let mut idr_tick = tokio::time::interval(std::time::Duration::from_millis(100));
+            idr_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    dg = conn.read_datagram() => {
+                        let Ok(dg) = dg else { break };
+                        match dg.first().copied() {
+                            Some(DG_AUDIO) => {
+                                if let Some(cb) = on_audio.as_mut() {
+                                    cb(dg[1..].to_vec());
+                                }
+                            }
+                            Some(DG_GYRO) => {
+                                if let (Some(cb), true) = (on_gyro.as_mut(), dg.len() >= 13) {
+                                    let gx = f32::from_le_bytes([dg[1], dg[2], dg[3], dg[4]]);
+                                    let gy = f32::from_le_bytes([dg[5], dg[6], dg[7], dg[8]]);
+                                    let gz = f32::from_le_bytes([dg[9], dg[10], dg[11], dg[12]]);
+                                    cb(gx, gy, gz);
+                                }
+                            }
+                            Some(DG_STREAM_GEOMETRY) if dg.len() >= 9 => {
+                                let w = u32::from_be_bytes([dg[1], dg[2], dg[3], dg[4]]);
+                                let h = u32::from_be_bytes([dg[5], dg[6], dg[7], dg[8]]);
+                                if let Some(t) = &geom_taps {
+                                    t.set_geometry(w, h);
+                                }
+                            }
+                            Some(DG_LINK_HEALTH) if dg.len() >= 2 => {
+                                // Host heartbeat: surface degraded/clean to the app's
+                                // indicator. Cheap, non-blocking (just a flag flip).
+                                if let Some(cb) = on_link_health.as_mut() {
+                                    cb(dg[1] != 0);
+                                }
+                            }
+                            Some(DG_FRAME_META) => {
+                                if let Ok(meta) = core_proto::latency::decode_frame_meta(&dg[1..]) {
+                                    let first = bench_dg.borrow_mut().on_frame_meta(meta);
+                                    if first {
+                                        // Host just opened a bench window. Fire the
+                                        // clock burst so offset/RTT are ready before
+                                        // the report, and (re)arm the idle deadline.
+                                        send_clock_burst(&conn).await;
+                                    }
+                                    idle_timer.as_mut().reset(
+                                        tokio::time::Instant::now()
+                                            + std::time::Duration::from_millis(BENCH_IDLE_MS),
+                                    );
+                                }
+                            }
+                            Some(DG_CLOCK_PONG) => {
+                                if let Ok(pong) = core_proto::latency::decode_clock_pong(&dg[1..]) {
+                                    let t3 = unix_nanos();
+                                    bench_dg.borrow_mut().on_clock_pong(pong, t3);
+                                }
+                            }
+                            _ => {}
+                        }
+                        // A hard cap also ends the window (busy stream, deadline never
+                        // idles): finalize + send the report inline. Build the report
+                        // and DROP the borrow before awaiting the send — a borrow held
+                        // across `.await` would risk a runtime double-borrow panic.
+                        let at_cap = bench_dg.borrow().window_at_cap();
+                        if at_cap {
+                            let report = bench_dg.borrow_mut().finish();
+                            if let Some(report) = report {
+                                send_latency_report(&conn, &report).await;
+                            }
+                            idle_timer.as_mut().reset(
+                                tokio::time::Instant::now()
+                                    + std::time::Duration::from_secs(86_400),
+                            );
+                        }
+                    }
+                    _ = &mut idle_timer => {
+                        // ~750ms since the last meta → the host stopped emitting →
+                        // window over. Build + send the report, then disarm. Drop the
+                        // borrow before awaiting (see above).
+                        let report = bench_dg.borrow_mut().finish();
+                        if let Some(report) = report {
+                            send_latency_report(&conn, &report).await;
+                        }
+                        idle_timer.as_mut().reset(
+                            tokio::time::Instant::now()
+                                + std::time::Duration::from_secs(86_400),
+                        );
+                    }
+                    _ = idr_tick.tick() => {
+                        // On-demand IDR: a decode error (corrupt stream) set the flag;
+                        // get the request on the wire promptly so the host forces a
+                        // keyframe in ~1 RTT instead of waiting for the periodic ~1s
+                        // IDR. Level flag (swap-to-false) — a persistent corruption
+                        // keeps re-flagging it; a one-off lost datagram falls back to
+                        // the periodic IDR. Empty payload: the host reads only the tag.
+                        if let Some(flag) = &request_idr {
+                            if flag.swap(false, Ordering::Relaxed) {
+                                let _ = conn.send_datagram(tagged_datagram(DG_REQUEST_IDR, &[]));
+                            }
+                        }
+                    }
+                    _ = qos_tick.tick() => {
+                        // ~1s window, so the drained count is ≈ delivered fps.
+                        let recv_fps = recv_count.swap(0, Ordering::Relaxed) as f32;
+                        let decode_ms =
+                            geom_taps.as_ref().map(|t| t.decode_mean_ms()).unwrap_or(0.0);
+                        let qos = core_proto::ClientQos { recv_fps, decode_ms };
+                        if let Ok(b) = core_proto::latency::encode_client_qos(&qos) {
+                            let _ = conn.send_datagram(tagged_datagram(DG_CLIENT_QOS, &b));
+                        }
+                        // Phase 2: re-send the client's resolution range each tick
+                        // (continuous, like QoS — a lost one self-heals; the host
+                        // applies it idempotently and only acts on a change).
+                        if let Some(rp) = &res_pref {
+                            let v = rp.load(Ordering::Relaxed);
+                            let pref = core_proto::ClientResPref {
+                                target_h: (v >> 32) as u32,
+                                floor_h: v as u32,
+                            };
+                            if let Ok(b) = core_proto::latency::encode_client_res_pref(&pref) {
+                                let _ = conn.send_datagram(tagged_datagram(DG_CLIENT_RESPREF, &b));
+                            }
+                        }
+                        // Phase 3: re-send the client's bitrate range each tick (same
+                        // continuous self-healing discipline as the resolution range).
+                        if let Some(bp) = &bitrate_pref {
+                            let v = bp.load(Ordering::Relaxed);
+                            let pref = core_proto::ClientBitratePref {
+                                min_kbps: (v >> 32) as u32,
+                                max_kbps: v as u32,
+                            };
+                            if let Ok(b) = core_proto::latency::encode_client_bitrate_pref(&pref) {
+                                let _ =
+                                    conn.send_datagram(tagged_datagram(DG_CLIENT_BITRATEPREF, &b));
+                            }
+                        }
+                        // Phase 3: re-send the client's framerate range each tick (same
+                        // continuous self-healing discipline as the other ranges).
+                        if let Some(fp) = &fps_pref {
+                            let v = fp.load(Ordering::Relaxed);
+                            let pref = core_proto::ClientFpsPref {
+                                min_fps: (v >> 32) as u16,
+                                max_fps: v as u16,
+                            };
+                            if let Ok(b) = core_proto::latency::encode_client_fps_pref(&pref) {
+                                let _ = conn.send_datagram(tagged_datagram(DG_CLIENT_FPSPREF, &b));
+                            }
+                        }
+                    }
+                }
+            }
+            anyhow::Ok(())
+        };
+        // A short-lived caller (e.g. the gyro calibration overlay) can ask us to
+        // tear the connection down by flipping `cancel`; we poll it and bail,
+        // closing the connection so the host returns to accept().
+        let session = async {
+            let (video_result, _dg_result) = tokio::join!(video, datagrams);
+            video_result
+        };
+        match cancel {
+            Some(flag) => {
+                let watch = async {
+                    while !flag.load(Ordering::Relaxed) {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                };
+                tokio::select! {
+                    r = session => r,
+                    _ = watch => {
+                        // Explicitly close so the host sees the drop immediately.
+                        // `close()` only *queues* the CONNECTION_CLOSE frame; we
+                        // must drive the connection until it's actually sent
+                        // (`closed().await`), else the runtime drops first and the
+                        // host only notices via QUIC idle-timeout — it reads as
+                        // "still streaming" for ~30s.
+                        conn.close(0u32.into(), b"client done");
+                        conn.closed().await;
+                        Ok(())
+                    }
+                }
+            }
+            None => session.await,
+        }
+    })
+}
+
+// --- Latency benchmark (client side) ---------------------------------------
+//
+// A one-shot, host-driven profile of the LIVE stream. The host opening a bench
+// window = it starts sending DG_FRAME_META; that first meta is the start signal.
+// The client then: (1) fires a short DG_CLOCK_PING burst to measure RTT (min and
+// max over the burst), (2) accumulates the host stage stamps off each FrameStageMeta
+// — pure host-clock subtractions, no cross-clock join — (3) reads the player taps
+// for the client decode/buffer/present stages, (4) sends back one DG_LATENCY_REPORT.
+// The wire stage is `rtt_min/2` (no frame-vs-clock join, no offset arithmetic). The
+// window ends when the host stops emitting meta (idle gap) or a hard cap is hit;
+// state then resets so a later bench can run again.
+
+/// Idle gap after the last frame-meta that ends a bench window.
+const BENCH_IDLE_MS: u64 = 750;
+/// Hard frame cap on a window (also ~5s at 60fps) so a never-idling stream can't
+/// run the bench forever.
+const BENCH_MAX_FRAMES: usize = 300;
+/// Number of clock-sync probes in the burst. Keep the min-RTT sample.
+const CLOCK_BURST: u32 = 8;
+
+/// One client-side latency-bench session. Lives in an `Rc<RefCell<_>>` borrowed by
+/// the datagram loop. The host stage stamps are host-clock UNIX nanos, so every
+/// host-side delta is a same-clock subtraction (offset-free); the clock burst is
+/// kept purely for RTT (→ the wire stage) and a diagnostic offset.
+struct BenchState {
+    /// Player decode/present taps (None → those report fields stay 0.0). Reset at
+    /// window open so each bench run is independent.
+    taps: Option<Arc<LatencyTaps>>,
+    /// True between the first frame-meta of a window and `finish()`.
+    active: bool,
+    /// RTT spread over the clock burst, nanos. `rtt_min` drives the wire stage
+    /// (`nexus = rtt_min/2`); `(rtt_max - rtt_min)/2` is the uncertainty. None
+    /// until the first pong lands.
+    rtt_min_ns: Option<u64>,
+    rtt_max_ns: u64,
+    /// Diagnostic-only clock offset (host − client) from the min-RTT pong. Not
+    /// used by any stage anymore.
+    clock_offset_ns: i64,
+    /// Running host-stage sums over the window (nanos) + the meta count. Host
+    /// stages are pure host-clock subtractions, so no AU join is needed.
+    compose_sum_ns: u64,
+    encode_sum_ns: u64,
+    host_send_sum_ns: u64,
+    metas: u32,
+}
+
+impl BenchState {
+    fn new(taps: Option<Arc<LatencyTaps>>) -> Self {
+        Self {
+            taps,
+            active: false,
+            rtt_min_ns: None,
+            rtt_max_ns: 0,
+            clock_offset_ns: 0,
+            compose_sum_ns: 0,
+            encode_sum_ns: 0,
+            host_send_sum_ns: 0,
+            metas: 0,
+        }
+    }
+
+    /// A frame-meta arrived. Opens a window on the first one (resetting per-window
+    /// state, including the player taps so the decode min/mean is fresh). Returns
+    /// true iff this is the first meta of a fresh window (→ caller fires the clock
+    /// burst). Accumulates the host stages straight off the stamps — guarding
+    /// against an out-of-order stamp by skipping any meta whose subtractions would
+    /// underflow.
+    fn on_frame_meta(&mut self, meta: core_proto::FrameStageMeta) -> bool {
+        let first = !self.active;
+        if first {
+            self.active = true;
+            self.rtt_min_ns = None;
+            self.rtt_max_ns = 0;
+            self.clock_offset_ns = 0;
+            self.compose_sum_ns = 0;
+            self.encode_sum_ns = 0;
+            self.host_send_sum_ns = 0;
+            self.metas = 0;
+            // Fresh decode/present accumulation for this window.
+            if let Some(t) = &self.taps {
+                t.reset();
+            }
+        }
+        // All three stages must be monotone in the stamps; if any would underflow
+        // the meta is bogus (clock blip / mis-stamp) — skip it rather than feed a
+        // garbage stage in. `samples` counts only the metas we actually folded.
+        let compose = meta.encode_start_ns.checked_sub(meta.capture_ns);
+        let encode = meta.encode_done_ns.checked_sub(meta.encode_start_ns);
+        let host_send = meta.wire_send_ns.checked_sub(meta.encode_done_ns);
+        if let (Some(c), Some(e), Some(hs)) = (compose, encode, host_send) {
+            self.compose_sum_ns = self.compose_sum_ns.saturating_add(c);
+            self.encode_sum_ns = self.encode_sum_ns.saturating_add(e);
+            self.host_send_sum_ns = self.host_send_sum_ns.saturating_add(hs);
+            self.metas += 1;
+        }
+        first
+    }
+
+    /// One clock pong (with the client's recv instant t3). Track the min and max
+    /// RTT over the burst; keep the min-RTT sample's offset as a diagnostic.
+    fn on_clock_pong(&mut self, pong: core_proto::ClockPong, t3_nanos: u64) {
+        let t0 = pong.t0_nanos as i64;
+        let t1 = pong.t1_nanos as i64;
+        let t2 = pong.t2_nanos as i64;
+        let t3 = t3_nanos as i64;
+        // NTP: offset = ((t1-t0)+(t2-t3))/2 ; rtt = (t3-t0)-(t2-t1).
+        let offset = ((t1 - t0) + (t2 - t3)) / 2;
+        let rtt = ((t3 - t0) - (t2 - t1)).max(0) as u64;
+        if self.rtt_min_ns.map(|m| rtt < m).unwrap_or(true) {
+            self.rtt_min_ns = Some(rtt);
+            self.clock_offset_ns = offset; // diagnostic, from the best sample
+        }
+        self.rtt_max_ns = self.rtt_max_ns.max(rtt);
+    }
+
+    /// True once the window has accumulated the hard frame cap.
+    fn window_at_cap(&self) -> bool {
+        self.active && self.metas as usize >= BENCH_MAX_FRAMES
+    }
+
+    /// Close the window and build the report (None if no window / no folded
+    /// metas). Resets so a later bench can run again.
+    fn finish(&mut self) -> Option<core_proto::WireLatencyReport> {
+        if !self.active {
+            return None;
+        }
+        self.active = false;
+
+        if self.metas == 0 {
+            // Window opened but no usable meta landed — nothing to report.
+            return None;
+        }
+        let n = self.metas as f64;
+        let mean_ms = |sum_ns: u64| (sum_ns as f64 / n / 1.0e6) as f32;
+        let compose_ms = mean_ms(self.compose_sum_ns);
+        let encode_ms = mean_ms(self.encode_sum_ns);
+        let host_send_ms = mean_ms(self.host_send_sum_ns);
+
+        // Wire stage is RTT-derived: half the min RTT, with the burst spread as the
+        // uncertainty. No frame join, no clock-offset arithmetic.
+        let rtt_min_ns = self.rtt_min_ns.unwrap_or(0);
+        let rtt_ms = (rtt_min_ns as f64 / 1.0e6) as f32;
+        let nexus_ms = rtt_ms / 2.0;
+        let nexus_uncertainty_ms =
+            (self.rtt_max_ns.saturating_sub(rtt_min_ns) as f64 / 1.0e6 / 2.0) as f32;
+        let clock_offset_ms = (self.clock_offset_ns as f64 / 1.0e6) as f32;
+
+        // Client residency from the player taps. The submit→emerge time is the
+        // in-flight buffer: ffmpeg's output is back-pressured by the 60 fps render,
+        // so every AU waits the full buffer depth and the GPU decode kernel (~few
+        // ms) is masked underneath — it cannot be isolated through an external
+        // pipe-fed decoder. So `buffer_ms` = the mean residency (buffer + decode,
+        // buffer-dominated) and `decode_ms` stays 0.0 (folded in, not separable).
+        // `present_ms` = emerge→present mean. Absent taps → all 0.0.
+        let (buffer_ms, decode_ms, present_ms) = match &self.taps {
+            Some(t) => (t.decode_mean_ms(), 0.0, t.present_mean_ms()),
+            None => (0.0, 0.0, 0.0),
+        };
+
+        let total_ms =
+            compose_ms + encode_ms + host_send_ms + nexus_ms + buffer_ms + decode_ms + present_ms;
+
+        let samples = self.metas;
+        // Reset for a possible future window.
+        self.metas = 0;
+        self.compose_sum_ns = 0;
+        self.encode_sum_ns = 0;
+        self.host_send_sum_ns = 0;
+
+        Some(core_proto::WireLatencyReport {
+            codec_fourcc: *b"hevc",
+            samples,
+            rtt_ms,
+            clock_offset_ms,
+            compose_ms,
+            encode_ms,
+            host_send_ms,
+            nexus_ms,
+            nexus_uncertainty_ms,
+            buffer_ms,
+            decode_ms,
+            present_ms,
+            total_ms,
+        })
+    }
+}
+
+/// Fire a short burst of clock-sync probes (client = initiator). Each `t0_nanos`
+/// is the send instant (UNIX nanos); the host echoes it in the pong.
+async fn send_clock_burst(conn: &quinn::Connection) {
+    for seq in 0..CLOCK_BURST {
+        let ping = core_proto::ClockPing {
+            seq,
+            t0_nanos: unix_nanos(),
+        };
+        match core_proto::latency::encode_clock_ping(&ping) {
+            Ok(b) => {
+                if let Err(e) = conn.send_datagram(tagged_datagram(DG_CLOCK_PING, &b)) {
+                    tracing::debug!("clock ping datagram dropped: {e}");
+                }
+            }
+            Err(e) => tracing::debug!("encode clock ping: {e}"),
+        }
+    }
+}
+
+/// Send the final per-stage report back to the host (DG_LATENCY_REPORT).
+async fn send_latency_report(conn: &quinn::Connection, report: &core_proto::WireLatencyReport) {
+    match core_proto::latency::encode_wire_latency(report) {
+        Ok(b) => {
+            if let Err(e) = conn.send_datagram(tagged_datagram(DG_LATENCY_REPORT, &b)) {
+                tracing::debug!("latency report datagram dropped: {e}");
+            }
+        }
+        Err(e) => tracing::debug!("encode latency report: {e}"),
+    }
+}
+
+/// Client-side mutual auth. Open a bidi stream and:
+///   1. send our v2 prefix (magic + version) + nonce + pubkey + wants_gyro;
+///   2. receive the host's signature + pubkey + challenge nonce, and verify
+///      the host against the TLS exporter + the pinned key (when provided);
+///   3. sign the host's challenge with our identity (zero sig if anonymous) so
+///      an enforcing host can authenticate and then authorize us.
+///
+/// `wants_gyro` tells the host whether to relay raw IMU gyro samples. False
+/// is the safe default — the host saves the IMU-reader thread's wakeups and
+/// the per-frame datagram, and a v1 host (legacy) wouldn't have parsed the
+/// flag anyway. The wire prefix (magic + version) lets a v2-aware host opt
+/// in to reading the trailing byte without breaking v1 hosts; the trireme
+/// client never talks to a v1 host in current builds (host and client ship
+/// from the same tree), but the v2 wire is forward-compatible by design.
+async fn do_video_auth(
+    conn: &quinn::Connection,
+    expected_pubkey: Option<&[u8; 32]>,
+    client_identity: Option<&core_crypto::Identity>,
+    wants_gyro: bool,
+    wants_hdr: bool,
+    requested_mode: core_proto::StreamMode,
+) -> Result<()> {
+    use rand::RngCore;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    // v2 prefix — see AUTH_PROTO_MAGIC. A v2 host detects this and reads the
+    // version u32 + trailing wants_gyro byte; a v1 host (none in-tree) would
+    // misread the magic as the first 4 bytes of the nonce and fail the sig
+    // check, which is the correct safety behaviour for a downgrade attempt.
+    send.write_all(&AUTH_PROTO_MAGIC).await?;
+    send.write_all(&AUTH_PROTO_VERSION.to_be_bytes()).await?;
+    let mut nonce = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    send.write_all(&nonce).await?;
+    // Our long-term pubkey, or zeros to connect anonymously. We keep the write
+    // side open — we still owe the host our signature in step 3.
+    let client_pub = client_identity
+        .map(|id| id.public_bytes())
+        .unwrap_or([0u8; 32]);
+    send.write_all(&client_pub).await?;
+    // wants_gyro flag — read by the host AFTER the pubkey so the v1 wire
+    // shape (nonce → pubkey) is preserved verbatim at the front.
+    let g: u8 = if wants_gyro { 1 } else { 0 };
+    send.write_all(&[g]).await?;
+    // v3: the 12-byte requested StreamMode (w, h, refresh_mhz) follows the gyro
+    // byte. A v3 host reads it; the host accepts v2 too, so this is additive.
+    send.write_all(&requested_mode.to_bytes()).await?;
+    // v4: a trailing 1-byte wants_hdr flag after the StreamMode block. A v4 host
+    // reads it; a v3 host rejects a v4 client at the version-range check (both
+    // ship from one tree, so that skew is only a dev-build corner).
+    let hdr: u8 = if wants_hdr { 1 } else { 0 };
+    send.write_all(&[hdr]).await?;
+
+    let mut sig = [0u8; 64];
+    recv.read_exact(&mut sig).await?;
+    let mut host_pub = [0u8; 32];
+    recv.read_exact(&mut host_pub).await?;
+    let mut host_nonce = [0u8; 32];
+    recv.read_exact(&mut host_nonce).await?;
+
+    let mut exporter = [0u8; 32];
+    conn.export_keying_material(&mut exporter, VIDEO_AUTH_EXPORTER_LABEL, &[])
+        .map_err(|e| anyhow::anyhow!("export_keying_material: {e:?}"))?;
+
+    core_crypto::verify_video_auth(&nonce, &exporter, &sig, &host_pub, expected_pubkey)
+        .map_err(|e| anyhow::anyhow!("video auth: {e}"))?;
+
+    // Prove our own identity over the host's challenge. An anonymous client
+    // sends a zero signature, which the host admits only if its authorizer
+    // allows anonymous clients.
+    let client_sig = match client_identity {
+        Some(id) => core_crypto::sign_client_auth(id, &host_nonce, &exporter),
+        None => [0u8; 64],
+    };
+    send.write_all(&client_sig).await?;
+    send.finish().ok();
+    Ok(())
+}
+
+/// A standalone bidirectional QUIC channel for the USB/IP relay.
+///
+/// Deliberately independent of the video stream: its own connection on its own
+/// port, persistent, and async — the USB devices stay attached whether or not a
+/// video session is up. The exporter (Trireme) dials in and opens the stream; the
+/// importer (Pharos) accepts it. URBs flow both directions over `send`/`recv`.
+pub struct UsbLink {
+    pub send: quinn::SendStream,
+    pub recv: quinn::RecvStream,
+    conn: quinn::Connection,
+    // Kept alive so the connection isn't torn down (client side owns its endpoint).
+    _endpoint: Option<Endpoint>,
+}
+
+impl UsbLink {
+    /// The peer's address (the exporter as seen by Pharos, or vice versa).
+    pub fn remote(&self) -> SocketAddr {
+        self.conn.remote_address()
+    }
+}
+
+/// Pharos (import side): bind the persistent USB-relay listener. The endpoint
+/// outlives individual device sessions — accept them with [`usb_import_accept`].
+pub fn usb_import_endpoint(addr: SocketAddr) -> Result<Endpoint> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    Ok(Endpoint::server(server_config()?, addr)?)
+}
+
+/// Accept one exporter connection and its relay stream on the listener. Low
+/// latency: the stream is used raw (no extra framing) so a URB hits the wire as
+/// soon as it's written.
+pub async fn usb_import_accept(endpoint: &Endpoint) -> Result<UsbLink> {
+    let incoming = endpoint
+        .accept()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("USB relay endpoint closed"))?;
+    let conn = incoming.await?;
+    let (send, recv) = conn.accept_bi().await?;
+    Ok(UsbLink {
+        send,
+        recv,
+        conn,
+        _endpoint: None,
+    })
+}
+
+/// Trireme (export side): open a persistent USB-relay connection to Pharos and the
+/// bidirectional stream the URBs ride on. Not contingent on any video session.
+pub async fn usb_export_connect(server_addr: SocketAddr) -> Result<UsbLink> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut endpoint = Endpoint::client((Ipv4Addr::UNSPECIFIED, 0).into())?;
+    endpoint.set_default_client_config(client_config()?);
+    let conn = endpoint.connect(server_addr, "localhost")?.await?;
+    // The exporter opens the stream and speaks first (device-info handshake),
+    // which is what makes the importer's accept_bi() resolve.
+    let (send, recv) = conn.open_bi().await?;
+    Ok(UsbLink {
+        send,
+        recv,
+        conn,
+        _endpoint: Some(endpoint),
+    })
+}
+
+// --- Pairing channel --------------------------------------------------------
+//
+// A separate QUIC port (default 4432) carries the pairing handshake. Each
+// pairing attempt is one QUIC connection + one bidi stream + a sequence of
+// length-prefixed postcard messages defined in [`pair_proto`]. The actual
+// crypto (SPAKE2 → HKDF → confirm MACs) lives in `core-crypto`; this module
+// is purely the wire shape.
+//
+// We give pairing its own listener instead of multiplexing onto the video
+// port so:
+//   - pairing keeps working when no video session is up,
+//   - the video acceptor doesn't have to demux,
+//   - we can later swap pairing's cert verifier independently (still
+//     accept-any today; a long-term pinned identity once the handshake
+//     itself is the trust anchor).
+
+/// Wire messages exchanged during pairing. Postcard-framed (length-prefix).
+pub mod pair_proto {
+    use serde::{Deserialize, Serialize};
+
+    /// One step of the handshake. The order is fixed:
+    ///   client → host: HelloPair
+    ///   host   → client: HelloAck
+    ///   client → host: Spake2Reply
+    ///   client → host: ClientConfirm
+    ///   host   → client: HostConfirm
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub enum PairMsg {
+        /// Client kicks off; advertises its long-term pubkey + protocol version.
+        HelloPair {
+            version: u32,
+            client_pubkey: [u8; 32],
+            /// Optional alias the client suggests for itself; the host stores
+            /// it alongside the pubkey in its peers list.
+            alias: Option<String>,
+        },
+        /// Host replies with its identity + its outbound SPAKE2 message.
+        HelloAck {
+            host_pubkey: [u8; 32],
+            spake2_msg_b: Vec<u8>,
+            /// The host's friendly name for itself (e.g. hostname). The
+            /// client may use it to update the tile.
+            host_alias: Option<String>,
+        },
+        /// Client returns its SPAKE2 outbound message.
+        Spake2Reply { spake2_msg_a: Vec<u8> },
+        /// Client confirms it computed the same shared secret.
+        ClientConfirm { mac: [u8; 32] },
+        /// Host confirms in turn. Receipt = paired.
+        HostConfirm { mac: [u8; 32] },
+        /// Either side may bail; the other should close.
+        Abort { reason: String },
+    }
+}
+
+use pair_proto::PairMsg;
+
+/// One pairing-side bidi stream. Mirrors [`UsbLink`] in shape so the
+/// listener-accept-relay structure is familiar.
+pub struct PairLink {
+    pub send: quinn::SendStream,
+    pub recv: quinn::RecvStream,
+    conn: quinn::Connection,
+    _endpoint: Option<Endpoint>,
+}
+
+impl PairLink {
+    pub fn remote(&self) -> SocketAddr {
+        self.conn.remote_address()
+    }
+
+    /// Postcard-encode + length-prefix + send a single pairing message.
+    pub async fn send_msg(&mut self, msg: &PairMsg) -> Result<()> {
+        let bytes = postcard::to_allocvec(msg)?;
+        let len = u32::try_from(bytes.len())?.to_be_bytes();
+        self.send.write_all(&len).await?;
+        self.send.write_all(&bytes).await?;
+        Ok(())
+    }
+
+    /// Read one length-prefixed postcard pairing message. Caps frame size
+    /// to 64 KiB — handshake messages are small.
+    pub async fn recv_msg(&mut self) -> Result<PairMsg> {
+        let mut len_buf = [0u8; 4];
+        self.recv.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        anyhow::ensure!(
+            len <= 64 * 1024,
+            "pairing frame {len} bytes exceeds 64KiB cap"
+        );
+        let mut buf = vec![0u8; len];
+        self.recv.read_exact(&mut buf).await?;
+        let msg: PairMsg = postcard::from_bytes(&buf)?;
+        Ok(msg)
+    }
+
+    /// Tidy close — graceful finish + give the peer a moment to drain.
+    pub async fn close(mut self) -> Result<()> {
+        self.send.finish().ok();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            self.recv.read_to_end(0),
+        )
+        .await;
+        self.conn.close(0u32.into(), b"pair done");
+        Ok(())
+    }
+}
+
+/// Pharos (host): bind the persistent pairing listener.
+pub fn pair_listen(addr: SocketAddr) -> Result<Endpoint> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    Ok(Endpoint::server(server_config()?, addr)?)
+}
+
+/// Accept one incoming pairing attempt on a previously-bound listener.
+pub async fn pair_accept(endpoint: &Endpoint) -> Result<PairLink> {
+    let incoming = endpoint
+        .accept()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("pair endpoint closed"))?;
+    let conn = incoming.await?;
+    let (send, recv) = conn.accept_bi().await?;
+    Ok(PairLink {
+        send,
+        recv,
+        conn,
+        _endpoint: None,
+    })
+}
+
+/// Trireme (client): dial a Pharos pairing port and open the bidi stream.
+pub async fn pair_connect(server_addrs: &[SocketAddr]) -> Result<PairLink> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut endpoint = Endpoint::client((Ipv4Addr::UNSPECIFIED, 0).into())?;
+    endpoint.set_default_client_config(client_config()?);
+    let conn = connect_first(&endpoint, server_addrs).await?;
+    let (send, recv) = conn.open_bi().await?;
+    Ok(PairLink {
+        send,
+        recv,
+        conn,
+        _endpoint: Some(endpoint),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    /// IDNA + host:port splitting. The IDN case is the whole point — a Unicode
+    /// domain must ToASCII to punycode before it ever reaches the resolver.
+    #[test]
+    fn resolve_addr_idn_and_literals() {
+        // IP literals pass straight through (no DNS).
+        assert_eq!(
+            super::resolve_addr("192.168.1.100:4433")
+                .unwrap()
+                .to_string(),
+            "192.168.1.100:4433",
+        );
+        // Bracketed IPv6 literal splits on `]:`.
+        assert!(super::resolve_addr("[::1]:4433").is_ok());
+        // Malformed input (no port) is rejected, not panicked.
+        assert!(super::resolve_addr("nope").is_err());
+        // The IDN path: the Unicode host must IDNA-encode to punycode. We can't
+        // assert DNS success offline, but the punycode form of the user's domain
+        // must equal the expected `xn--` label (proves ToASCII ran, not raw UTF-8).
+        assert_eq!(idna::domain_to_ascii("bücher.example").unwrap(), "xn--bcher-kva.example");
+    }
+
+    #[test]
+    fn hevc_bytes_roundtrip_over_quic() {
+        // Stand-in for an encoded HEVC chunk.
+        let data: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
+        let received = super::quic_loopback(data.clone()).expect("loopback");
+        assert_eq!(received, data);
+    }
+
+    /// The USB relay channel must carry bytes both ways on one bidi stream
+    /// (exporter→host = RET_SUBMIT, host→exporter = CMD_SUBMIT).
+    #[test]
+    fn usb_bidi_roundtrip() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let endpoint = super::usb_import_endpoint((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+            let addr = endpoint.local_addr().unwrap();
+
+            // Pharos side: read the exporter's hello, reply (the URB direction).
+            let server = tokio::spawn(async move {
+                let mut link = super::usb_import_accept(&endpoint).await.unwrap();
+                let mut hello = [0u8; 4];
+                link.recv.read_exact(&mut hello).await.unwrap();
+                link.send.write_all(b"CMD0").await.unwrap();
+                link.send.finish().unwrap();
+                link.recv.read_to_end(0).await.ok(); // drain
+                hello
+            });
+
+            // Exporter side.
+            let mut link = super::usb_export_connect(addr).await.unwrap();
+            link.send.write_all(b"DEV0").await.unwrap();
+            let mut reply = [0u8; 4];
+            link.recv.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"CMD0");
+            link.send.finish().unwrap();
+
+            assert_eq!(&server.await.unwrap(), b"DEV0");
+        });
+    }
+
+    /// The pairing QUIC path (`pair_listen`/`pair_accept` ↔ `pair_connect`) must
+    /// complete a handshake and carry a bidi exchange on loopback — isolates the
+    /// QUIC layer from the Windows host's no-response symptom.
+    #[test]
+    fn pair_quic_handshake_loopback() {
+        use std::net::Ipv4Addr;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let endpoint = super::pair_listen((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+            let addr = endpoint.local_addr().unwrap();
+            // Server: accept the connection + the client's bidi stream, read the
+            // client's first bytes (mirrors `handle_one` reading HelloPair first).
+            let server = tokio::spawn(async move {
+                let mut link = super::pair_accept(&endpoint).await.unwrap();
+                let mut buf = [0u8; 4];
+                link.recv.read_exact(&mut buf).await.unwrap();
+                buf
+            });
+            // Client: connect + open the bidi stream + send. Keep the link (and
+            // thus the connection) alive until the server has read.
+            let mut link = super::pair_connect(&[addr]).await.unwrap();
+            link.send.write_all(b"PING").await.unwrap();
+            let got = server.await.unwrap();
+            assert_eq!(&got, b"PING");
+        });
+    }
+
+    /// A client NIC/IP change mid-stream must NOT drop the connection — QUIC
+    /// migrates it to the new path (keyed by connection ID, not the 4-tuple). We
+    /// simulate the change by rebinding the client endpoint to a fresh local
+    /// socket while a uni stream is in flight, then assert the rest still arrives.
+    #[test]
+    fn connection_survives_client_rebind() {
+        use std::net::{Ipv4Addr, UdpSocket};
+        use std::time::Duration;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let server = super::Endpoint::server(
+                super::server_config().unwrap(),
+                (Ipv4Addr::LOCALHOST, 0).into(),
+            )
+            .unwrap();
+            let addr = server.local_addr().unwrap();
+            let srv = tokio::spawn(async move {
+                let conn = server.accept().await.unwrap().await.unwrap();
+                let mut s = conn.open_uni().await.unwrap();
+                for i in 0..20u8 {
+                    s.write_all(&[i]).await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                }
+                s.finish().ok();
+                // Hold the connection open so the client can drain post-migration.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            });
+
+            let mut client = super::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+            client.set_default_client_config(super::client_config().unwrap());
+            let conn = client.connect(addr, "localhost").unwrap().await.unwrap();
+            let mut r = conn.accept_uni().await.unwrap();
+
+            // Read a little, then yank the socket out from under the connection —
+            // this is what a WiFi→Ethernet switch / DHCP renew looks like to quinn.
+            let mut first = [0u8; 3];
+            r.read_exact(&mut first).await.unwrap();
+            client
+                .rebind(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap())
+                .unwrap();
+
+            // The rest must still arrive over the migrated path.
+            let rest = r.read_to_end(64).await.unwrap();
+            let mut all = first.to_vec();
+            all.extend(rest);
+            assert_eq!(
+                all,
+                (0..20u8).collect::<Vec<u8>>(),
+                "data lost across client rebind/migration"
+            );
+            srv.await.unwrap();
+        });
+    }
+
+    /// The whole point of M2 pairing hardening: a host with an enforcing
+    /// authorizer streams to a paired client and rejects an unpaired one.
+    #[test]
+    fn mutual_auth_admits_paired_rejects_unpaired() {
+        use std::net::{SocketAddr, UdpSocket};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let host_id = Arc::new(core_crypto::Identity::generate());
+        let client_a = core_crypto::Identity::generate(); // paired → admitted
+        let client_b = core_crypto::Identity::generate(); // unpaired → rejected
+        let a_pub = client_a.public_bytes();
+
+        // Grab a free UDP port, then bind the streamer to it.
+        let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+
+        // Authorizer admits only client A's *verified* pubkey.
+        let authorizer: super::ClientAuthorizer =
+            Arc::new(move |c: Option<[u8; 32]>| c == Some(a_pub));
+        let streamer = Arc::new(
+            super::QuicStreamer::start_with_authorizer(
+                addr,
+                host_id,
+                authorizer,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .unwrap(),
+        );
+
+        // Keep frames flowing so an admitted client has something to receive.
+        let stop = Arc::new(AtomicBool::new(false));
+        let pusher = {
+            let s = streamer.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    s.send(vec![1, 2, 3, 4]);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
+
+        // Unpaired client B: the host closes the connection after auth, so the
+        // video client errors out and never sees a frame. Run it to completion
+        // first (the host accepts one connection at a time).
+        let res_b = std::thread::spawn(move || {
+            super::run_video_client(addr, None, Some(&client_b), |_| {}, None, None, None)
+        })
+        .join()
+        .unwrap();
+        assert!(res_b.is_err(), "unpaired client must be rejected");
+
+        // Paired client A: admitted, receives at least one frame.
+        let got = Arc::new(AtomicBool::new(false));
+        {
+            let got = got.clone();
+            std::thread::spawn(move || {
+                let _ = super::run_video_client(
+                    addr,
+                    None,
+                    Some(&client_a),
+                    move |_| {
+                        got.store(true, Ordering::Release);
+                    },
+                    None,
+                    None,
+                    None,
+                );
+            });
+        }
+        let mut admitted = false;
+        for _ in 0..300 {
+            if got.load(Ordering::Acquire) {
+                admitted = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _ = pusher.join();
+        assert!(
+            admitted,
+            "paired client must be admitted and receive a frame"
+        );
+    }
+
+    /// Audio rides the same authenticated session as unreliable QUIC datagrams:
+    /// `send_audio` on the host → `on_audio` on the client.
+    #[test]
+    fn audio_datagrams_reach_client() {
+        use std::net::{SocketAddr, UdpSocket};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let host_id = Arc::new(core_crypto::Identity::generate());
+        let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+
+        let streamer = Arc::new(super::QuicStreamer::start(addr, host_id).unwrap());
+
+        // Push audio packets continuously (only transmitted once a client is up).
+        let stop = Arc::new(AtomicBool::new(false));
+        let pusher = {
+            let s = streamer.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    s.send_audio(vec![7, 7, 7, 7]);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+
+        let got_audio = Arc::new(AtomicBool::new(false));
+        {
+            let got_audio = got_audio.clone();
+            std::thread::spawn(move || {
+                let on_audio: Box<dyn FnMut(Vec<u8>) + Send> = Box::new(move |pkt: Vec<u8>| {
+                    if !pkt.is_empty() {
+                        got_audio.store(true, Ordering::Release);
+                    }
+                });
+                // No video is pushed here, so the video stream just idles; the
+                // audio datagrams are what we're checking.
+                let _ = super::run_video_client_with_input(
+                    vec![addr],
+                    None,
+                    None,
+                    |_| {},
+                    None,
+                    Some(on_audio),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    false, // wants_hdr
+                    None,
+                    None,
+                    core_proto::StreamMode::default(),
+                    None,
+                    None,
+                    None,
+                );
+            });
+        }
+
+        let mut received = false;
+        for _ in 0..300 {
+            if got_audio.load(Ordering::Acquire) {
+                received = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _ = pusher.join();
+        assert!(received, "client must receive audio datagrams");
+    }
+
+    /// The app-launcher relay's client→host direction, under simulated video
+    /// load: the host pushes a catalog (so the app stream opens) + a steady video
+    /// stream, the client sends a launch via its app channel, and the host's
+    /// `take_app_launch_rx` must deliver it. Reproduces the "tap does nothing"
+    /// bug seen on the TV without needing the device.
+    #[test]
+    fn app_launch_relays_client_to_host_under_load() {
+        use std::net::{SocketAddr, UdpSocket};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let host_id = Arc::new(core_crypto::Identity::generate());
+        let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+
+        let streamer = Arc::new(super::QuicStreamer::start(addr, host_id).unwrap());
+        let mut launch_rx = streamer.take_app_launch_rx().expect("app launch rx once");
+        // Publish a catalog so the host opens the app relay stream on connect.
+        streamer.send_app_catalog(vec![core_proto::AppInfo {
+            id: "x".into(),
+            name: "X".into(),
+            kind: 0,
+            art: Vec::new(),
+            running: false,
+        }]);
+
+        // Simulate the live stream so the client's video loop is busy (the
+        // condition under which a starved app task would never send).
+        let stop = Arc::new(AtomicBool::new(false));
+        let pusher = {
+            let s = streamer.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    s.send(vec![0u8; 4096]);
+                    std::thread::sleep(Duration::from_millis(8));
+                }
+            })
+        };
+
+        let (app_tx, app_rx) = tokio::sync::mpsc::unbounded_channel::<core_proto::AppMsg>();
+        // Match the real client exactly: it opens the input bidi stream AND
+        // registers an on_catalog callback, both alongside the app launch channel.
+        let (_input_tx, input_rx) =
+            tokio::sync::mpsc::unbounded_channel::<core_proto::InputEvent>();
+        let on_catalog: Option<Box<dyn FnMut(Vec<core_proto::AppInfo>) + Send>> =
+            Some(Box::new(|_apps| {}));
+        std::thread::spawn(move || {
+            let _ = super::run_video_client_with_input(
+                vec![addr],
+                None,
+                None,
+                |_| {},
+                Some(input_rx),
+                None,
+                None,
+                None,
+                None,
+                on_catalog,
+                Some(app_rx),
+                false,
+                false, // wants_hdr
+                None,
+                None,
+                core_proto::StreamMode::default(),
+                None,
+                None,
+                None,
+            );
+        });
+
+        // Wait for the client to connect + the app stream to establish.
+        for _ in 0..300 {
+            if streamer.is_connected() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        app_tx
+            .send(core_proto::AppMsg::Launch {
+                id: "crimson-desert".into(),
+            })
+            .expect("send launch");
+
+        let mut got = None;
+        for _ in 0..300 {
+            if let Ok(core_proto::AppMsg::Launch { id }) = launch_rx.try_recv() {
+                got = Some(id);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _ = pusher.join();
+        assert_eq!(
+            got.as_deref(),
+            Some("crimson-desert"),
+            "host must receive the client's launch request"
+        );
+    }
+
+    /// The on-demand latency benchmark, end to end on loopback. The host pushes a
+    /// few video AUs via `send_with_meta` (= opens a bench window, the meta riding
+    /// inline with each AU; the transport fills `wire_send_ns`). The client must
+    /// auto-detect that, fire the clock-ping burst, the host must answer with pongs,
+    /// and after the meta stops the client must send a `WireLatencyReport` back —
+    /// which `take_latency_rx` delivers with `samples > 0` and all-finite numbers.
+    /// Loopback-only: no decoder, taps None (so decode/buffer/present are 0.0); we
+    /// only exercise the host + wire path.
+    #[test]
+    fn latency_bench_roundtrips_report() {
+        use std::net::{SocketAddr, UdpSocket};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let host_id = Arc::new(core_crypto::Identity::generate());
+        let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+
+        let streamer = Arc::new(super::QuicStreamer::start(addr, host_id).unwrap());
+        let mut latency_rx = streamer.take_latency_rx().expect("latency rx once");
+
+        // Host pusher: once a client is connected, send a burst of video AUs each
+        // paired with a FrameStageMeta (UNIX-nanos stamps with realistic gaps), then
+        // stop emitting meta so the client's idle timer closes the window.
+        let stop = Arc::new(AtomicBool::new(false));
+        let pusher = {
+            let s = streamer.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                // Wait for the client to be connected before benching.
+                while !s.is_connected() && !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let now = || {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos() as u64
+                };
+                for idx in 0..20u64 {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    // Back-date the stamps so the *real* wire_send_ns the transport
+                    // takes at write_all (≈now) lands AFTER encode_done — i.e. the
+                    // simulated compose+encode happened in the immediate past, just
+                    // like a real host where the AU is encoded before it's sent.
+                    let encode_done = now();
+                    let encode_start = encode_done - 2_000_000; // 2ms encode
+                    let capture = encode_start - 800_000; // 0.8ms compose
+                    let meta = core_proto::FrameStageMeta {
+                        frame_idx: idx,
+                        capture_ns: capture,
+                        encode_start_ns: encode_start,
+                        encode_done_ns: encode_done,
+                        wire_send_ns: 0, // filled by the transport at write_all
+                    };
+                    // One call carries the AU and its meta 1:1 down the same channel.
+                    s.send_with_meta(vec![idx as u8, 1, 2, 3], false, meta);
+                    std::thread::sleep(Duration::from_millis(16)); // ~60fps
+                }
+                // Stop emitting meta; the client's idle timer (~750ms) ends the
+                // window and triggers the report. Keep the connection alive.
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })
+        };
+
+        // Client: participates in the bench automatically (taps None).
+        let client_done = Arc::new(AtomicBool::new(false));
+        {
+            let client_done = client_done.clone();
+            std::thread::spawn(move || {
+                let _ = super::run_video_client_with_input(
+                    vec![addr],
+                    None,
+                    None,
+                    |_| {},
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,  // latency_taps None → decode/present stay 0.0
+                    None,  // on_catalog
+                    None,  // app_launch_rx
+                    false, // bench client: no gyro
+                    false, // bench client: no HDR
+                    None,  // on_link_health
+                    None,  // request_idr
+                    core_proto::StreamMode::default(), // requested_mode
+                    None,  // res_pref
+                    None,  // bitrate_pref
+                    None,  // fps_pref
+                );
+                client_done.store(true, Ordering::Release);
+            });
+        }
+
+        // The host should receive exactly one report once the window closes.
+        let report = {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), latency_rx.recv())
+                    .await
+                    .ok()
+                    .flatten()
+            })
+        };
+        stop.store(true, Ordering::Relaxed);
+        let _ = pusher.join();
+
+        let report = report.expect("host must receive a WireLatencyReport");
+        assert!(report.samples > 0, "report must have folded ≥1 meta");
+        assert_eq!(&report.codec_fourcc, b"hevc");
+        // Every numeric field must be finite (no NaN/inf from a bad clock calc).
+        for v in [
+            report.rtt_ms,
+            report.clock_offset_ms,
+            report.compose_ms,
+            report.encode_ms,
+            report.host_send_ms,
+            report.nexus_ms,
+            report.nexus_uncertainty_ms,
+            report.buffer_ms,
+            report.decode_ms,
+            report.present_ms,
+            report.total_ms,
+        ] {
+            assert!(v.is_finite(), "report field must be finite, got {v}");
+        }
+        // Taps None → the client-local stages are exactly 0 and non-negative.
+        assert_eq!(report.decode_ms, 0.0);
+        assert_eq!(report.buffer_ms, 0.0);
+        assert_eq!(report.present_ms, 0.0);
+        assert!(report.decode_ms >= 0.0);
+        assert!(report.buffer_ms >= 0.0);
+        // The host stamped a 0.8ms compose + 2ms encode gap; both should survive.
+        assert!(
+            report.compose_ms > 0.0,
+            "compose stage should be nonzero (host stamped 0.8ms)"
+        );
+        assert!(
+            report.encode_ms > 0.0,
+            "encode stage should be nonzero (host stamped 2ms)"
+        );
+        // nexus is exactly half the (min) RTT.
+        let half_rtt = report.rtt_ms / 2.0;
+        assert!(
+            (report.nexus_ms - half_rtt).abs() < 1.0e-3,
+            "nexus_ms ({}) should equal rtt_ms/2 ({half_rtt})",
+            report.nexus_ms
+        );
+    }
+}

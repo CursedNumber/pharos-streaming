@@ -1,0 +1,38 @@
+[package]
+name = "media-spice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+# Native SPICE source for split-screen cells (e.g. a Proxmox/QEMU VM console
+# spoken over `protocol = "spice"`). Mirrors `trireme::vncsrc`: a `run(...)` that
+# emits full top-down RGBA frames and drains an `InputEvent` channel, bridged
+# into the player's existing NV12 path via ffmpeg.
+#
+# The actual spice-client-glib FFI lives behind the `ffi` feature so the lean
+# default build (and the pure-logic unit tests) need neither glib-sys nor the
+# spice-gtk system library. The Trireme client turns `ffi` on via its own
+# `spice` feature; everywhere else this crate compiles to a stub `run`.
+
+[features]
+default = []
+# Pull in the GLib/GObject FFI + link libspice-client-glib-2.0 (build.rs probes
+# it with pkg-config). Requires the `spice-gtk` system package at build time.
+ffi = ["dep:glib-sys", "dep:gobject-sys"]
+
+[dependencies]
+anyhow = "1"
+tracing = "0.1"
+# `InputEvent` wire type, shared with the rest of the client.
+core-proto = { workspace = true }
+# The player hands us an UnboundedReceiver<InputEvent>; only the channel is used.
+tokio = { version = "1", features = ["sync"] }
+# GLib/GObject FFI base (GMainLoop, GObject, GValue, signal connect, …). Only
+# compiled when `ffi` is on. Matched to the system glib 2.x; no other crate in
+# the workspace pulls glib, so there is no version to unify against.
+glib-sys = { version = "0.20", optional = true }
+gobject-sys = { version = "0.20", optional = true }
+
+[build-dependencies]
+pkg-config = "0.3"

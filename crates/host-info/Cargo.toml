@@ -1,0 +1,16 @@
+[package]
+name = "host-info"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Host identity helpers (hostname + advertised NIC MACs/IPs) for telemetry,
+# Wake-on-LAN, and MAC-driven socket binding. A lean leaf — just cross-platform
+# NIC enumeration, no tokio/rumqttc — so it cross-compiles cleanly to
+# windows-msvc and can be depended on by both the host and the panel.
+
+[dependencies]
+# Cross-platform NIC enumeration (name + MAC + IPs together). Publishing every
+# MAC lets HA WoL target any interface; resolving MAC→IP lets the host bind the
+# interface the operator designates on a multi-NIC machine.
+network-interface = "2"

@@ -1,0 +1,523 @@
+# rust-i18n locale file (v2: one file per module, each key carries per-locale
+# values). English is the default + fallback. To add a language, add its code
+# (e.g. `"fr"`) alongside `en` under each key — it then appears automatically in
+# Settings → Appearance → Language (driven by `available_locales!()`).
+#
+# This file is owned exclusively by the Video tab (crates/pharos-panel/src/tabs/
+# video.rs). Every key is namespaced `video.*` so it never clashes with another
+# tab's strings. Purely dynamic values (counts, ports, ffmpeg tokens, vendor /
+# codec strings from the capability probes) stay as Rust formatting — only the
+# static labels and descriptions around them live here.
+_version = 2
+
+# --- Header -----------------------------------------------------------------
+["video.heading"]
+en = "Video"
+nb = "Video"
+
+["video.intro"]
+en = "The video path, end to end: how a frame leaves this host's encoder, crosses the QUIC link, and is decoded on the client. Boxes show what's available on the hardware in play today."
+nb = "Videobanen, fra ende til ende: hvordan et bilde forlater enkoderen på denne verten, krysser QUIC-lenken og dekodes på klienten. Boksene viser hva som er tilgjengelig på maskinvaren som er i bruk i dag."
+
+["video.reprobe"]
+en = "Re-probe"
+nb = "Sonder på nytt"
+
+["video.reprobe_desc"]
+en = "Re-run the encoder (ffmpeg -encoders) and decoder (test-decode) probes on a worker thread. The decode probe is process-cached, so this is fast after the first run and never blocks the UI."
+nb = "Kjør sonderingene for enkoder (ffmpeg -encoders) og dekoder (test-decode) på nytt på en arbeidstråd. Dekodingssonderingen er prosess-bufret, så dette går raskt etter første kjøring og blokkerer aldri grensesnittet."
+
+["video.probing"]
+en = "probing…"
+nb = "sonderer…"
+
+["video.probing_desc"]
+en = "A capability re-probe is running on a worker thread; the matrix refreshes when it finishes."
+nb = "En ny kapabilitetssondering kjører på en arbeidstråd; matrisen oppdateres når den er ferdig."
+
+# --- Performance legend ------------------------------------------------------
+["video.legend.heading"]
+en = "Performance"
+nb = "Ytelse"
+
+["video.legend.desc"]
+en = "Each option carries a 1-to-6 performance chip: 1 is excellent (hardware-accelerated, full frame rate), 6 is very poor (software fallback). The chip colour runs green for fast to red for slow."
+nb = "Hvert alternativ har en ytelsesbrikke fra 1 til 6: 1 er utmerket (maskinvareakselerert, full bildefrekvens), 6 er svært dårlig (programvarefallback). Brikkefargen går fra grønn for rask til rød for treg."
+
+["video.legend.validated_mark_desc"]
+en = "A star marks a route confirmed working end-to-end on our own hardware — hover the star for the rig it was validated on."
+nb = "En stjerne markerer en rute som er bekreftet å fungere fra ende til ende på vår egen maskinvare — hold pekeren over stjernen for å se riggen den ble validert på."
+
+["video.legend.validated_text"]
+en = "= validated end-to-end on our hardware (hover for the rig)."
+nb = "= validert fra ende til ende på vår maskinvare (hold pekeren over for å se riggen)."
+
+# --- Performance ranks (1..6) ------------------------------------------------
+["video.perf.1"]
+en = "Excellent"
+nb = "Utmerket"
+
+["video.perf.2"]
+en = "Very good"
+nb = "Svært god"
+
+["video.perf.3"]
+en = "Good"
+nb = "God"
+
+["video.perf.4"]
+en = "Fair"
+nb = "Brukbar"
+
+["video.perf.5"]
+en = "Poor"
+nb = "Dårlig"
+
+["video.perf.6"]
+en = "Very poor"
+nb = "Svært dårlig"
+
+["video.perf.chip_desc"]
+en = "Performance rank for this option, 1 (excellent) to 6 (very poor); green is fast, red is slow."
+nb = "Ytelsesrangering for dette alternativet, 1 (utmerket) til 6 (svært dårlig); grønn er rask, rød er treg."
+
+# --- Show-unavailable toggle + availability count ----------------------------
+["video.show_unavailable"]
+en = "Show unavailable options"
+nb = "Vis utilgjengelige alternativer"
+
+["video.show_unavailable_desc"]
+en = "Off by default: the matrix shows only what works on this box today. Turn on to also list encoders and decoders ffmpeg knows about but that have no working device here — they appear dimmed, with the probe reason as their description."
+nb = "Av som standard: matrisen viser bare det som fungerer på denne maskinen i dag. Slå på for også å liste enkodere og dekodere som ffmpeg kjenner til, men som ikke har noen fungerende enhet her — de vises nedtonet, med sonderingsårsaken som beskrivelse."
+
+["video.avail_count_desc"]
+en = "How many video encoders and decoders are usable on this machine right now, out of everything the probes found."
+nb = "Hvor mange videoenkodere og -dekodere som er brukbare på denne maskinen akkurat nå, av alt sonderingene fant."
+
+["video.avail.encoder_one"]
+en = "encoder"
+nb = "enkoder"
+
+["video.avail.encoder_many"]
+en = "encoders"
+nb = "enkodere"
+
+["video.avail.decoder_one"]
+en = "decoder"
+nb = "dekoder"
+
+["video.avail.decoder_many"]
+en = "decoders"
+nb = "dekodere"
+
+["video.avail.available_here"]
+en = "available here"
+nb = "tilgjengelig her"
+
+# --- Column headers ----------------------------------------------------------
+["video.col.encode"]
+en = "HOST ENCODE"
+nb = "ENKODING PÅ VERT"
+
+["video.col.encode_desc"]
+en = "This host turns the captured desktop into an HEVC bitstream — the left edge of the pipeline. Each box below is a usable encoder; the best one is listed first."
+nb = "Denne verten gjør det fangede skrivebordet om til en HEVC-bitstrøm — venstre kant av pipelinen. Hver boks nedenfor er en brukbar enkoder; den beste står først."
+
+["video.col.transport"]
+en = "VIDEO TRANSPORT"
+nb = "VIDEOTRANSPORT"
+
+["video.col.transport_desc"]
+en = "Pharos streams over a single QUIC connection (TLS 1.3, congestion-controlled) — the middle of the pipeline. The legacy RTP and plain-UDP transports are shown as not used."
+nb = "Pharos strømmer over én enkelt QUIC-tilkobling (TLS 1.3, med overbelastningskontroll) — midten av pipelinen. De eldre transportene RTP og ren UDP vises som ikke i bruk."
+
+["video.col.codec"]
+en = "CODEC"
+nb = "KODEK"
+
+["video.col.codec_desc"]
+en = "The video codec on the wire — the middle of the pipeline. Transport is always QUIC (TLS 1.3, congestion-controlled), so it isn't a choice; the codec is. HEVC is active today; the pipeline is structured so H.264 and AV1 can slot in."
+nb = "Videokodeken på ledningen — midten av pipelinen. Transporten er alltid QUIC (TLS 1.3, med overbelastningskontroll), så den er ikke et valg; det er kodeken. HEVC er aktiv i dag; pipelinen er bygd slik at H.264 og AV1 kan settes inn."
+
+# --- codecs (the middle column) ---------------------------------------------
+["video.codec.hevc"]
+en = "HEVC"
+nb = "HEVC"
+
+["video.codec.hevc_meta"]
+en = "H.265 · 8/10-bit · main"
+nb = "H.265 · 8/10-bit · main"
+
+["video.codec.hevc_mark_desc"]
+en = "HEVC is the active codec across every validated rig (NVENC, Quick Sync, AMF, rkmpp, software)."
+nb = "HEVC er den aktive kodeken på alle validerte rigger (NVENC, Quick Sync, AMF, rkmpp, programvare)."
+
+["video.codec.hevc_desc"]
+en = "High Efficiency Video Coding (H.265): the codec Pharos encodes and streams today, end to end. Good quality-per-bit and broad hardware encode/decode support."
+nb = "High Efficiency Video Coding (H.265): kodeken Pharos enkoder og strømmer i dag, ende til ende. God kvalitet per bit og bred maskinvarestøtte for enkoding/dekoding."
+
+["video.codec.in_use"]
+en = "in use"
+nb = "i bruk"
+
+["video.codec.in_use_desc"]
+en = "This is the codec the live stream uses right now."
+nb = "Dette er kodeken den aktive strømmen bruker akkurat nå."
+
+["video.codec.h264"]
+en = "H.264"
+nb = "H.264"
+
+["video.codec.h264_desc"]
+en = "Advanced Video Coding (AVC). Not active yet — the encode/decode path is structured so it can be added as a fallback for the widest device compatibility."
+nb = "Advanced Video Coding (AVC). Ikke aktiv ennå — enkode-/dekodebanen er bygd slik at den kan legges til som en reserve for bredest mulig enhetskompatibilitet."
+
+["video.codec.av1"]
+en = "AV1"
+nb = "AV1"
+
+["video.codec.av1_desc"]
+en = "Royalty-free, better quality-per-bit than HEVC. Not active yet — slated for once hardware AV1 encode is common across the rigs."
+nb = "Royalty-fri, bedre kvalitet per bit enn HEVC. Ikke aktiv ennå — planlagt når maskinvare-AV1-enkoding er vanlig på riggene."
+
+["video.codec.ready"]
+en = "ready"
+nb = "klar"
+
+["video.codec.ready_desc"]
+en = "Structured for, but not active in this build."
+nb = "Det er lagt til rette for den, men den er ikke aktiv i denne byggeversjonen."
+
+["video.col.decode"]
+en = "CLIENT DECODE"
+nb = "DEKODING PÅ KLIENT"
+
+["video.col.decode_desc"]
+en = "The Trireme client turns the HEVC bitstream back into frames — the right edge of the pipeline. Each box below is a decoder the client can use."
+nb = "Trireme-klienten gjør HEVC-bitstrømmen tilbake til bilder — høyre kant av pipelinen. Hver boks nedenfor er en dekoder klienten kan bruke."
+
+# --- Empty-state messages ----------------------------------------------------
+["video.empty.encoders_all"]
+en = "No encoders known to ffmpeg on this box."
+nb = "Ingen enkodere er kjent for ffmpeg på denne maskinen."
+
+["video.empty.encoders_avail"]
+en = "No encoders available here. Tick \"Show unavailable\" to see what ffmpeg knows about."
+nb = "Ingen enkodere er tilgjengelige her. Kryss av for «Vis utilgjengelige» for å se hva ffmpeg kjenner til."
+
+["video.empty.decoders_all"]
+en = "No decoders known to ffmpeg on this box."
+nb = "Ingen dekodere er kjent for ffmpeg på denne maskinen."
+
+["video.empty.decoders_avail"]
+en = "No decoders available here. Tick \"Show unavailable\" to see what ffmpeg knows about."
+nb = "Ingen dekodere er tilgjengelige her. Kryss av for «Vis utilgjengelige» for å se hva ffmpeg kjenner til."
+
+# --- Option box (encoder / decoder) ------------------------------------------
+["video.box.validated_on"]
+en = "Validated end-to-end on"
+nb = "Validert fra ende til ende på"
+
+["video.box.validated_no_rig"]
+en = "Validated end-to-end."
+nb = "Validert fra ende til ende."
+
+["video.box.status.validated"]
+en = "Validated"
+nb = "Validert"
+
+["video.box.status.available"]
+en = "Available"
+nb = "Tilgjengelig"
+
+["video.box.status.unavailable"]
+en = "Unavailable"
+nb = "Utilgjengelig"
+
+["video.box.encoder_desc"]
+en = "Host encoder option. Vendor and codec are on the second line, the ffmpeg selector on the third, and a status badge below."
+nb = "Enkoderalternativ for vert. Leverandør og kodek står på andre linje, ffmpeg-velgeren på tredje, og et statusmerke under."
+
+["video.box.decoder_desc"]
+en = "Client decoder option. Vendor and codec are on the second line, the ffmpeg selector on the third, and a status badge below."
+nb = "Dekoderalternativ for klient. Leverandør og kodek står på andre linje, ffmpeg-velgeren på tredje, og et statusmerke under."
+
+["video.box.status.validated_desc"]
+en = "Confirmed working end-to-end on our own hardware (test-decode passed or a known-good rig)."
+nb = "Bekreftet å fungere fra ende til ende på vår egen maskinvare (test-decode bestått eller en kjent fungerende rigg)."
+
+["video.box.status.available_desc"]
+en = "Present and working on this machine, but not yet starred as validated end-to-end."
+nb = "Til stede og fungerer på denne maskinen, men ennå ikke stjernemerket som validert fra ende til ende."
+
+["video.box.status.unavailable_desc"]
+en = "ffmpeg knows this option but no working device was found here; the probe reason is in this box's description."
+nb = "ffmpeg kjenner dette alternativet, men ingen fungerende enhet ble funnet her; sonderingsårsaken står i denne boksens beskrivelse."
+
+# --- Transport card ----------------------------------------------------------
+["video.transport.quic"]
+en = "QUIC"
+nb = "QUIC"
+
+["video.transport.quic_mark_desc"]
+en = "QUIC is the only transport Pharos uses — validated end-to-end."
+nb = "QUIC er den eneste transporten Pharos bruker — validert fra ende til ende."
+
+["video.transport.quic_meta"]
+en = "UDP · TLS 1.3"
+nb = "UDP · TLS 1.3"
+
+["video.transport.quic_status"]
+en = "Active"
+nb = "Aktiv"
+
+["video.transport.quic_status_desc"]
+en = "QUIC is the live transport carrying this stream right now."
+nb = "QUIC er den aktive transporten som bærer denne strømmen akkurat nå."
+
+["video.transport.quic_desc"]
+en = "A single bidirectional QUIC connection carries video, audio (Opus) and the input back-channel over UDP with TLS 1.3. The flow-control window is the latency-critical knob (Settings → stream window)."
+nb = "Én enkelt toveis QUIC-tilkobling bærer video, lyd (Opus) og inndata-bakkanalen over UDP med TLS 1.3. Flytkontrollvinduet er den latenskritiske innstillingen (Innstillinger → strømvindu)."
+
+["video.transport.rtp"]
+en = "RTP / RTSP"
+nb = "RTP / RTSP"
+
+["video.transport.rtp_desc"]
+en = "Not used by Pharos — the classic GameStream transport; QUIC replaces it."
+nb = "Ikke brukt av Pharos — den klassiske GameStream-transporten; QUIC erstatter den."
+
+["video.transport.udp"]
+en = "Plain UDP"
+nb = "Ren UDP"
+
+["video.transport.udp_desc"]
+en = "Not used by Pharos — no congestion control or encryption on its own."
+nb = "Ikke brukt av Pharos — har verken overbelastningskontroll eller kryptering på egen hånd."
+
+["video.transport.na"]
+en = " N/A "
+nb = " I/T "
+
+["video.transport.na_desc"]
+en = "Not available: this transport is shown for comparison but Pharos does not use it."
+nb = "Ikke tilgjengelig: denne transporten vises til sammenligning, men Pharos bruker den ikke."
+
+# --- Audio strip -------------------------------------------------------------
+["video.audio.heading"]
+en = "Audio"
+nb = "Lyd"
+
+["video.audio.heading_desc"]
+en = "Audio path: Opus is the only codec, encoded host-side and decoded on the client, multiplexed onto the same QUIC connection as the video — no separate audio socket."
+nb = "Lydbane: Opus er den eneste kodeken, enkodes på vertssiden og dekodes på klienten, multiplekset på samme QUIC-tilkobling som videoen — ingen egen lydsocket."
+
+["video.audio.opus"]
+en = "Opus"
+nb = "Opus"
+
+["video.audio.opus_mark_desc"]
+en = "Validated on the Android X90J client (60fps / 0-drop + audio)."
+nb = "Validert på Android X90J-klienten (60fps / 0 tap + lyd)."
+
+["video.audio.opus_inband"]
+en = "In-band over QUIC"
+nb = "I samme kanal over QUIC"
+
+["video.audio.opus_inband_desc"]
+en = "Audio is multiplexed onto the same QUIC connection as the video — no separate audio socket."
+nb = "Lyd multiplekses på samme QUIC-tilkobling som videoen — ingen egen lydsocket."
+
+["video.audio.opus_desc"]
+en = "Opus is the only audio codec — low-latency, encoded host-side and decoded on the client, multiplexed onto the same QUIC connection as the video."
+nb = "Opus er den eneste lydkodeken — lav ventetid, enkodes på vertssiden og dekodes på klienten, multiplekset på samme QUIC-tilkobling som videoen."
+
+# --- Latency benchmark -------------------------------------------------------
+["video.bench.heading"]
+en = "Latency benchmark"
+nb = "Latensmåling"
+
+["video.bench.heading_desc"]
+en = "Measure the real, per-step latency of the live pipeline while a Trireme is streaming, re-attributed to honest stages: compose, encode, host send, the wire leg, in-flight buffering, decode and present. The wire leg is RTT/2 from the clock-sync probes and shown with its uncertainty; the buffer row — not compute — is usually the biggest number."
+nb = "Mål den faktiske latensen per trinn i den aktive pipelinen mens en Trireme strømmer, omfordelt til ærlige trinn: sammensetting, enkoding, sending fra vert, ledningsleddet, buffring under transport, dekoding og visning. Ledningsleddet er RTT/2 fra klokkesynk-sonderingene og vises med sin usikkerhet; bufferraden — ikke beregning — er som regel det største tallet."
+
+["video.bench.run"]
+en = "Run benchmark"
+nb = "Kjør måling"
+
+["video.bench.run_desc"]
+en = "Ask the host to time the pipeline over 240 frames and report the per-step latency. Needs a Trireme actively streaming. Disabled when no host is connected."
+nb = "Be verten ta tiden på pipelinen over 240 bilder og rapportere latensen per trinn. Krever at en Trireme strømmer aktivt. Deaktivert når ingen vert er tilkoblet."
+
+["video.bench.running"]
+en = "benchmarking…"
+nb = "måler…"
+
+["video.bench.running_desc"]
+en = "The host is timing the pipeline; the results table appears when the run finishes."
+nb = "Verten tar tiden på pipelinen; resultattabellen vises når kjøringen er ferdig."
+
+["video.bench.started"]
+en = "Latency benchmark started…"
+nb = "Latensmåling startet…"
+
+["video.bench.done"]
+en = "Latency benchmark complete."
+nb = "Latensmåling fullført."
+
+["video.bench.error_prefix"]
+en = "Benchmark failed:"
+nb = "Målingen mislyktes:"
+
+["video.bench.error_desc"]
+en = "The benchmark could not complete — typically because no client is currently streaming, or the run timed out."
+nb = "Målingen kunne ikke fullføres — vanligvis fordi ingen klient strømmer akkurat nå, eller fordi kjøringen tidsavbrøt."
+
+["video.bench.timeout"]
+en = "Benchmark timed out — is a Trireme actually streaming?"
+nb = "Målingen tidsavbrøt — strømmer en Trireme faktisk?"
+
+["video.bench.hint"]
+en = "No benchmark yet. Run one while a Trireme is streaming to see where the latency goes, step by step."
+nb = "Ingen måling ennå. Kjør en mens en Trireme strømmer for å se hvor latensen blir av, trinn for trinn."
+
+["video.bench.hint_desc"]
+en = "The benchmark needs a live stream to measure: start a Trireme client streaming from this host, then press Run benchmark."
+nb = "Målingen trenger en aktiv strøm å måle: start en Trireme-klient som strømmer fra denne verten, og trykk deretter Kjør måling."
+
+# --- Benchmark summary line --------------------------------------------------
+["video.bench.summary.samples"]
+en = "Samples:"
+nb = "Prøver:"
+
+["video.bench.summary.rtt"]
+en = "RTT:"
+nb = "RTT:"
+
+["video.bench.summary.offset"]
+en = "clock offset (diagnostic):"
+nb = "klokkeavvik (diagnostisk):"
+
+["video.bench.summary_desc"]
+en = "How many frames were sampled, the measured round-trip time, and the estimated host-to-client clock offset. The offset is diagnostic only — no stage is derived from it; the wire leg comes from RTT/2."
+nb = "Hvor mange bilder som ble målt, den målte rundturstiden, og det estimerte klokkeavviket mellom vert og klient. Avviket er kun diagnostisk — ingen trinn utledes fra det; ledningsleddet kommer fra RTT/2."
+
+# --- Benchmark table columns -------------------------------------------------
+["video.bench.col.step"]
+en = "Pipeline step"
+nb = "Pipeline-trinn"
+
+["video.bench.col.step_desc"]
+en = "One row per stage a frame passes through, from host capture to client present."
+nb = "Én rad per trinn et bilde går gjennom, fra fangst på verten til visning på klienten."
+
+["video.bench.col.codec"]
+en = "Codec"
+nb = "Kodek"
+
+["video.bench.col.codec_desc"]
+en = "The video codec carried through this stage (constant across the run, e.g. HEVC)."
+nb = "Videokodeken som bæres gjennom dette trinnet (konstant gjennom kjøringen, f.eks. HEVC)."
+
+["video.bench.col.codec_total_desc"]
+en = "The total spans every stage, so no single codec applies to this row."
+nb = "Totalen dekker alle trinn, så ingen enkelt kodek gjelder for denne raden."
+
+["video.bench.col.latency"]
+en = "Added latency"
+nb = "Lagt til latens"
+
+["video.bench.col.latency_desc"]
+en = "Milliseconds this stage adds. The network/router wire row is shown as a value ± its uncertainty (it is RTT/2, not directly measured)."
+nb = "Millisekunder dette trinnet legger til. Ledningsraden for nettverk/ruter vises som en verdi ± usikkerheten (den er RTT/2, ikke målt direkte)."
+
+# --- Benchmark step rows -----------------------------------------------------
+["video.bench.step.compose"]
+en = "Compose"
+nb = "Sammensetting"
+
+["video.bench.step.compose_desc"]
+en = "Time on the host composing the desktop frame (the compositor's work) before it reaches the encoder."
+nb = "Tid på verten med å sette sammen skrivebordsbildet (kompositorens arbeid) før det når enkoderen."
+
+["video.bench.step.encode"]
+en = "Encode"
+nb = "Enkoding"
+
+["video.bench.step.encode_desc"]
+en = "Time spent inside the encoder turning the composed frame into an HEVC bitstream."
+nb = "Tid brukt inne i enkoderen med å gjøre det sammensatte bildet om til en HEVC-bitstrøm."
+
+["video.bench.step.host_send"]
+en = "Host send"
+nb = "Sending fra vert"
+
+["video.bench.step.host_send_desc"]
+en = "Time on the host from the encoded frame to its bytes entering the QUIC send queue."
+nb = "Tid på verten fra det enkodede bildet til bytene legges i QUIC-sendekøen."
+
+["video.bench.step.nexus"]
+en = "Network / router"
+nb = "Nettverk / ruter"
+
+["video.bench.step.nexus_desc"]
+en = "The true wire/router time — the unverified-in-the-middle leg. It is RTT/2 from the clock-sync probes (not derived from any host or client stage), so it carries a ± uncertainty rather than a direct measurement."
+nb = "Den faktiske tiden på ledningen/ruteren — det uverifiserte leddet i midten. Det er RTT/2 fra klokkesynk-sonderingene (ikke utledet fra noe trinn på vert eller klient), så det har en ± usikkerhet i stedet for en direkte måling."
+
+["video.bench.step.buffer"]
+en = "Buffer · in-flight"
+nb = "Buffer · under transport"
+
+["video.bench.step.buffer_desc"]
+en = "In-flight residency between arrival and display — usually the dominant number, and queueing rather than compute. It pools several buffers: the decoder's internal frame/surface pool (often the biggest on loopback), the QUIC flow-control window, and the send queue. Reduce it with decoder low-delay options plus PHAROS_STREAM_WINDOW_KB / PHAROS_QUEUE_FRAMES. The GPU decode kernel (~a few ms) is folded in here — ffmpeg's output is render-paced, so its tiny decode time can't be isolated from the buffer through an external decoder."
+nb = "Opphold mellom ankomst og visning — vanligvis det dominerende tallet, og kødanning snarere enn beregning. Det samler flere buffere: dekoderens interne bilde-/flatepool (ofte størst på loopback), QUIC-flytkontrollvinduet og sendekøen. Reduser det med dekoderens lavlatensvalg pluss PHAROS_STREAM_WINDOW_KB / PHAROS_QUEUE_FRAMES. GPU-dekodingen (~noen få ms) er slått sammen her — ffmpeg sin utgang taktes av visningen, så den lille dekodetiden kan ikke skilles fra bufferen via en ekstern dekoder."
+
+["video.bench.step.present"]
+en = "Present"
+nb = "Visning"
+
+["video.bench.step.present_desc"]
+en = "Time on the client from the decoded picture to it being shown on screen."
+nb = "Tid på klienten fra det dekodede bildet til det vises på skjermen."
+
+["video.bench.step.total"]
+en = "Total"
+nb = "Totalt"
+
+["video.bench.step.total_desc"]
+en = "End-to-end latency: capture on the host through to present on the client, including the inferred network leg."
+nb = "Ende-til-ende-latens: fra fangst på verten til visning på klienten, inkludert det utledede nettverksleddet."
+
+["video.bench.nexus_caption"]
+en = "Network / router is RTT/2 from the clock-sync probes — the true wire/router time, the unverified in-the-middle. Not measured directly, so treat it as approximate (± shown)."
+nb = "Nettverk / ruter er RTT/2 fra klokkesynk-sonderingene — den faktiske tiden på ledningen/ruteren, det uverifiserte leddet i midten. Ikke målt direkte, så behandle den som omtrentlig (± vist)."
+
+["video.bench.buffer_caption"]
+en = "Buffer · in-flight pools the decoder's internal frame/surface pool (often the biggest on loopback), the QUIC flow-control window and the send queue — queueing, not compute, and usually the dominant number. The GPU decode kernel (~a few ms) is folded in: it can't be isolated through an external pipe-fed decoder."
+nb = "Buffer · under transport samler dekoderens interne bilde-/flatepool (ofte størst på loopback), QUIC-flytkontrollvinduet og sendekøen — kødanning, ikke beregning, og vanligvis det dominerende tallet. GPU-dekodingen (~noen få ms) er slått sammen her: den kan ikke skilles via en ekstern pipe-matet dekoder."
+
+# --- Footer ------------------------------------------------------------------
+["video.footer_title"]
+en = "This tab is a path overview — deep tuning comes later (hover for details)."
+nb = "Denne fanen er en oversikt over banen — grundig finjustering kommer senere (hold pekeren over for detaljer)."
+
+["video.footer"]
+en = "Deep video tuning — bitrate, encoder preset, codec selection, the QUIC flow-control window — is a separate upcoming session. This tab is the path overview and what's available today. Encoders run on the host (left); decoders run on the client (right); validated routes are starred."
+nb = "Grundig finjustering av video — bitrate, enkoder-forhåndsinnstilling, kodekvalg, QUIC-flytkontrollvinduet — er en egen kommende økt. Denne fanen er oversikten over banen og hva som er tilgjengelig i dag. Enkodere kjører på verten (venstre); dekodere kjører på klienten (høyre); validerte ruter er stjernemerket."
+
+# --- Benchmark CSV export -------------------------------------------------
+["video.bench.copy_csv"]
+en = "Copy CSV"
+nb = "Kopier CSV"
+
+["video.bench.copy_csv_desc"]
+en = "Copy this benchmark as a one-row CSV (header + values) to the clipboard. Paste into a spreadsheet; successive runs stack as rows. Clipboard is used for cross-platform portability — no native file dialog."
+nb = "Kopier denne målingen som en CSV-rad (overskrift + verdier) til utklippstavlen. Lim inn i et regneark; flere kjøringer stables som rader. Utklippstavle brukes for plattformuavhengighet — ingen fildialog."
+
+["video.bench.copy_csv_hint"]
+en = "→ clipboard, paste into a spreadsheet"
+nb = "→ utklippstavle, lim inn i et regneark"
+
+["video.bench.copied"]
+en = "Benchmark CSV copied to clipboard"
+nb = "Måling-CSV kopiert til utklippstavlen"

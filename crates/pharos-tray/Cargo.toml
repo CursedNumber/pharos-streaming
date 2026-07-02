@@ -1,0 +1,33 @@
+[package]
+name = "pharos-tray"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# A small system-tray daemon for the Pharos host. Shows a three-state lighthouse
+# icon + a right-click menu (open the panel / stop the host). Cross-platform: the
+# state source, icon rasterization, and actions are shared; only the tray DISPLAY
+# backend is per-OS — freedesktop StatusNotifierItem (ksni/D-Bus) on Linux, the
+# Win32 notification area (tray-icon + a tao message pump) on Windows.
+[[bin]]
+name = "pharos-tray"
+path = "src/main.rs"
+
+# Shared core — state (the cross-platform control client), icon rasterization
+# (SVG → RGBA), and menu actions — builds on every OS.
+[dependencies]
+control-ipc = { path = "../control-ipc" }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Shared Pharos lighthouse art + SVG→RGBA rasterizer (one source for tray + compositor).
+pharos-assets = { path = "../pharos-assets" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# StatusNotifierItem (KDE Plasma tray protocol) — pure Rust, no GTK.
+ksni = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[target."cfg(windows)".dependencies]
+tao = "0.35.3"
+tray-icon = "0.24.1"

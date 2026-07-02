@@ -1,0 +1,47 @@
+# Vendored copy of nvidia-video-codec-sdk 0.4.0 (MIT, by Viliam Vadocz),
+# patched via [patch.crates-io] in the workspace root to add a single safe
+# `Session::reconfigure_bitrate` method (the published crate seals the encoder
+# handle and ships no reconfigure wrapper — see src/safe/session.rs). Manifest
+# trimmed to lib-only: dev-dependencies (vulkano/libc), examples and tests are
+# dropped since we only build the library. Original at Cargo.toml.orig.
+[package]
+edition = "2021"
+rust-version = "1.70"
+name = "nvidia-video-codec-sdk"
+version = "0.4.0"
+build = "build.rs"
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Bindings for NVIDIA Video Codec SDK (vendored + reconfigure patch)"
+license = "MIT"
+repository = "https://github.com/ViliamVadocz/nvidia-video-codec-sdk"
+
+[features]
+ci-check = [
+    "cudarc/cuda-12020",
+    "cudarc/dynamic-loading",
+]
+default = []
+
+[lib]
+name = "nvidia_video_codec_sdk"
+path = "src/lib.rs"
+
+# Validation spike for the live resolution-change patch (Session::
+# reconfigure_resolution): proves NvEncReconfigureEncoder with a dimension
+# change avoids the libnvcuvid re-init SIGSEGV on the real GPU. Run with
+# `cargo run -p nvidia-video-codec-sdk --example drc_spike`.
+[[example]]
+name = "drc_spike"
+path = "examples/drc_spike.rs"
+
+[dependencies.cudarc]
+version = "0.16.4"
+features = ["cuda-version-from-build-system"]
+
+[dependencies.lazy_static]
+version = "1.5.0"
+

@@ -1,0 +1,749 @@
+# rust-i18n locale file (v2) for the Compositor tab. English is the default +
+# fallback. Every key is namespaced `compositor.*` so it never clashes with
+# another tab's locale file. To add a language, add its code alongside `en`.
+_version = 2
+
+# --- Heading / intro -------------------------------------------------------
+["compositor.heading"]
+en = "Compositor"
+nb = "Compositor"
+
+["compositor.policy.title"]
+en = "Display policy (resolution + refresh)"
+nb = "Visningspolicy (oppløsning + oppdatering)"
+
+["compositor.badge.experimental"]
+en = "multi-CLIENT · experimental"
+nb = "multi-CLIENT · eksperimentell"
+
+# --- Mirror mode (one shared encode for all clients) -----------------------
+["compositor.mirror.label"]
+en = "Mirror to all clients"
+nb = "Speil til alle klienter"
+
+["compositor.mirror.desc"]
+en = "Share ONE encode across every connected client instead of streaming to one at a time. Saves GPU/encode work, but the stream is clamped to the weakest client's resolution, frame rate, and bitrate — so quality is throttled to the lowest common denominator. A single client keeps full per-client adaptation."
+nb = "Del ÉN koding mellom alle tilkoblede klienter i stedet for å strømme til én om gangen. Sparer GPU/koding, men strømmen begrenses til den svakeste klientens oppløsning, bildefrekvens og bitrate."
+
+["compositor.mirror.throttle_title"]
+en = "Mirror — quality limited"
+nb = "Speil — kvalitet begrenset"
+
+["compositor.mirror.armed"]
+en = "Mirror on — clamps to the weakest client once a second device connects"
+nb = "Speil på — begrenses til den svakeste klienten når en ny enhet kobler til"
+
+["compositor.mirror.encoding"]
+en = "Shared encode"
+nb = "Delt koding"
+
+["compositor.mirror.capped_by"]
+en = "capped by"
+nb = "begrenset av"
+
+["compositor.mirror.pending"]
+en = "Shared encode is live. Per-client quality adaptation (which client is the limit) isn't wired yet, and multi-client streaming is pending a 2-device test."
+nb = "Delt koding er aktiv. Tilpasning per klient er ikke koblet ennå, og flerklient-strømming venter på en to-enheters test."
+
+["compositor.intro"]
+en = "Lay out a composite virtual desktop across several Trireme clients. Drag a client from the palette onto the canvas to create a display."
+nb = "Legg ut et sammensatt virtuelt skrivebord over flere Trireme-klienter. Dra en klient fra paletten over på lerretet for å opprette en skjerm."
+
+# --- Toolbar ---------------------------------------------------------------
+["compositor.toolbar.arrange_hint"]
+en = "Drag a device from the palette onto the canvas, then drag tiles to arrange — they snap to each other's edges."
+nb = "Dra en enhet fra paletten ut på lerretet, og dra deretter brikkene for å ordne dem — de fester seg til hverandres kanter."
+
+["compositor.toolbar.arrange_hint_desc"]
+en = "How to build a layout: each paired device in the palette is a drag source; drop it on the canvas to add a display, then drag displays around — they snap flush to neighbouring edges like Windows display settings."
+nb = "Slik bygger du et oppsett: hver paret enhet i paletten er en drakilde; slipp den på lerretet for å legge til en skjerm, og dra deretter skjermene rundt — de fester seg kant-i-kant med naboene, som Windows skjerminnstillinger."
+
+["compositor.toolbar.fps"]
+en = "Shared FPS"
+nb = "Delt fps"
+
+["compositor.toolbar.fps_desc"]
+en = "One shared pacer drives every output — the compositor runs a single frame-rate across the whole virtual desktop. Raising this lifts every display at once."
+nb = "Én delt pacer driver alle utganger — Compositor kjører én felles bildefrekvens over hele det virtuelle skrivebordet. Å heve denne løfter alle skjermer på én gang."
+
+["compositor.toolbar.policy"]
+en = "Resolution policy:"
+nb = "Oppløsningspolicy:"
+
+["compositor.toolbar.policy_set_in_settings"]
+en = "(set in Settings)"
+nb = "(angitt i Innstillinger)"
+
+["compositor.toolbar.policy_desc_suffix"]
+en = "Change this on the Settings tab; new tiles size and snap to match."
+nb = "Endre dette i Innstillinger-fanen; nye fliser dimensjoneres og festes deretter."
+
+["compositor.toolbar.policy_badge_desc"]
+en = "The active resolution policy, chosen on the Settings tab. It governs how freshly-dropped displays are sized and how they snap together."
+nb = "Den aktive oppløsningspolicyen, valgt i Innstillinger-fanen. Den styrer hvordan nyslupne skjermer dimensjoneres og hvordan de festes sammen."
+
+["compositor.toolbar.maximize"]
+en = "Maximize canvas"
+nb = "Maksimer lerret"
+
+["compositor.toolbar.restore"]
+en = "Restore palette"
+nb = "Gjenopprett palett"
+
+["compositor.toolbar.maximize_desc"]
+en = "Give the canvas the full width by folding the palette into a compact top strip. Toggle again to restore the side-by-side palette."
+nb = "Gi lerretet full bredde ved å folde paletten inn i en kompakt topplinje. Veksle igjen for å gjenopprette paletten ved siden av."
+
+["compositor.toolbar.equalize"]
+en = "Equalize to smallest"
+nb = "Utjevn til minste"
+
+["compositor.toolbar.equalize_desc"]
+en = "Uniform (LCD wall) policy: clamp every display to the resolution of the smallest tile, so the wall is uniform."
+nb = "Uniform (LCD-vegg) policy: lås alle skjermer til oppløsningen til den minste flisen, slik at veggen blir enhetlig."
+
+# --- Palette ---------------------------------------------------------------
+["compositor.palette.heading"]
+en = "Palette"
+nb = "Palett"
+
+["compositor.palette.heading_desc"]
+en = "Your paired Trireme clients, plus a blank-output and a manual-address chip. Drag any entry onto the canvas to add a display for it."
+nb = "Dine parede Trireme-klienter, pluss en tom-utgang og en manuell-adresse-brikke. Dra en oppføring over på lerretet for å legge til en skjerm for den."
+
+["compositor.palette.drag_hint"]
+en = "Drag onto the canvas →"
+nb = "Dra over på lerretet →"
+
+["compositor.palette.drag_hint_strip"]
+en = "Drag onto canvas:"
+nb = "Dra over på lerretet:"
+
+["compositor.palette.blank"]
+en = "Blank 1080p"
+nb = "Tom 1080p"
+
+["compositor.palette.blank_sub"]
+en = "no peer"
+nb = "ingen peer"
+
+["compositor.palette.blank_desc"]
+en = "Drag to add an empty display (1920×1080, auto QUIC port) with no peer pinned to it."
+nb = "Dra for å legge til en tom skjerm (1920×1080, automatisk QUIC-port) uten en peer festet til den."
+
+["compositor.palette.no_peers"]
+en = "No paired clients yet.\nPair a Trireme to drag it here."
+nb = "Ingen parede klienter ennå.\nParkoble en Trireme for å dra den hit."
+
+["compositor.palette.peer_desc_suffix"]
+en = "Drag onto the canvas to assign a display to this client."
+nb = "Dra over på lerretet for å tildele en skjerm til denne klienten."
+
+["compositor.palette.manual_heading"]
+en = "Manual sink"
+nb = "Manuell sink"
+
+["compositor.palette.manual_name_hint"]
+en = "name (e.g. couch)"
+nb = "navn (f.eks. sofa)"
+
+["compositor.palette.manual_name_hint_short"]
+en = "name"
+nb = "navn"
+
+["compositor.palette.manual_name_desc"]
+en = "A short name for a sink you enter by hand — used as the display's output name in multi.toml."
+nb = "Et kort navn for en sink du skriver inn manuelt — brukt som skjermens utgangsnavn i multi.toml."
+
+["compositor.palette.manual_addr_hint"]
+en = "quic://host:15777"
+nb = "quic://host:15777"
+
+["compositor.palette.manual_addr_desc"]
+en = "The QUIC address the host should stream this hand-entered display to."
+nb = "QUIC-adressen verten skal strømme denne manuelt innskrevne skjermen til."
+
+["compositor.palette.manual_drag_disabled"]
+en = "drag manual"
+nb = "dra manuell"
+
+["compositor.palette.manual_drag_disabled_desc"]
+en = "Type an address first, then drag this chip onto the canvas to add the sink."
+nb = "Skriv inn en adresse først, dra deretter denne brikken over på lerretet for å legge til sinken."
+
+["compositor.palette.manual_drag_desc"]
+en = "Drag onto the canvas to add this manually-entered sink as a display."
+nb = "Dra over på lerretet for å legge til denne manuelt innskrevne sinken som en skjerm."
+
+# --- Canvas ----------------------------------------------------------------
+["compositor.canvas.empty"]
+en = "Drag a client here to add a display"
+nb = "Dra en klient hit for å legge til en skjerm"
+
+["compositor.canvas.desc"]
+en = "The composite virtual desktop, drawn to scale. Drag a client from the palette here to add a display; drag a tile to move it; click a tile to select it; Shift- or Ctrl/Cmd-click to multi-select; click empty space to clear the selection."
+nb = "Det sammensatte virtuelle skrivebordet, tegnet i målestokk. Dra en klient fra paletten hit for å legge til en skjerm; dra en flis for å flytte den; klikk på en flis for å velge den; Shift- eller Ctrl/Cmd-klikk for flervalg; klikk på tomt område for å tømme valget."
+
+["compositor.canvas.legend_desc"]
+en = "Scale legend: how many real device pixels each on-screen pixel represents at the current zoom."
+nb = "Målestokkforklaring: hvor mange faktiske enhets-piksler hver skjermpiksel representerer ved gjeldende zoom."
+
+["compositor.canvas.budget_suffix"]
+en = "of encode budget"
+nb = "av enkoderbudsjettet"
+
+["compositor.canvas.budget_mirror"]
+en = "1× shared"
+nb = "1× delt"
+
+# --- Presets (named layout snapshots: setup + positions + input) -----------
+["compositor.presets.heading"]
+en = "Presets"
+nb = "Forhåndsinnstillinger"
+
+["compositor.presets.heading_desc"]
+en = "Save and recall named layouts — display setup, tile positions, and each device's input on/off — in one click."
+nb = "Lagre og hent navngitte oppsett — skjermoppsett, brikkeposisjoner og inn/av for hver enhets inndata — med ett klikk."
+
+["compositor.presets.none"]
+en = "(no preset)"
+nb = "(ingen)"
+
+["compositor.presets.load"]
+en = "Load"
+nb = "Hent"
+
+["compositor.presets.delete"]
+en = "Delete"
+nb = "Slett"
+
+["compositor.presets.save"]
+en = "Save as"
+nb = "Lagre som"
+
+["compositor.presets.name_hint"]
+en = "Preset name"
+nb = "Navn"
+
+["compositor.canvas.budget_desc"]
+en = "Encode load: the layout's total pixels-per-second (Σ width·height·fps) against the configured budget ([encode] max_pixels_per_sec in config.toml — a placeholder 4K-at-60 until it's derived from the GPU). Green is comfortable, amber is near the ceiling, red is over it."
+nb = "Enkoderbelastning: oppsettets totale piksler-per-sekund (Σ bredde·høyde·fps) mot det konfigurerte budsjettet ([encode] max_pixels_per_sec i config.toml — en plassholder på 4K-i-60 inntil det utledes fra GPU-en). Grønt er komfortabelt, gult er nær taket, rødt er over."
+
+# --- Displays / tile editors ----------------------------------------------
+["compositor.displays.heading"]
+en = "Displays"
+nb = "Skjermer"
+
+["compositor.displays.heading_desc"]
+en = "Every display in the layout, with numeric controls for size, position and refresh. Edits here mirror the canvas; nothing is written until you press Apply / Save."
+nb = "Hver skjerm i oppsettet, med numeriske kontroller for størrelse, posisjon og oppdatering. Endringer her speiler lerretet; ingenting skrives før du trykker Bruk / Lagre."
+
+["compositor.displays.empty"]
+en = "No displays yet. Drag a client onto the canvas, or use “Blank 1080p”."
+nb = "Ingen skjermer ennå. Dra en klient over på lerretet, eller bruk «Tom 1080p»."
+
+["compositor.editor.select"]
+en = "Select this display — highlights it on the canvas and makes it the primary for canvas drag."
+nb = "Velg denne skjermen — uthever den på lerretet og gjør den til hovedvalg for draoperasjoner."
+
+["compositor.editor.name_hint"]
+en = "name"
+nb = "navn"
+
+["compositor.editor.name_desc"]
+en = "Output name — becomes the compositor's [[output]] name in multi.toml. Kept to a clean identifier token."
+nb = "Utgangsnavn — blir Compositor sitt [[output]]-navn i multi.toml. Holdes til en ren identifikator."
+
+["compositor.editor.name_device_desc"]
+en = "This output is pinned to a device, so its name follows the device's name automatically — rename the device to rename this output."
+nb = "Denne utgangen er festet til en enhet, så navnet følger enhetens navn automatisk — gi enheten nytt navn for å endre denne utgangen."
+
+["compositor.editor.resolution"]
+en = "Resolution"
+nb = "Oppløsning"
+
+["compositor.editor.resolution_device_desc"]
+en = "The device's last-reported resolution. It's device-reported (read-only) and governs this tile's size on the canvas — it updates when the device reconnects and negotiates a new mode."
+nb = "Enhetens sist rapporterte oppløsning. Den er enhetsrapportert (skrivebeskyttet) og styrer denne flisens størrelse på lerretet — den oppdateres når enheten kobler til igjen og forhandler en ny modus."
+
+["compositor.editor.peer_pinned"]
+en = "peer-pinned"
+nb = "peer-festet"
+
+["compositor.editor.peer_pinned_desc"]
+en = "This display is pinned to a specific paired Trireme client."
+nb = "Denne skjermen er festet til en bestemt paret Trireme-klient."
+
+["compositor.editor.remove"]
+en = "Remove this display from the layout."
+nb = "Fjern denne skjermen fra oppsettet."
+
+["compositor.editor.auto_port"]
+en = "auto-port"
+nb = "auto-port"
+
+["compositor.editor.auto_port_desc"]
+en = "Reset this display's address to the auto-assigned QUIC port for its position."
+nb = "Tilbakestill denne skjermens adresse til den automatisk tildelte QUIC-porten for posisjonen."
+
+["compositor.editor.addr_hint"]
+en = "quic://host:port"
+nb = "quic://host:port"
+
+["compositor.editor.addr_desc"]
+en = "The QUIC sink the host streams this display to. Each display needs a unique port."
+nb = "QUIC-sinken verten strømmer denne skjermen til. Hver skjerm trenger en unik port."
+
+["compositor.editor.label_w"]
+en = "W"
+nb = "B"
+
+["compositor.editor.label_h"]
+en = "H"
+nb = "H"
+
+["compositor.editor.label_x"]
+en = "X"
+nb = "X"
+
+["compositor.editor.label_y"]
+en = "Y"
+nb = "Y"
+
+["compositor.editor.width_desc"]
+en = "Display width in pixels."
+nb = "Skjermbredde i piksler."
+
+["compositor.editor.height_desc"]
+en = "Display height in pixels."
+nb = "Skjermhøyde i piksler."
+
+["compositor.editor.pos_x_desc"]
+en = "Horizontal position of this display's top-left corner in the virtual desktop, in pixels."
+nb = "Horisontal posisjon av skjermens øvre venstre hjørne i det virtuelle skrivebordet, i piksler."
+
+["compositor.editor.pos_y_desc"]
+en = "Vertical position of this display's top-left corner in the virtual desktop, in pixels."
+nb = "Vertikal posisjon av skjermens øvre venstre hjørne i det virtuelle skrivebordet, i piksler."
+
+["compositor.editor.refresh"]
+en = "Refresh"
+nb = "Oppdatering"
+
+["compositor.editor.refresh_desc"]
+en = "Display-only refresh hint. The compositor paces all outputs from the shared FPS, so this is informational."
+nb = "Visningshint for oppdatering. Compositor pacer alle utganger fra den delte fps-en, så dette er kun informativt."
+
+["compositor.editor.preset_desc_prefix"]
+en = "Set this display to"
+nb = "Sett denne skjermen til"
+
+["compositor.editor.tile_right"]
+en = "Tile right of this"
+nb = "Plasser til høyre for denne"
+
+["compositor.editor.tile_right_desc"]
+en = "Add a new display flush to the right edge of this one — a one-click side-by-side span."
+nb = "Legg til en ny skjerm kant i kant med høyre kant av denne — en side-ved-side-utvidelse med ett klikk."
+
+# --- Layout-mode presets (Mirror / Extend / Single) ------------------------
+["compositor.modes.heading"]
+en = "Layout mode"
+nb = "Oppsettsmodus"
+
+["compositor.modes.hint"]
+en = "One-click arrangements. Each rewrites every display below, then save with Apply to take effect on the host's next start."
+nb = "Oppsett med ett klikk. Hvert valg skriver om alle skjermene nedenfor; lagre med Bruk for at det skal tre i kraft ved vertens neste oppstart."
+
+["compositor.modes.mirror"]
+en = "Mirror"
+nb = "Speil"
+
+["compositor.modes.mirror_desc"]
+en = "Mirror / duplicate: put every display at the same size and position (top-left), so they all stream the same desktop. The shared size is the largest existing display, or 1920×1080 if they're mixed or empty."
+nb = "Speil / dupliser: sett hver skjerm til samme størrelse og posisjon (øverst til venstre), slik at de alle strømmer det samme skrivebordet. Den felles størrelsen er den største eksisterende skjermen, eller 1920×1080 hvis de er blandede eller tomme."
+
+["compositor.modes.extend"]
+en = "Extend"
+nb = "Utvid"
+
+["compositor.modes.extend_desc"]
+en = "Extend: lay the displays out left-to-right, each flush against the previous one's right edge and top-aligned, forming one wide virtual desktop with distinct regions. Each display keeps its own size."
+nb = "Utvid: legg skjermene fra venstre til høyre, hver kant i kant med den forrige sin høyrekant og toppjustert, slik at de danner ett bredt virtuelt skrivebord med atskilte områder. Hver skjerm beholder sin egen størrelse."
+
+["compositor.modes.single"]
+en = "Single"
+nb = "Enkel"
+
+["compositor.modes.single_desc"]
+en = "Single: keep just one display — the selected one if any, otherwise the first — at the origin and drop the rest. If the layout is empty, add a fresh 1920×1080 display."
+nb = "Enkel: behold bare én skjerm — den valgte hvis noen, ellers den første — i origo og fjern resten. Hvis oppsettet er tomt, legg til en ny 1920×1080-skjerm."
+
+["compositor.modes.note"]
+en = "Modes are file-driven: the host applies a saved layout on its next (re)start."
+nb = "Modusene er fildrevne: verten tar i bruk et lagret oppsett ved sin neste (om)start."
+
+["compositor.modes.note_desc"]
+en = "By the lean-CLI design there is no live \"switch mode now\" command — a mode rewrites the layout, you Apply to save it to multi.toml, and the compositor picks it up the next time it starts."
+nb = "Etter det enkle CLI-designet finnes det ingen «bytt modus nå»-kommando i sanntid — en modus skriver om oppsettet, du trykker Bruk for å lagre det til multi.toml, og kompositoren tar det i bruk neste gang den starter."
+
+# --- Media Player ---------------------------------------------------------
+["compositor.media.heading"]
+en = "Media Player"
+nb = "Mediespiller"
+
+["compositor.media.heading_desc"]
+en = "Play a video file into the running compositor; it composes onto the displays and streams to every connected Trireme over the existing QUIC sink. Live only — this needs the host's control socket, so a compositor must be running."
+nb = "Spill av en videofil inn i den kjørende kompositoren; den settes sammen på skjermene og strømmes til hver tilkoblet Trireme over den eksisterende QUIC-sluken. Kun sanntid — dette krever vertens kontrollsocket, så en kompositor må kjøre."
+
+["compositor.media.path_hint"]
+en = "/path/to/clip.mkv"
+nb = "/sti/til/klipp.mkv"
+
+["compositor.media.path_desc"]
+en = "Absolute path on the host to the media file to play. Type the path — there is no file picker (the host may be a different machine than this panel)."
+nb = "Absolutt sti på verten til mediefilen som skal spilles av. Skriv inn stien — det finnes ingen filvelger (verten kan være en annen maskin enn dette panelet)."
+
+["compositor.media.play"]
+en = "Play"
+nb = "Spill av"
+
+["compositor.media.play_desc"]
+en = "Tell the running compositor to play this file fullscreen on the host output. It streams to every connected Trireme over the live QUIC sink. Disabled until a path is set and a host is connected."
+nb = "Be den kjørende kompositoren spille av denne filen i fullskjerm på vertsutgangen. Den strømmes til hver tilkoblet Trireme over den aktive QUIC-sluken. Deaktivert til en sti er satt og en vert er tilkoblet."
+
+["compositor.media.play_need_path"]
+en = "Enter the path to a media file on the host first."
+nb = "Skriv inn stien til en mediefil på verten først."
+
+["compositor.media.stop"]
+en = "Stop"
+nb = "Stopp"
+
+["compositor.media.stop_desc"]
+en = "Stop whatever media the compositor is currently playing. Disabled when no host is connected."
+nb = "Stopp uansett hvilke medier kompositoren spiller av nå. Deaktivert når ingen vert er tilkoblet."
+
+["compositor.media.status_play_prefix"]
+en = "Playing:"
+nb = "Spiller av:"
+
+["compositor.media.status_stop"]
+en = "Stopped media playback."
+nb = "Stoppet medieavspilling."
+
+["compositor.media.ack_ok"]
+en = "Done."
+nb = "Ferdig."
+
+["compositor.media.ack_fail_prefix"]
+en = "Media command failed:"
+nb = "Mediekommandoen mislyktes:"
+
+# --- Apply / Clear row -----------------------------------------------------
+["compositor.apply.save"]
+en = "Apply / Save layout"
+nb = "Bruk / Lagre oppsett"
+
+["compositor.apply.save_desc_prefix"]
+en = "Write the compositor's multi.toml at"
+nb = "Skriv Compositor sin multi.toml på"
+
+["compositor.apply.save_disabled_desc"]
+en = "Add at least one display first."
+nb = "Legg til minst én skjerm først."
+
+["compositor.apply.discard_hint"]
+en = "Layout changes save with the panel's global Save."
+nb = "Endringer i oppsettet lagres med panelets globale Lagre."
+
+["compositor.apply.discard_hint_desc"]
+en = "The layout is written to multi.toml by the panel's global Save when it's dirty. The buttons here only discard: Clear removes every display, Reload re-reads the saved file from disk."
+nb = "Oppsettet skrives til multi.toml av panelets globale Lagre når det er endret. Knappene her forkaster kun: Tøm fjerner alle skjermer, Last inn på nytt leser den lagrede filen fra disk igjen."
+
+["compositor.apply.clear"]
+en = "Clear"
+nb = "Tøm"
+
+["compositor.apply.clear_desc"]
+en = "Remove every display. This does not write to disk until you press Apply / Save."
+nb = "Fjern alle skjermer. Dette skrives ikke til disk før du trykker Bruk / Lagre."
+
+["compositor.apply.reload"]
+en = "Reload"
+nb = "Last inn på nytt"
+
+["compositor.apply.reload_desc"]
+en = "Re-read multi.toml from disk, discarding any unsaved edits."
+nb = "Les multi.toml på nytt fra disk, og forkast eventuelle ulagrede endringer."
+
+["compositor.apply.summary_display_singular"]
+en = "display"
+nb = "skjerm"
+
+["compositor.apply.summary_display_plural"]
+en = "displays"
+nb = "skjermer"
+
+["compositor.apply.summary_mp"]
+en = "MP total"
+nb = "MP totalt"
+
+["compositor.apply.summary_fps"]
+en = "fps"
+nb = "fps"
+
+["compositor.apply.summary_desc"]
+en = "Summary of the current layout: number of displays, total megapixels, and the shared frame rate."
+nb = "Sammendrag av gjeldende oppsett: antall skjermer, totalt antall megapiksler, og den delte bildefrekvensen."
+
+# --- Validation warnings ---------------------------------------------------
+["compositor.warn.dup_addr"]
+en = "Two displays share the same sink address — each needs a unique port."
+nb = "To skjermer deler samme sink-adresse — hver trenger en unik port."
+
+["compositor.warn.empty_name"]
+en = "A display has an empty name."
+nb = "En skjerm har et tomt navn."
+
+["compositor.warn.overlap"]
+en = "Some displays overlap in the virtual desktop (may be intentional)."
+nb = "Noen skjermer overlapper i det virtuelle skrivebordet (kan være tilsiktet)."
+
+["compositor.warn.over_budget"]
+en = "Over the encode pixel-rate budget — the host may not sustain this layout"
+nb = "Over enkoderens pikselrate-budsjett — verten klarer kanskje ikke å opprettholde dette oppsettet"
+
+# --- Status messages -------------------------------------------------------
+["compositor.status.equalized_prefix"]
+en = "Equalized all displays to"
+nb = "Utjevnet alle skjermer til"
+
+["compositor.status.equalized_suffix"]
+en = "(Uniform LCD)."
+nb = "(Uniform LCD)."
+
+["compositor.status.added_for_prefix"]
+en = "Added display for"
+nb = "La til skjerm for"
+
+["compositor.status.added_manual_prefix"]
+en = "Added manual display"
+nb = "La til manuell skjerm"
+
+["compositor.status.added_blank"]
+en = "Added a blank display."
+nb = "La til en tom skjerm."
+
+["compositor.status.tile_right"]
+en = "Added a display to the right (side-by-side span)."
+nb = "La til en skjerm til høyre (side-ved-side-utvidelse)."
+
+["compositor.status.mirror_prefix"]
+en = "Mirrored all displays at"
+nb = "Speilet alle skjermer i"
+
+["compositor.status.extend_prefix"]
+en = "Extended"
+nb = "Utvidet"
+
+["compositor.status.extend_suffix"]
+en = "displays left-to-right."
+nb = "skjermer fra venstre til høyre."
+
+["compositor.status.single"]
+en = "Single-display layout (kept one)."
+nb = "Enkeltskjerm-oppsett (beholdt én)."
+
+["compositor.status.cleared"]
+en = "Cleared the layout (not yet saved)."
+nb = "Tømte oppsettet (ennå ikke lagret)."
+
+["compositor.status.reloaded"]
+en = "Reloaded layout from disk."
+nb = "Lastet oppsett på nytt fra disk."
+
+["compositor.status.saved_prefix"]
+en = "Saved"
+nb = "Lagret"
+
+["compositor.status.saved_suffix"]
+en = "display(s) to multi.toml."
+nb = "skjerm(er) til multi.toml."
+
+["compositor.status.save_error_prefix"]
+en = "Could not save layout:"
+nb = "Kunne ikke lagre oppsett:"
+
+# --- Footnote --------------------------------------------------------------
+["compositor.footnote.heading"]
+en = "About this layout"
+nb = "Om dette oppsettet"
+
+["compositor.footnote.what"]
+en = "“Apply / Save layout” writes the compositor's multi.toml (one [[output]] block per display, plus the shared fps). The Pharos host reads this file to drive multiple Trireme clients as one composite virtual desktop."
+nb = "«Bruk / Lagre oppsett» skriver Compositor sin multi.toml (én [[output]]-blokk per skjerm, pluss den delte fps-en). Pharos-verten leser denne filen for å drive flere Trireme-klienter som ett sammensatt virtuelt skrivebord."
+
+["compositor.footnote.status"]
+en = "Status: multi-HOST (several monitors on one Pharos box) is validated. multi-CLIENT (this — fanning one desktop across several Triremes) is new and experimental; expect rough edges."
+nb = "Status: multi-HOST (flere skjermer på én Pharos-maskin) er validert. multi-CLIENT (dette — å spre ett skrivebord over flere Triremer) er nytt og eksperimentelt; forvent ujevnheter."
+
+["compositor.footnote.tip"]
+en = "Tip: drag clients from the palette to add displays, drag tiles to reposition them, Shift/Ctrl-click to multi-select, and use the Arrange tools for one-click align, distribute, snap and duplicate. The resolution policy (Settings) controls how new tiles size and snap."
+nb = "Tips: dra klienter fra paletten for å legge til skjermer, dra fliser for å flytte dem, Shift/Ctrl-klikk for flervalg, og bruk Ordne-verktøyene for justering, fordeling, festing og duplisering med ett klikk. Oppløsningspolicyen (Innstillinger) styrer hvordan nye fliser dimensjoneres og festes."
+
+# --- Play media: file browser + subtitle selector -------------------------
+["compositor.media.browse"]
+en = "Browse…"
+nb = "Bla gjennom …"
+
+["compositor.media.browse_desc"]
+en = "Open a native file browser to choose a video to play. The path can also be typed or pasted into the field."
+nb = "Åpne en filvelger for å velge en video å spille av. Stien kan også skrives eller limes inn i feltet."
+
+["compositor.media.subs_label"]
+en = "Subtitles:"
+nb = "Undertekster:"
+
+["compositor.media.subs_auto"]
+en = "Auto"
+nb = "Auto"
+
+["compositor.media.subs_auto_desc"]
+en = "Use embedded subtitle tracks and same-folder sidecar files (movie.srt, movie.en.srt, …), auto-selected by the player. The default."
+nb = "Bruk innebygde underteksts­spor og sidefiler i samme mappe (movie.srt, movie.en.srt, …), valgt automatisk av spilleren. Standard."
+
+["compositor.media.subs_off"]
+en = "Off"
+nb = "Av"
+
+["compositor.media.subs_off_desc"]
+en = "Disable subtitles entirely."
+nb = "Slå av undertekster helt."
+
+["compositor.media.subs_choose"]
+en = "Choose file…"
+nb = "Velg fil …"
+
+["compositor.media.subs_choose_desc"]
+en = "Pick an explicit external subtitle file (for when it isn't a recognised same-folder sidecar). Opens in the video's folder."
+nb = "Velg en ekstern undertekstfil (for når den ikke er en gjenkjent sidefil i samme mappe). Åpnes i videoens mappe."
+
+# --- Play media: embedded track pickers -----------------------------------
+["compositor.media.subs_track"]
+en = "Track"
+nb = "Spor"
+
+["compositor.media.audio_label"]
+en = "Audio:"
+nb = "Lyd:"
+
+["compositor.media.audio_track"]
+en = "Track"
+nb = "Spor"
+
+# --- Live preview ---------------------------------------------------------
+["compositor.preview.heading"]
+en = "Live preview"
+nb = "Forhåndsvisning"
+
+["compositor.preview.heading_desc"]
+en = "A small, low-rate preview of the actual streamed output. The host writes a downscaled JPEG ~2fps only while this is on, and auto-stops after 20 seconds to keep the readback overhead off the stream."
+nb = "En liten forhåndsvisning av den faktiske strømmen. Verten skriver en nedskalert JPEG ~2 ganger/sek kun mens dette er på, og stopper automatisk etter 20 sekunder for å holde overhead borte fra strømmen."
+
+["compositor.preview.start"]
+en = "Show preview (20s)"
+nb = "Vis forhåndsvisning (20s)"
+
+["compositor.preview.start_desc"]
+en = "Show a live preview for 20 seconds — it stops on its own, or click Stop. Off the rest of the time, so there is zero readback overhead. Click again after it stops to show it again."
+nb = "Vis en forhåndsvisning i 20 sekunder — den stopper av seg selv, eller klikk Stopp. Av ellers, så det er null overhead. Klikk igjen etter at den stopper for å vise på nytt."
+
+["compositor.preview.stop"]
+en = "Stop preview"
+nb = "Stopp forhåndsvisning"
+
+["compositor.preview.left"]
+en = "· stops in"
+nb = "· stopper om"
+
+["compositor.preview.hint"]
+en = "Off — no overhead. Needs a connected, streaming host."
+nb = "Av — ingen overhead. Krever en tilkoblet, strømmende vert."
+
+["compositor.preview.waiting"]
+en = "Waiting for the first frame…"
+nb = "Venter på første bilde …"
+
+# --- Performance (per-stage frame timing) ----------------------------------
+["compositor.perf.title"]
+en = "Performance (live frame timings)"
+nb = "Ytelse (sanntids bildemålinger)"
+
+["compositor.perf.subtitle"]
+en = "Per-stage µs over the active host's render loop. Sampling turns on while this panel is open."
+nb = "Per-stadium µs over den aktive vertens render-løkke. Måling slås på mens denne fanen er åpen."
+
+["compositor.perf.no_link"]
+en = "no host"
+nb = "ingen vert"
+
+["compositor.perf.warming"]
+en = "warming up…"
+nb = "varmer opp …"
+
+["compositor.perf.frames"]
+en = "frames"
+nb = "bilder"
+
+["compositor.perf.col.stage"]
+en = "Stage"
+nb = "Stadium"
+
+["compositor.perf.col.mean"]
+en = "Mean"
+nb = "Snitt"
+
+["compositor.perf.col.p95"]
+en = "p95"
+nb = "p95"
+
+["compositor.perf.col.max"]
+en = "Max"
+nb = "Maks"
+
+["compositor.perf.col.trend"]
+en = "Trend"
+nb = "Trend"
+
+["compositor.perf.stage.dispatch"]
+en = "dispatch"
+nb = "dispatch"
+
+["compositor.perf.stage.ctrl"]
+en = "ctrl"
+nb = "ctrl"
+
+["compositor.perf.stage.input"]
+en = "input"
+nb = "input"
+
+["compositor.perf.stage.gyro"]
+en = "gyro"
+nb = "gyro"
+
+["compositor.perf.stage.render"]
+en = "render"
+nb = "render"
+
+["compositor.perf.stage.post"]
+en = "post"
+nb = "post"
+
+["compositor.perf.stage.pace"]
+en = "pace"
+nb = "pace"
+
+["compositor.perf.stage.status"]
+en = "status"
+nb = "status"

@@ -1,0 +1,58 @@
+# Pharos (host) / Trireme (client) — clean-slate KVM-over-IP + game streaming.
+# See BATTLE_PLAN.md for the architecture this layout mirrors (§3).
+[workspace]
+resolver = "2"
+members = [
+    "crates/pal",
+    "crates/app-launcher",
+    "crates/core-proto",
+    "crates/control-ipc",
+    "crates/host-info",
+    "crates/core-crypto",
+    "crates/core-session",
+    "crates/core-usbip",
+    "crates/core-ffi",
+    "crates/host-core",
+    "crates/media-capture",
+    "crates/media-encode",
+    "crates/media-audio",
+    "crates/media-decode",
+    "crates/media-spice",
+    "crates/gamepad-bridge",
+    "crates/integration-mqtt",
+    "crates/pharos-assets",
+    "crates/pharos-panel",
+    "crates/pharos-tray",
+    "crates/input-inject",
+    "crates/usbip-host",
+    "crates/compositor",
+    "crates/pharos-win",
+    "crates/transport",
+    "crates/trireme",
+    "crates/trireme-kms",
+    "crates/usbip-export",
+    "crates/hostd",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# GPLv3 — matches the Sunshine/Moonlight lineage this project descends from.
+license = "GPL-3.0-only"
+authors = ["Pharos/Trireme contributors"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+thiserror = "2"
+uniffi = "0.28"
+core-proto = { path = "crates/core-proto" }
+
+# Local override of the (MIT) NVENC bindings crate. Upstream 0.4.0 (the latest
+# published version) seals the encoder handle and ships no `reconfigure` wrapper,
+# so live bitrate adaptation is impossible against it. The vendored copy adds ONE
+# safe method — `Session::reconfigure_bitrate` (NvEncReconfigureEncoder; in-place
+# RC change, NOT a session re-init, so it dodges the driver SIGSEGV). Reversible:
+# drop this stanza + the vendor/ dir if upstream ever exposes reconfigure.
+[patch.crates-io]
+nvidia-video-codec-sdk = { path = "vendor/nvidia-video-codec-sdk" }

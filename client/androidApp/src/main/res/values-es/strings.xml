@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- i18n scaffold: machine-stub, needs review -->
+<!-- English-first: this locale is illustrative, NOT a complete translation. It
+     translates ~5 core keys to prove the pipeline (Android falls back to the
+     default values/ for anything missing here). app_name is intentionally NOT
+     overridden — the brand "Trireme" stays the same in every locale. -->
+<resources>
+
+    <string name="logo_desc">Trireme</string>
+
+    <string name="action_cancel">Cancelar</string>
+    <string name="action_save">Guardar</string>
+    <string name="action_connect">Conectar</string>
+    <string name="action_back">Atrás</string>
+
+    <string name="exit_press_again">Pulsa atrás otra vez para salir</string>
+
+    <plurals name="hosts_connected_count">
+        <item quantity="one">%1$d host conectado</item>
+        <item quantity="other">%1$d hosts conectados</item>
+    </plurals>
+
+    <string name="nav_controllers">Mandos</string>
+    <string name="nav_controllers_desc">Mandos detectados, calibración de giroscopio y ajustes por mando</string>
+
+</resources>

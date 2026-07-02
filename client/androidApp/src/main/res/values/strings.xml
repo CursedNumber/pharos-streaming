@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Canonical (English) default-locale strings. Seeded by the Asset agent.
+     UI modules add their OWN namespaced files (strings_nav.xml, strings_hosts.xml,
+     strings_apps.xml, strings_settings.xml) to avoid merge conflicts; Android
+     merges them all into R.string. Keys are snake_case + namespaced. -->
+<resources>
+
+    <!-- App identity -->
+    <string name="app_name">Trireme</string>
+
+    <!-- Branding / a11y: the trireme logo + launcher art. Describe once where it
+         conveys identity; mark decorative (null) where it merely repeats. -->
+    <string name="logo_desc">Trireme</string>
+
+    <!-- Shared action labels (reused across panes and dialogs) -->
+    <string name="action_cancel">Cancel</string>
+    <string name="action_save">Save</string>
+    <string name="action_connect">Connect</string>
+    <string name="action_disconnect">Disconnect</string>
+    <string name="action_back">Back</string>
+    <string name="action_add">Add</string>
+    <string name="action_edit">Edit</string>
+    <string name="action_delete">Delete</string>
+    <string name="action_pair">Pair</string>
+    <string name="action_ok">OK</string>
+    <string name="action_close">Close</string>
+
+    <!-- "Connect" / multi-select action with an interpolated count, e.g.
+         the host picker confirming how many sessions a tap will open. -->
+    <string name="action_connect_count">Connect (%1$d)</string>
+
+    <!-- Double-Back-to-exit toast shown when the navbar is open. -->
+    <string name="exit_press_again">Press back again to exit</string>
+
+    <!-- Plural demonstrating the i18n pipeline: a count of currently-connected
+         hosts, e.g. for a status line above the pooled Apps grid. UI modules may
+         use this directly or define their own namespaced plurals alongside. -->
+    <plurals name="hosts_connected_count">
+        <item quantity="one">%1$d host connected</item>
+        <item quantity="other">%1$d hosts connected</item>
+    </plurals>
+
+</resources>

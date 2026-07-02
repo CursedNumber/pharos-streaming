@@ -1,0 +1,33 @@
+[package]
+name = "host-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Platform-agnostic host-side glue shared by every Pharos host backend (the
+# Linux Smithay `compositor` and the Windows `pharos-win` host). Holds the
+# pairing listener + identity/config-dir helpers — pure transport + core-crypto,
+# no Smithay/DRM/Win32. This is the seam that lets the hosts be co-equal
+# (BATTLE_PLAN.md §3) without duplicating the PAKE wiring.
+
+[dependencies]
+anyhow = "1"
+tracing = "0.1"
+serde = { workspace = true }
+transport = { path = "../transport" }
+core-crypto = { path = "../core-crypto" }
+core-proto = { path = "../core-proto" }
+# Peer/identity persistence + config dir.
+toml = "0.8"
+dirs = "5"
+hex = "0.4"
+# PIN generation.
+rand = "0.8"
+# mDNS service advertisement (zeroconf) for LAN auto-discovery.
+mdns-sd = "0.20"
+# Async runtime for the pairing listener.
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+
+# gethostname(3) for the mDNS host label — Unix only; Windows falls back to env.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

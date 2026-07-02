@@ -1,0 +1,535 @@
+# rust-i18n locale file (v2) — Controllers tab.
+# This file is owned exclusively by the Controllers tab; keys are namespaced
+# "controllers.*" so they never collide with other tabs. English is the default
+# and the fallback. To add a language, add its code (e.g. `"fr"`) alongside `en`
+# under each key.
+_version = 2
+
+# --- page header ------------------------------------------------------------
+["controllers.heading"]
+en = "Game Controllers"
+nb = "Spillkontrollere"
+
+["controllers.intro_desc"]
+en = "Per-controller feel the host applies the moment a pad connects — face-button swaps and gyro→mouse tuning, keyed by USB VID:PID. These are the persisted host profiles; live edits during a stream relay the same values over the input channel."
+nb = "Følelse per kontroller som verten bruker i det øyeblikket en kontroller kobles til — bytte av ansiktsknapper og gyro→mus-justering, nøklet på USB VID:PID. Dette er de lagrede vertprofilene; redigeringer i sanntid under en strøm videresender de samme verdiene over inndatakanalen."
+
+# --- toolbar ----------------------------------------------------------------
+["controllers.toolbar.add"]
+en = "Add controller"
+nb = "Legg til kontroller"
+
+["controllers.toolbar.add_desc"]
+en = "Register a controller by USB VID:PID without it being plugged in, so its profile is ready the moment the pad first connects."
+nb = "Registrer en kontroller med USB VID:PID uten at den er koblet til, slik at profilen er klar i det øyeblikket kontrolleren kobles til første gang."
+
+["controllers.toolbar.save"]
+en = "Save profiles"
+nb = "Lagre profiler"
+
+["controllers.toolbar.save_desc"]
+en = "Write controller-profiles.toml, the file the host reads. Saved profiles are applied automatically whenever a matching pad connects."
+nb = "Skriv controller-profiles.toml, filen verten leser. Lagrede profiler brukes automatisk når en kontroller som passer kobles til."
+
+["controllers.toolbar.unsaved"]
+en = "● unsaved"
+nb = "● ikke lagret"
+
+["controllers.toolbar.saved_status"]
+en = "Saved controller profiles."
+nb = "Lagret kontrollerprofiler."
+
+["controllers.toolbar.save_error"]
+en = "save controller profiles:"
+nb = "lagre kontrollerprofiler:"
+
+# --- sections ---------------------------------------------------------------
+["controllers.section.configured"]
+en = "Configured controllers"
+nb = "Konfigurerte kontrollere"
+
+["controllers.section.configured_desc"]
+en = "The controllers the host has a saved profile for, keyed by USB VID:PID. Each card edits that pad's face-button swaps and gyro tuning; changes apply the next time the pad connects."
+nb = "Kontrollerne verten har en lagret profil for, nøklet på USB VID:PID. Hvert kort redigerer den kontrollerens bytte av ansiktsknapper og gyro-justering; endringer trer i kraft neste gang kontrolleren kobles til."
+
+["controllers.section.presets"]
+en = "Presets"
+nb = "Forhåndsinnstillinger"
+
+["controllers.section.presets_intro"]
+en = "Named, reusable feels you can apply to any controller (mirrors the TV \"Manage\" flow). Apply copies a preset onto a controller's profile; you still need to Save to persist."
+nb = "Navngitte, gjenbrukbare følelser du kan bruke på hvilken som helst kontroller (gjenspeiler TV-ens \"Administrer\"-flyt). Bruk kopierer en forhåndsinnstilling til en kontrollers profil; du må fortsatt lagre for å beholde den."
+
+["controllers.section.usbip"]
+en = "USB/IP forwarding classes"
+nb = "USB/IP-videresendingsklasser"
+
+# --- empty state ------------------------------------------------------------
+["controllers.empty.title"]
+en = "No controller profiles yet"
+nb = "Ingen kontrollerprofiler ennå"
+
+["controllers.empty.body"]
+en = "The host saves a profile the first time a pad connects, or you can add one by hand with “Add controller”."
+nb = "Verten lagrer en profil første gang en kontroller kobles til, eller du kan legge til en manuelt med «Legg til kontroller»."
+
+["controllers.empty.desc"]
+en = "There are no saved controller profiles. A profile is created automatically the first time a pad connects to the host, or you can pre-register one with Add controller."
+nb = "Det finnes ingen lagrede kontrollerprofiler. En profil opprettes automatisk første gang en kontroller kobles til verten, eller du kan forhåndsregistrere en med Legg til kontroller."
+
+# --- controller card --------------------------------------------------------
+["controllers.card.kind_desc"]
+en = "The controller family detected from its VID:PID. Determines the capability hints and the default feel."
+nb = "Kontrollerfamilien som er gjenkjent fra VID:PID. Bestemmer hint om egenskaper og standardfølelsen."
+
+["controllers.card.remove_desc"]
+en = "Remove this controller profile. The pad keeps working with default feel; remember to Save to persist the removal."
+nb = "Fjern denne kontrollerprofilen. Kontrolleren fortsetter å fungere med standardfølelse; husk å lagre for å beholde fjerningen."
+
+["controllers.card.removed_status"]
+en = "Removed profile"
+nb = "Fjernet profil"
+
+# --- capability badges ------------------------------------------------------
+["controllers.caps.gyro"]
+en = "gyro"
+nb = "gyro"
+
+["controllers.caps.touchpad"]
+en = "touchpad"
+nb = "styreflate"
+
+["controllers.caps.paddles"]
+en = "paddles"
+nb = "padler"
+
+["controllers.caps.rumble"]
+en = "rumble"
+nb = "vibrasjon"
+
+# --- face-button swaps ------------------------------------------------------
+["controllers.swap.ab"]
+en = "Swap A ↔ B"
+nb = "Bytt A ↔ B"
+
+["controllers.swap.ab_desc"]
+en = "Inject B when A is pressed and vice versa — maps a Nintendo-physical layout onto Xbox button prompts."
+nb = "Send B når A trykkes og omvendt — kobler et fysisk Nintendo-oppsett til Xbox-knappeanvisninger."
+
+["controllers.swap.xy"]
+en = "Swap X ↔ Y"
+nb = "Bytt X ↔ Y"
+
+["controllers.swap.xy_desc"]
+en = "Inject Y when X is pressed and vice versa — the second half of the Nintendo↔Xbox face-button remap."
+nb = "Send Y når X trykkes og omvendt — den andre halvdelen av Nintendo↔Xbox-omkoblingen av ansiktsknapper."
+
+# Cross-link to the host-wide A/B swap fallback (lives in Settings → Gamepad).
+["controllers.global_fallback_link"]
+en = "Host-wide A/B swap fallback → Settings › Gamepad"
+nb = "Vertsomfattende A/B-byttereserve → Innstillinger › Spillkontroller"
+
+["controllers.global_fallback_desc"]
+en = "A single host-wide A/B-swap fallback applies to any pad that has no per-controller override here. It lives in Settings → Gamepad (collapsed by default); click to open that tab. Per-controller swaps above always win over it."
+nb = "En enkelt vertsomfattende A/B-byttereserve gjelder for enhver kontroller som ikke har en egen overstyring her. Den ligger i Innstillinger → Spillkontroller (sammenslått som standard); klikk for å åpne den fanen. Bytter per kontroller ovenfor vinner alltid over den."
+
+# --- gyro editor ------------------------------------------------------------
+["controllers.gyro.heading"]
+en = "Gyro → mouse"
+nb = "Gyro → mus"
+
+["controllers.gyro.enabled"]
+en = "enabled"
+nb = "aktivert"
+
+["controllers.gyro.enabled_desc"]
+en = "Master switch for gyro aiming on this controller. When off, the pad's motion sensor is ignored and the knobs below have no effect."
+nb = "Hovedbryter for gyro-sikting på denne kontrolleren. Når den er av, ignoreres kontrollerens bevegelsessensor og innstillingene under har ingen effekt."
+
+["controllers.gyro.reset"]
+en = "Reset to defaults"
+nb = "Tilbakestill til standard"
+
+["controllers.gyro.reset_desc"]
+en = "Restore the shipped gyro feel for this controller (sensitivity, acceleration, axis mapping, and inversion all return to the factory values)."
+nb = "Gjenopprett den medfølgende gyrofølelsen for denne kontrolleren (følsomhet, akselerasjon, aksekobling og invertering går alle tilbake til fabrikkverdiene)."
+
+["controllers.gyro.no_sensor_hint"]
+en = "This controller family has no gyro hint — tuning still saves, but gyro→mouse only works if the pad actually exposes a sensor."
+nb = "Denne kontrollerfamilien har ikke noe gyro-hint — justeringen lagres likevel, men gyro→mus virker bare hvis kontrolleren faktisk har en sensor."
+
+["controllers.gyro.no_sensor_desc"]
+en = "The host has no record that this controller family carries a motion sensor. The tuning is still saved and relayed, but it only does anything if the physical pad really exposes gyro data."
+nb = "Verten har ingen registrering av at denne kontrollerfamilien har en bevegelsessensor. Justeringen lagres og videresendes likevel, men den gjør bare noe hvis den fysiske kontrolleren faktisk eksponerer gyro-data."
+
+["controllers.gyro.curve_desc"]
+en = "Acceleration curve preview: vertical is the output gain applied to your base sensitivity (1× at the bottom), horizontal is how fast you rotate the pad in degrees per second. The vertical line marks the accel knee (accel_ref); the horizontal line marks the clamp ceiling (1 + accel max). It mirrors exactly what the host applies."
+nb = "Forhåndsvisning av akselerasjonskurven: loddrett er utgangsforsterkningen som brukes på grunnfølsomheten din (1× nederst), vannrett er hvor raskt du roterer kontrolleren i grader per sekund. Den loddrette linjen markerer akselerasjonsknekket (accel_ref); den vannrette linjen markerer begrensningstaket (1 + maks akselerasjon). Den gjenspeiler nøyaktig det verten bruker."
+
+# --- sliders ----------------------------------------------------------------
+["controllers.slider.sens_x"]
+en = "Sensitivity X"
+nb = "Følsomhet X"
+
+["controllers.slider.sens_x_help"]
+en = "Horizontal gyro sensitivity, in screen pixels of mouse motion per degree of controller rotation. Higher turns faster."
+nb = "Horisontal gyro-følsomhet, i skjermpiksler musbevegelse per grad kontrollerrotasjon. Høyere snur raskere."
+
+["controllers.slider.sens_y"]
+en = "Sensitivity Y"
+nb = "Følsomhet Y"
+
+["controllers.slider.sens_y_help"]
+en = "Vertical gyro sensitivity, in screen pixels of mouse motion per degree of controller rotation. Higher looks up/down faster."
+nb = "Vertikal gyro-følsomhet, i skjermpiksler musbevegelse per grad kontrollerrotasjon. Høyere ser opp/ned raskere."
+
+["controllers.slider.accel"]
+en = "Acceleration"
+nb = "Akselerasjon"
+
+["controllers.slider.accel_help"]
+en = "Extra gain applied as you rotate faster. 0 keeps a flat 1:1 feel; higher lets quick flicks travel further than the raw sensitivity alone."
+nb = "Ekstra forsterkning som brukes når du roterer raskere. 0 gir en flat 1:1-følelse; høyere lar raske bevegelser nå lenger enn den rene følsomheten alene."
+
+["controllers.slider.accel_pow"]
+en = "Accel curve (pow)"
+nb = "Akselerasjonskurve (pow)"
+
+["controllers.slider.accel_pow_help"]
+en = "Attack exponent of the acceleration curve. Above 1 keeps slow, precise aim near 1:1 while still ramping up fast flicks."
+nb = "Eksponent for akselerasjonskurvens stigning. Over 1 holder langsom, presis sikting nær 1:1 mens raske bevegelser fortsatt trappes opp."
+
+["controllers.slider.accel_ref"]
+en = "Accel knee (deg/s)"
+nb = "Akselerasjonsknekk (grader/s)"
+
+["controllers.slider.accel_ref_help"]
+en = "The rotation speed, in degrees per second, at which the acceleration curve reaches full effect (1×). Below this the curve is gentler."
+nb = "Rotasjonshastigheten, i grader per sekund, der akselerasjonskurven når full effekt (1×). Under dette er kurven mildere."
+
+["controllers.slider.accel_max"]
+en = "Accel max (clamp)"
+nb = "Maks akselerasjon (begrensning)"
+
+["controllers.slider.accel_max_help"]
+en = "Ceiling on the extra acceleration gain, so a sudden flick can't multiply your aim into an uncontrollable spin."
+nb = "Tak på den ekstra akselerasjonsforsterkningen, slik at en plutselig bevegelse ikke kan gange siktingen din opp til en ukontrollerbar snurr."
+
+["controllers.slider.default_label"]
+en = "default:"
+nb = "standard:"
+
+# --- invert + axis mapping --------------------------------------------------
+["controllers.invert.x"]
+en = "Invert X"
+nb = "Inverter X"
+
+["controllers.invert.x_desc"]
+en = "Flip the horizontal gyro direction, so tilting the pad one way aims the opposite way."
+nb = "Snu den horisontale gyro-retningen, slik at å vippe kontrolleren én vei sikter motsatt vei."
+
+["controllers.invert.y"]
+en = "Invert Y"
+nb = "Inverter Y"
+
+["controllers.invert.y_desc"]
+en = "Flip the vertical gyro direction (classic \"inverted look\" up/down)."
+nb = "Snu den vertikale gyro-retningen (klassisk \"invertert utsyn\" opp/ned)."
+
+["controllers.axis.horizontal"]
+en = "Horizontal axis"
+nb = "Horisontal akse"
+
+["controllers.axis.horizontal_desc"]
+en = "Which raw gyro axis (RX, RY, or RZ) the controller reports horizontal rotation on. Change this if left/right aiming maps to the wrong motion."
+nb = "Hvilken rå gyro-akse (RX, RY eller RZ) kontrolleren rapporterer horisontal rotasjon på. Endre dette hvis venstre/høyre-sikting kobles til feil bevegelse."
+
+["controllers.axis.vertical"]
+en = "Vertical axis"
+nb = "Vertikal akse"
+
+["controllers.axis.vertical_desc"]
+en = "Which raw gyro axis (RX, RY, or RZ) the controller reports vertical rotation on. Change this if up/down aiming maps to the wrong motion."
+nb = "Hvilken rå gyro-akse (RX, RY eller RZ) kontrolleren rapporterer vertikal rotasjon på. Endre dette hvis opp/ned-sikting kobles til feil bevegelse."
+
+["controllers.axis.combo_desc"]
+en = "Pick the raw motion-sensor axis to use for this direction."
+nb = "Velg den rå bevegelsessensoraksen som skal brukes for denne retningen."
+
+["controllers.axis.raw"]
+en = "axis"
+nb = "akse"
+
+# --- presets card -----------------------------------------------------------
+["controllers.presets.empty"]
+en = "No presets saved. Use “Save as preset…” on a controller below to capture its current feel as a reusable preset."
+nb = "Ingen forhåndsinnstillinger lagret. Bruk «Lagre som forhåndsinnstilling …» på en kontroller nedenfor for å fange dens nåværende følelse som en gjenbrukbar forhåndsinnstilling."
+
+["controllers.presets.create_default"]
+en = "Create from defaults"
+nb = "Opprett fra standard"
+
+["controllers.presets.create_default_desc"]
+en = "Add a starter preset with the shipped out-of-the-box feel (default gyro tuning, no face-button swaps) so the Apply-preset picker has something to apply. Remember to Save profiles to keep it."
+nb = "Legg til en startforhåndsinnstilling med den medfølgende standardfølelsen (standard gyro-justering, ingen bytte av ansiktsknapper) slik at velgeren for Bruk forhåndsinnstilling har noe å bruke. Husk å lagre profiler for å beholde den."
+
+["controllers.presets.default_name"]
+en = "Default"
+nb = "Standard"
+
+["controllers.presets.created_status"]
+en = "Created a default preset."
+nb = "Opprettet en standard forhåndsinnstilling."
+
+["controllers.presets.name_desc"]
+en = "A saved, reusable feel. Apply it to any controller from that controller's Apply-preset picker."
+nb = "En lagret, gjenbrukbar følelse. Bruk den på hvilken som helst kontroller fra den kontrollerens velger for Bruk forhåndsinnstilling."
+
+["controllers.presets.gyro_on"]
+en = "on"
+nb = "på"
+
+["controllers.presets.gyro_off"]
+en = "off"
+nb = "av"
+
+["controllers.presets.delete"]
+en = "Delete"
+nb = "Slett"
+
+["controllers.presets.delete_desc"]
+en = "Permanently remove this preset. Controllers that already had it applied keep their copied values; only the reusable preset is removed. Remember to Save."
+nb = "Fjern denne forhåndsinnstillingen permanent. Kontrollere som allerede har fått den brukt beholder sine kopierte verdier; bare den gjenbrukbare forhåndsinnstillingen fjernes. Husk å lagre."
+
+["controllers.presets.deleted_status"]
+en = "Deleted preset"
+nb = "Slettet forhåndsinnstilling"
+
+["controllers.presets.rename"]
+en = "Rename"
+nb = "Gi nytt navn"
+
+["controllers.presets.rename_desc"]
+en = "Give this preset a different name. Does not change controllers it was already applied to."
+nb = "Gi denne forhåndsinnstillingen et annet navn. Endrer ikke kontrollere den allerede er brukt på."
+
+# --- USB/IP reference -------------------------------------------------------
+["controllers.usbip.intro_desc"]
+en = "Reference, not settings. Explains the three USB/IP transport classes a controller can use to reach the host, since the carriage method — not the pad — is what limits gyro and audio."
+nb = "Referanse, ikke innstillinger. Forklarer de tre USB/IP-transportklassene en kontroller kan bruke for å nå verten, siden bæremetoden — ikke kontrolleren — er det som begrenser gyro og lyd."
+
+["controllers.usbip.relay_badge"]
+en = "relay"
+nb = "relé"
+
+["controllers.usbip.relay_title"]
+en = "USB/IP relay (HID — wired pads)"
+nb = "USB/IP-relé (HID — kablede kontrollere)"
+
+["controllers.usbip.relay_body"]
+en = "Interrupt/bulk HID controllers export cleanly over USB/IP: the client exports the local device, the host imports it into a virtual hub. Gyro + paddles come through as-is. Best path for a wired DualSense/DS4."
+nb = "Interrupt/bulk-HID-kontrollere eksporteres rent over USB/IP: klienten eksporterer den lokale enheten, verten importerer den til en virtuell hub. Gyro + padler kommer gjennom som de er. Beste vei for en kablet DualSense/DS4."
+
+["controllers.usbip.bt_badge"]
+en = "pair-and-forward"
+nb = "par-og-videresend"
+
+["controllers.usbip.bt_title"]
+en = "Bluetooth (pair locally, then forward)"
+nb = "Bluetooth (par lokalt, videresend deretter)"
+
+["controllers.usbip.bt_body"]
+en = "BT bonding can’t ride USB/IP (the radio’s link keys never cross the wire). Pair the pad to the client device’s own Bluetooth first; its HID stream then forwards normally. This is the route for wireless Switch Pro / 8BitDo."
+nb = "BT-binding kan ikke gå over USB/IP (radioens koblingsnøkler krysser aldri kabelen). Par kontrolleren med klientenhetens egen Bluetooth først; HID-strømmen videresendes deretter normalt. Dette er veien for trådløs Switch Pro / 8BitDo."
+
+["controllers.usbip.iso_badge"]
+en = "unsupported"
+nb = "støttes ikke"
+
+["controllers.usbip.iso_title"]
+en = "Isochronous (USB audio / webcams) — deferred"
+nb = "Isokron (USB audio / webkameraer) — utsatt"
+
+["controllers.usbip.iso_body"]
+en = "Isochronous endpoints (controller headset audio, camera) are architected for but gated off post-v1 — rusb has no iso API and Android can’t service it. Controller *input* never uses iso, so pads are unaffected."
+nb = "Isokrone endepunkter (lyd fra kontrollerheadset, kamera) er det lagt opp til, men de er stengt av etter v1 — rusb har ingen iso API og Android kan ikke betjene det. Kontroller-*inndata* bruker aldri iso, så kontrollere påvirkes ikke."
+
+# --- add dialog -------------------------------------------------------------
+["controllers.add.title"]
+en = "Add controller"
+nb = "Legg til kontroller"
+
+["controllers.add.body"]
+en = "Enter the controller's USB vendor + product id (4 hex digits each). Find them with `lsusb` on Linux or Device Manager on Windows."
+nb = "Skriv inn kontrollerens USB vendor + product id (4 hex-sifre hver). Finn dem med `lsusb` på Linux eller Enhetsbehandling på Windows."
+
+["controllers.add.vid_label"]
+en = "Vendor ID (hex)"
+nb = "Vendor ID (hex)"
+
+["controllers.add.vid_desc"]
+en = "The 4-hex-digit USB vendor id (e.g. 045e for Microsoft). A leading 0x is tolerated."
+nb = "Den 4-hex-sifrede USB vendor id (f.eks. 045e for Microsoft). En innledende 0x tolereres."
+
+["controllers.add.pid_label"]
+en = "Product ID (hex)"
+nb = "Product ID (hex)"
+
+["controllers.add.pid_desc"]
+en = "The 4-hex-digit USB product id (e.g. 028e for an Xbox 360 pad). A leading 0x is tolerated."
+nb = "Den 4-hex-sifrede USB product id (f.eks. 028e for en Xbox 360-kontroller). En innledende 0x tolereres."
+
+["controllers.add.name_label"]
+en = "Name (optional)"
+nb = "Navn (valgfritt)"
+
+["controllers.add.name_desc"]
+en = "An optional friendly name. Used only to refine classification for pads that report a generic VID:PID (e.g. some 8BitDo / Flydigi modes)."
+nb = "Et valgfritt visningsnavn. Brukes kun til å forfine klassifiseringen for kontrollere som rapporterer en generisk VID:PID (f.eks. noen 8BitDo-/Flydigi-moduser)."
+
+["controllers.add.detected"]
+en = "Detected:"
+nb = "Gjenkjent:"
+
+["controllers.add.detected_desc"]
+en = "How the entered VID:PID (and optional name) classifies right now, with its expected capabilities."
+nb = "Hvordan den angitte VID:PID (og valgfritt navn) klassifiseres akkurat nå, med forventede egenskaper."
+
+["controllers.add.exists"]
+en = "A profile for this id already exists."
+nb = "En profil for denne id-en finnes allerede."
+
+["controllers.add.exists_desc"]
+en = "There is already a saved profile for this VID:PID. Close this dialog and edit the existing card instead."
+nb = "Det finnes allerede en lagret profil for denne VID:PID. Lukk denne dialogen og rediger det eksisterende kortet i stedet."
+
+["controllers.add.invalid"]
+en = "Enter valid 4-digit hex ids to preview."
+nb = "Skriv inn gyldige 4-sifrede hex-id-er for å forhåndsvise."
+
+["controllers.add.invalid_desc"]
+en = "The vendor and product ids must each be 1–4 hexadecimal digits before a controller can be added."
+nb = "Vendor- og product-id-ene må hver være 1–4 heksadesimale sifre før en kontroller kan legges til."
+
+["controllers.add.cancel"]
+en = "Cancel"
+nb = "Avbryt"
+
+["controllers.add.cancel_desc"]
+en = "Close this dialog without adding a controller."
+nb = "Lukk denne dialogen uten å legge til en kontroller."
+
+["controllers.add.confirm"]
+en = "Add"
+nb = "Legg til"
+
+["controllers.add.confirm_desc"]
+en = "Create a profile for this VID:PID with default feel. Enabled once the ids are valid and not already registered."
+nb = "Opprett en profil for denne VID:PID med standardfølelse. Aktiveres når id-ene er gyldige og ikke allerede er registrert."
+
+["controllers.add.added_status"]
+en = "Added controller"
+nb = "La til kontroller"
+
+# --- preset dialog ----------------------------------------------------------
+["controllers.preset_dialog.rename_title"]
+en = "Rename preset"
+nb = "Gi forhåndsinnstilling nytt navn"
+
+["controllers.preset_dialog.save_title"]
+en = "Save as preset"
+nb = "Lagre som forhåndsinnstilling"
+
+["controllers.preset_dialog.name_label"]
+en = "Preset name"
+nb = "Navn på forhåndsinnstilling"
+
+["controllers.preset_dialog.name_desc"]
+en = "A short, memorable name for this preset (e.g. \"Couch flick aim\"). Used in each controller's Apply-preset picker."
+nb = "Et kort, lett huskbart navn for denne forhåndsinnstillingen (f.eks. \"Couch flick aim\"). Brukes i hver kontrollers velger for Bruk forhåndsinnstilling."
+
+["controllers.preset_dialog.clashes"]
+en = "A preset with that name already exists."
+nb = "En forhåndsinnstilling med det navnet finnes allerede."
+
+["controllers.preset_dialog.clashes_desc"]
+en = "Choose a different name — a preset with this name already exists and would be overwritten."
+nb = "Velg et annet navn — en forhåndsinnstilling med dette navnet finnes allerede og ville blitt overskrevet."
+
+["controllers.preset_dialog.cancel"]
+en = "Cancel"
+nb = "Avbryt"
+
+["controllers.preset_dialog.cancel_desc"]
+en = "Close this dialog without saving the preset."
+nb = "Lukk denne dialogen uten å lagre forhåndsinnstillingen."
+
+["controllers.preset_dialog.save"]
+en = "Save"
+nb = "Lagre"
+
+["controllers.preset_dialog.save_desc"]
+en = "Store the preset under this name. Enabled once a non-clashing name is entered. You still need Save profiles to write it to disk."
+nb = "Lagre forhåndsinnstillingen under dette navnet. Aktiveres når et navn uten konflikt er angitt. Du må fortsatt bruke Lagre profiler for å skrive den til disk."
+
+["controllers.preset_dialog.renamed_status"]
+en = "Renamed preset to"
+nb = "Ga forhåndsinnstilling nytt navn til"
+
+["controllers.preset_dialog.saved_status"]
+en = "Saved preset"
+nb = "Lagret forhåndsinnstilling"
+
+# --- per-controller preset actions ------------------------------------------
+["controllers.apply.button"]
+en = "Apply preset"
+nb = "Bruk forhåndsinnstilling"
+
+["controllers.apply.none_desc"]
+en = "No presets saved yet. Use “Save as preset…” to capture a feel first, then apply it here."
+nb = "Ingen forhåndsinnstillinger lagret ennå. Bruk «Lagre som forhåndsinnstilling …» for å fange en følelse først, og bruk den deretter her."
+
+["controllers.apply.choose"]
+en = "Choose preset…"
+nb = "Velg forhåndsinnstilling …"
+
+["controllers.apply.combo_desc"]
+en = "Pick a saved preset to copy onto this controller."
+nb = "Velg en lagret forhåndsinnstilling som skal kopieres til denne kontrolleren."
+
+["controllers.apply.confirm"]
+en = "Apply"
+nb = "Bruk"
+
+["controllers.apply.confirm_desc"]
+en = "Copy the chosen preset's values onto this controller's profile. Remember to Save profiles to persist."
+nb = "Kopier den valgte forhåndsinnstillingens verdier til denne kontrollerens profil. Husk å bruke Lagre profiler for å beholde dem."
+
+["controllers.apply.applied_status"]
+en = "Applied preset"
+nb = "Brukte forhåndsinnstilling"
+
+["controllers.apply.applied_to"]
+en = "to"
+nb = "til"
+
+["controllers.apply.save_as"]
+en = "Save as preset…"
+nb = "Lagre som forhåndsinnstilling …"
+
+["controllers.apply.save_as_desc"]
+en = "Capture this controller's current feel (swaps + gyro tuning) as a new reusable preset."
+nb = "Fang denne kontrollerens nåværende følelse (bytter + gyro-justering) som en ny gjenbrukbar forhåndsinnstilling."
+
+# --- preset summary fragments ----------------------------------------------
+["controllers.summary.gyro"]
+en = "gyro"
+nb = "gyro"
+
+["controllers.summary.sens"]
+en = "sens"
+nb = "føls"
+
+["controllers.summary.accel"]
+en = "accel"
+nb = "aksel"

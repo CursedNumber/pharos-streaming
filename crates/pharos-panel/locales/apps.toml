@@ -1,0 +1,302 @@
+# Apps tab (the application launcher). rust-i18n v2: one key per section, each
+# carrying per-locale values. English is default + fallback.
+_version = 2
+
+["apps.heading"]
+en = "Applications"
+nb = "Programmer"
+
+["apps.intro"]
+en = "Apps you save here appear on the host's virtual display and as box-art tiles on Trireme clients. Launch them here, from a Trireme tile, or with `pharos-compositor launch-app <slug>`."
+nb = "Programmer du lagrer her vises på vertens virtuelle skjerm og som omslagsfliser på Trireme-klienter. Start dem her, fra en Trireme-flis, eller med `pharos-compositor launch-app <slug>`."
+
+["apps.toolbar.add"]
+en = "Add application"
+nb = "Legg til program"
+
+["apps.toolbar.add_desc"]
+en = "Open the editor to create a new application — start from a Steam scan, an installed app, or any executable."
+nb = "Åpne editoren for å lage et nytt program — start fra et Steam-søk, et installert program, eller en hvilken som helst kjørbar fil."
+
+["apps.live_on"]
+en = "Host connected — launches go live"
+nb = "Vert tilkoblet — start kjører direkte"
+
+["apps.live_off"]
+en = "Host offline — edits are saved; launches need a running host."
+nb = "Vert frakoblet — endringer lagres; start krever en kjørende vert."
+
+["apps.empty"]
+en = "No applications yet. Click “Add application” to create one."
+nb = "Ingen programmer ennå. Klikk «Legg til program» for å lage ett."
+
+# --- launcher cards -------------------------------------------------------
+["apps.card.launch"]
+en = "Launch"
+nb = "Start"
+
+["apps.card.launch_desc"]
+en = "Launch this application on the live host's virtual display."
+nb = "Start dette programmet på den kjørende vertens virtuelle skjerm."
+
+["apps.card.edit"]
+en = "Edit"
+nb = "Rediger"
+
+["apps.card.delete"]
+en = "Delete"
+nb = "Slett"
+
+["apps.card.builtin"]
+en = "Built-in"
+nb = "Innebygd"
+
+# --- editor ---------------------------------------------------------------
+["apps.editor.new_title"]
+en = "New application"
+nb = "Nytt program"
+
+["apps.editor.edit_title"]
+en = "Edit application"
+nb = "Rediger program"
+
+["apps.editor.save"]
+en = "Save"
+nb = "Lagre"
+
+["apps.editor.save_desc"]
+en = "Add this application to the catalog. Click “Save all” (or close the window) to write it to disk."
+nb = "Legg dette programmet til i katalogen. Klikk «Lagre alt» (eller lukk vinduet) for å skrive det til disk."
+
+["apps.editor.cancel"]
+en = "Cancel"
+nb = "Avbryt"
+
+["apps.editor.slug_taken"]
+en = "Another app already uses the slug:"
+nb = "Et annet program bruker allerede slugen:"
+
+["apps.editor.slug_reserved"]
+en = "“desktop” is reserved for the built-in Desktop tile."
+nb = "«desktop» er reservert for den innebygde Skrivebord-flisen."
+
+# --- easy mode ------------------------------------------------------------
+["apps.easy.title"]
+en = "Easy mode — start from what's installed"
+nb = "Enkel modus — start fra det som er installert"
+
+["apps.easy.scan_steam"]
+en = "Scan Steam"
+nb = "Søk i Steam"
+
+["apps.easy.scan_steam_desc"]
+en = "Find installed Steam games and fill in a distro-correct launch command + box art automatically."
+nb = "Finn installerte Steam-spill og fyll inn en distro-korrekt startkommando og omslag automatisk."
+
+["apps.easy.installed"]
+en = "Installed apps"
+nb = "Installerte programmer"
+
+["apps.easy.installed_desc"]
+en = "Pick from the desktop applications installed on this host."
+nb = "Velg blant skrivebordsprogrammene som er installert på denne verten."
+
+["apps.easy.browse_exe"]
+en = "Browse for an executable…"
+nb = "Bla etter en kjørbar fil…"
+
+["apps.easy.browse_exe_desc"]
+en = "Choose any program file; its name and command are filled in for you."
+nb = "Velg en hvilken som helst programfil; navn og kommando fylles inn for deg."
+
+["apps.easy.filter"]
+en = "Filter…"
+nb = "Filtrer…"
+
+["apps.easy.none_found"]
+en = "Nothing found."
+nb = "Ingenting funnet."
+
+# --- fields ---------------------------------------------------------------
+["apps.field.name"]
+en = "Name"
+nb = "Navn"
+
+["apps.field.slug"]
+en = "Slug"
+nb = "Slug"
+
+["apps.field.slug_hint"]
+en = "auto from name"
+nb = "auto fra navn"
+
+["apps.field.slug_desc"]
+en = "Short id used by the CLI (`launch-app <slug>`) and the client relay. Left blank, it's derived from the name."
+nb = "Kort id brukt av CLI (`launch-app <slug>`) og klientreléet. Hvis tom, avledes den fra navnet."
+
+["apps.field.kind"]
+en = "Kind"
+nb = "Type"
+
+["apps.field.gyro"]
+en = "Gyro"
+nb = "Gyro"
+
+["apps.field.gyro_desc"]
+en = "How the host treats controller gyro while this app is the active foreground app. Defaults to Enabled (raw to the game). Requires the client to also opt in to gyro relay in Trireme settings — otherwise no gyro reaches the host."
+nb = "Hvordan verten håndterer gyro når dette programmet er aktivt. Standard er Aktivert (rå til spillet). Krever også at klienten slår på gyro-overføring i Trireme-innstillingene — ellers når ingen gyro frem til verten."
+
+["apps.gyro.enabled"]
+en = "Enabled — raw to game"
+nb = "Aktivert — rå til spillet"
+
+["apps.gyro.mouse"]
+en = "Mouse — gyro→mouse aim"
+nb = "Mus — gyro→mussikte"
+
+["apps.gyro.disabled"]
+en = "Disabled — ignored"
+nb = "Av — ignorert"
+
+["apps.field.fps_cap"]
+en = "FPS cap"
+nb = "FPS-tak"
+
+["apps.field.fps_cap_desc"]
+en = "Cap this app's framerate with a MangoHud limiter on launch. The stream's output is a fixed refresh, so rendering above it just wastes GPU and heat. Auto matches the virtual output's rate; Fixed sets an explicit number. Direct-launched apps only — a Steam game must set its cap in its Steam launch options (e.g. mangohud %command%)."
+nb = "Begrens programmets bildefrekvens med en MangoHud-begrenser ved oppstart. Strømmens utgang har fast oppdateringsfrekvens, så å tegne over den sløser bare GPU og varme. Auto følger den virtuelle utgangens frekvens; Fast setter et eksplisitt tall. Kun for direktestartede programmer — et Steam-spill må sette taket i sine Steam-oppstartsvalg (f.eks. mangohud %command%)."
+
+["apps.fps_cap.off"]
+en = "Off — uncapped"
+nb = "Av — uten tak"
+
+["apps.fps_cap.auto"]
+en = "Auto — match the output"
+nb = "Auto — følg utgangen"
+
+["apps.fps_cap.fixed"]
+en = "Fixed…"
+nb = "Fast…"
+
+["apps.field.perf_overlay"]
+en = "Perf overlay"
+nb = "Ytelsesoverlegg"
+
+["apps.field.perf_overlay_on"]
+en = "Show MangoHud overlay"
+nb = "Vis MangoHud-overlegg"
+
+["apps.field.perf_overlay_desc"]
+en = "Burn MangoHud's perf overlay (fps, frametime, GPU/CPU) into this app's stream so you can read it on the client. Off by default — the FPS cap normally runs MangoHud invisibly. Direct-launched apps only; a Steam game must add 'mangohud %command%' to its Steam launch options."
+nb = "Brenn MangoHuds ytelsesoverlegg (fps, bildetid, GPU/CPU) inn i programmets strøm så du kan lese det på klienten. Av som standard — FPS-taket kjører normalt MangoHud usynlig. Kun for direktestartede programmer; et Steam-spill må legge til «mangohud %command%» i sine Steam-oppstartsvalg."
+
+["apps.field.mangohud_absent"]
+en = "MangoHud not detected on the host — install it to enable the overlay and FPS cap."
+nb = "MangoHud ikke funnet på verten — installer det for å aktivere overlegg og FPS-tak."
+
+["apps.field.command"]
+en = "Launch command"
+nb = "Startkommando"
+
+["apps.field.command_desc"]
+en = "The command to run. Tokenized on spaces (quotes respected) unless “Run in shell” is on."
+nb = "Kommandoen som kjøres. Deles på mellomrom (anførselstegn respekteres) med mindre «Kjør i skall» er på."
+
+["apps.field.shell"]
+en = "Run in shell"
+nb = "Kjør i skall"
+
+["apps.field.shell_desc"]
+en = "Run the command through /bin/sh -c (cmd /C on Windows) so pipes, && and URI handlers work."
+nb = "Kjør kommandoen via /bin/sh -c (cmd /C på Windows) slik at rør, && og URI-håndterere virker."
+
+["apps.field.target"]
+en = "Target"
+nb = "Mål"
+
+["apps.field.box_art"]
+en = "Box art"
+nb = "Omslag"
+
+["apps.field.box_art_hint"]
+en = "path to a PNG/JPEG"
+nb = "bane til en PNG/JPEG"
+
+["apps.field.browse"]
+en = "Browse…"
+nb = "Bla…"
+
+["apps.advanced"]
+en = "Advanced (working directory, environment)"
+nb = "Avansert (arbeidsmappe, miljø)"
+
+["apps.field.cwd"]
+en = "Working directory"
+nb = "Arbeidsmappe"
+
+["apps.field.cwd_hint"]
+en = "optional"
+nb = "valgfritt"
+
+["apps.field.env"]
+en = "Environment variables"
+nb = "Miljøvariabler"
+
+["apps.field.env_add"]
+en = "Add variable"
+nb = "Legg til variabel"
+
+# --- kinds ----------------------------------------------------------------
+["apps.kind.app"]
+en = "App"
+nb = "Program"
+
+["apps.kind.game"]
+en = "Game"
+nb = "Spill"
+
+["apps.kind.desktop"]
+en = "Desktop"
+nb = "Skrivebord"
+
+["apps.kind.media"]
+en = "Media"
+nb = "Media"
+
+# --- targets --------------------------------------------------------------
+["apps.target.virtual"]
+en = "Virtual display"
+nb = "Virtuell skjerm"
+
+["apps.target.virtual_output"]
+en = "A specific virtual output"
+nb = "En bestemt virtuell utgang"
+
+["apps.target.output_name_hint"]
+en = "output name (from multi.toml)"
+nb = "utgangsnavn (fra multi.toml)"
+
+["apps.target.extend"]
+en = "Extend the physical desktop (coming soon)"
+nb = "Utvid det fysiske skrivebordet (kommer snart)"
+
+["apps.target.duplicate"]
+en = "Duplicate the physical desktop (coming soon)"
+nb = "Dupliser det fysiske skrivebordet (kommer snart)"
+
+["apps.target.physical_note"]
+en = "Physical-desktop targets aren't wired into the compositor yet — the choice is saved, but launching one reports it's unavailable for now."
+nb = "Fysisk-skrivebord-mål er ikke koblet inn i compositoren ennå — valget lagres, men å starte ett rapporterer at det er utilgjengelig foreløpig."
+
+# --- status notes ---------------------------------------------------------
+["apps.saved"]
+en = "Added"
+nb = "La til"
+
+["apps.deleted"]
+en = "Removed"
+nb = "Fjernet"
+
+["apps.launched"]
+en = "Launching"
+nb = "Starter"

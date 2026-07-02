@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Apps pane strings (pooled box-art launcher across all connected hosts). Owned by
+  the Navbar agent (contract C).
+-->
+<resources>
+    <string name="apps_title">Apps</string>
+    <string name="apps_subtitle">Pick an app to launch on its host. The host becomes the active stream.</string>
+
+    <!-- Shown until any connected host has reported a catalog. -->
+    <string name="apps_waiting">Waiting for an app catalog…</string>
+    <!-- Shown when connected but a specific host's catalog is still empty. -->
+    <string name="apps_host_empty">No apps reported yet.</string>
+
+    <!-- contentDescription for a tile whose box art is present — the name is the
+         art's meaning. (No-art tiles fall back to the kind glyph + the name label.) -->
+    <string name="apps_tile_desc">Launch %1$s</string>
+    <!-- contentDescription for a RUNNING tile — opens a manage menu instead of launching. -->
+    <string name="apps_tile_running_desc">%1$s is running — open manage menu</string>
+    <!-- Badge over a running app's box art. -->
+    <string name="apps_tile_running_badge">RUNNING</string>
+    <!-- Running-app manage menu actions. -->
+    <string name="apps_action_switch_to">Switch to</string>
+    <string name="apps_action_relaunch">Relaunch</string>
+    <string name="apps_action_end_process">End process</string>
+
+    <!-- Per-host section header includes a count for the live region. -->
+    <string name="apps_host_header">%1$s</string>
+</resources>

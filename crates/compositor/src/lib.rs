@@ -1,0 +1,1092 @@
+//! Pharos headless Wayland compositor (Smithay).
+//!
+//! M1, step 1: a hand-rolled headless compositor that advertises a *synthesized*
+//! virtual output (no DRM connector, no real EDID — so the EVDI-class
+//! connector/EDID bugs simply cannot occur) and accepts Wayland clients.
+//! Rendering of client surfaces and DMA-BUF capture → NVENC come in step 2.
+//!
+//! Structure follows Smithay 0.7's `smallvil` example, with the winit backend
+//! and the interactive move/resize grabs removed (a streaming host drives the
+//! output itself and doesn't need pointer-driven window management).
+
+#![cfg(target_os = "linux")]
+
+use std::{ffi::OsString, sync::Arc, time::Duration};
+
+use smithay::backend::renderer::utils::on_commit_buffer_handler;
+use smithay::output::Mode as OutputMode;
+use smithay::{
+    delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm,
+    delegate_xdg_shell,
+    desktop::{PopupKind, PopupManager, Space, Window, WindowSurfaceType},
+    input::{Seat, SeatHandler, SeatState},
+    output::{Output, PhysicalProperties, Subpixel},
+    reexports::{
+        calloop::{
+            generic::Generic, EventLoop, Interest, LoopSignal, Mode as CalloopMode, PostAction,
+        },
+        wayland_protocols::xdg::shell::server::xdg_toplevel,
+        wayland_server::{
+            backend::{ClientData, ClientId, DisconnectReason},
+            protocol::{wl_buffer, wl_output, wl_seat, wl_surface::WlSurface},
+            Client, Display, DisplayHandle, Resource,
+        },
+    },
+    utils::{Logical, Point, Serial, Transform},
+    wayland::{
+        buffer::BufferHandler,
+        compositor::{
+            get_parent, is_sync_subsurface, with_states, CompositorClientState, CompositorHandler,
+            CompositorState,
+        },
+        output::{OutputHandler, OutputManagerState},
+        selection::{
+            data_device::{
+                set_data_device_focus, ClientDndGrabHandler, DataDeviceHandler, DataDeviceState,
+                ServerDndGrabHandler,
+            },
+            SelectionHandler,
+        },
+        shell::xdg::{
+            PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+            XdgToplevelSurfaceData,
+        },
+        shm::{ShmHandler, ShmState},
+        socket::ListeningSocketSource,
+    },
+};
+use tracing::info;
+
+mod capture;
+use capture::HevcEncoder;
+
+pub mod control;
+pub mod gamepad;
+pub mod gyro_imu;
+pub mod host_input;
+pub mod idle;
+
+pub mod color_mgmt;
+pub mod cuegl;
+pub mod multi;
+pub mod nvenc;
+pub mod pairing;
+pub mod preview;
+pub mod usbkbd;
+// Pairing + identity glue now lives in the cross-platform `host-core` crate
+// (shared with the Windows host). Re-exported so `compositor::pair::run` and
+// the internal `crate::pair::identity_path()` call sites keep resolving.
+pub use host_core::pair;
+
+// Software (pixman) rendering + CPU readback for the capture path.
+use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::damage::OutputDamageTracker;
+use smithay::backend::renderer::element::solid::SolidColorRenderElement;
+use smithay::backend::renderer::pixman::PixmanRenderer;
+use smithay::backend::renderer::{Bind, ExportMem, Offscreen};
+use smithay::utils::{Rectangle, Size};
+
+// linux-dmabuf + real client compositing.
+use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::renderer::ImportDma;
+use smithay::delegate_dmabuf;
+use smithay::delegate_viewporter;
+use smithay::desktop::space::space_render_elements;
+use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
+use smithay::wayland::viewporter::ViewporterState;
+
+/// Event-loop shared data: the compositor state plus a display handle.
+pub struct CalloopData {
+    pub state: State,
+    pub display_handle: DisplayHandle,
+}
+
+/// How long after a launch a newly-mapped toplevel is associated with that app's
+/// slug (for Switch-To). Generous because Steam can take many seconds to bring a
+/// game window up after the URI handoff.
+const APP_CLAIM_WINDOW: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The compositor. Holds every Wayland global's server-side state.
+pub struct State {
+    pub start_time: std::time::Instant,
+    pub socket_name: OsString,
+    pub display_handle: DisplayHandle,
+
+    pub space: Space<Window>,
+    pub loop_signal: LoopSignal,
+
+    pub compositor_state: CompositorState,
+    pub xdg_shell_state: XdgShellState,
+    pub shm_state: ShmState,
+    pub output_manager_state: OutputManagerState,
+    pub seat_state: SeatState<State>,
+    pub data_device_state: DataDeviceState,
+    pub dmabuf_state: DmabufState,
+    pub popups: PopupManager,
+    pub seat: Seat<Self>,
+    /// How many toplevels we've already placed. For a multi-output `extend`
+    /// layout we put the Nth new toplevel on the Nth output (clamped to the last)
+    /// so distinct apps land on distinct streams. For mirror/single — overlapping
+    /// or single output — every output sits at the same origin, so this still
+    /// resolves to the same (0,0)-anchored placement as before.
+    pub placed_toplevels: usize,
+    /// Set by the launch path just before spawning an app (slug + launch instant):
+    /// every toplevel that maps within [`APP_CLAIM_WINDOW`] of the launch claims
+    /// this slug, LAST-one-wins — so a Steam splash / winewayland throwaway window
+    /// that maps first is overwritten by the real game window that maps a moment
+    /// later. Launch-order association sidesteps the XWayland pid problem (a Proton
+    /// game's surface belongs to Xwayland, not the game). Stale dead surfaces are
+    /// swept each frame (see the render loop's `app_surfaces.retain`).
+    pub pending_app_launch: Option<(String, std::time::Instant)>,
+    /// slug → the toplevel surface most recently launched for it. Used by
+    /// [`State::switch_to_app`] to raise + focus a running app on request. Stale
+    /// entries (surface gone) are pruned on lookup.
+    pub app_surfaces: std::collections::HashMap<String, WlSurface>,
+}
+
+impl State {
+    pub fn new(event_loop: &mut EventLoop<CalloopData>, display: Display<Self>) -> Self {
+        let start_time = std::time::Instant::now();
+        let dh = display.handle();
+
+        let compositor_state = CompositorState::new::<Self>(&dh);
+        let xdg_shell_state = XdgShellState::new::<Self>(&dh);
+        let shm_state = ShmState::new::<Self>(&dh, vec![]);
+        let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
+        let mut seat_state = SeatState::new();
+        let data_device_state = DataDeviceState::new::<Self>(&dh);
+        let dmabuf_state = DmabufState::new();
+        let popups = PopupManager::default();
+
+        let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, "seat0");
+        // Assume keyboard + pointer are always present (host injects input later).
+        seat.add_keyboard(Default::default(), 200, 25).unwrap();
+        seat.add_pointer();
+
+        let space = Space::default();
+        let socket_name = Self::init_wayland_listener(display, event_loop);
+        let loop_signal = event_loop.get_signal();
+
+        Self {
+            start_time,
+            socket_name,
+            display_handle: dh,
+            space,
+            loop_signal,
+            compositor_state,
+            xdg_shell_state,
+            shm_state,
+            output_manager_state,
+            seat_state,
+            data_device_state,
+            dmabuf_state,
+            popups,
+            seat,
+            placed_toplevels: 0,
+            pending_app_launch: None,
+            app_surfaces: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Raise + focus the toplevel most recently launched for `slug` (Switch-To).
+    /// Returns the focused surface (so the render loop can point pointer/touch/gyro
+    /// dispatch at it too — keyboard focus alone leaves those routed at the old
+    /// window). `None` if no live window is associated; prunes a stale mapping.
+    pub fn switch_to_app(&mut self, slug: &str) -> Option<WlSurface> {
+        let surface = self.app_surfaces.get(slug).cloned()?;
+        let win = self
+            .space
+            .elements()
+            .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == &surface))
+            .cloned();
+        match win {
+            Some(w) => {
+                self.space.raise_element(&w, true);
+                if let Some(kbd) = self.seat.get_keyboard() {
+                    let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+                    kbd.set_focus(self, Some(surface.clone()), serial);
+                }
+                Some(surface)
+            }
+            None => {
+                // The window is gone — drop the stale mapping.
+                self.app_surfaces.remove(slug);
+                None
+            }
+        }
+    }
+
+    /// Drop `app_surfaces` entries whose toplevel is no longer mapped, so a later
+    /// Switch-To can't resolve to a dead surface and a winewayland throwaway window
+    /// (mapped then torn down) doesn't linger as a bogus association. Called once
+    /// per frame after `space.refresh()`.
+    pub fn sweep_app_surfaces(&mut self) {
+        if self.app_surfaces.is_empty() {
+            return;
+        }
+        // A Vec (not a HashSet) — WlSurface has interior mutability, so it's a
+        // poor hash key (clippy::mutable_key_type), and app_surfaces is tiny.
+        let live: Vec<WlSurface> = self
+            .space
+            .elements()
+            .filter_map(|w| w.toplevel().map(|t| t.wl_surface().clone()))
+            .collect();
+        self.app_surfaces.retain(|_, s| live.contains(s));
+    }
+
+    fn init_wayland_listener(
+        display: Display<State>,
+        event_loop: &mut EventLoop<CalloopData>,
+    ) -> OsString {
+        // Auto-pick the next free `wayland-N` socket (won't clash with the host's).
+        let listening_socket = ListeningSocketSource::new_auto().unwrap();
+        let socket_name = listening_socket.socket_name().to_os_string();
+
+        // INVARIANT (screenshot/portal safety): Pharos is a *headless, isolated*
+        // compositor — its `wl_output`/`xdg_output` globals live only on this
+        // socket, so the host's `xdg-desktop-portal-kde` / Spectacle / KWin
+        // screenshots cannot see them *unless* `WAYLAND_DISPLAY=<this socket>`
+        // leaks into the user session or the D-Bus/systemd activation
+        // environment. If it does, the portal binds to Pharos instead of KWin
+        // and screen capture goes dark (the historical "Spectacle dark-screen").
+        // This socket must stay private to clients we launch (they get it via a
+        // per-process `Command::env`, never a session-wide export). The future
+        // extend-physical path is the *inbound* mirror — Pharos connecting to
+        // the host's `wayland-0` as a client — and is unaffected by this rule.
+        // See rig/WORKAROUNDS.md (Spectacle section). Cheap startup tripwire:
+        match std::env::var_os("WAYLAND_DISPLAY") {
+            Some(session_wd) if session_wd == socket_name => {
+                tracing::error!(
+                    "WAYLAND_DISPLAY={socket_name:?} is Pharos's OWN virtual-display \
+                     socket — the host desktop portal / Spectacle / KWin screenshots \
+                     will bind to Pharos and screen capture will break. Never export \
+                     this socket session-wide; see rig/WORKAROUNDS.md."
+                );
+            }
+            Some(session_wd) => {
+                tracing::info!(
+                    "virtual-display socket {socket_name:?} (private to launched \
+                     clients); host session WAYLAND_DISPLAY={session_wd:?} — portal / \
+                     Spectacle / KWin screenshots stay on the host compositor"
+                );
+            }
+            None => {
+                tracing::info!(
+                    "virtual-display socket {socket_name:?} (private to launched \
+                     clients); no host WAYLAND_DISPLAY in env"
+                );
+            }
+        }
+
+        let handle = event_loop.handle();
+
+        handle
+            .insert_source(listening_socket, move |client_stream, _, state| {
+                state
+                    .display_handle
+                    .insert_client(client_stream, Arc::new(ClientState::default()))
+                    .unwrap();
+            })
+            .expect("failed to init the wayland event source");
+
+        handle
+            .insert_source(
+                Generic::new(display, Interest::READ, CalloopMode::Level),
+                |_, display, state| {
+                    // SAFETY: we never drop the display.
+                    unsafe {
+                        display
+                            .get_mut()
+                            .dispatch_clients(&mut state.state)
+                            .unwrap();
+                    }
+                    Ok(PostAction::Continue)
+                },
+            )
+            .unwrap();
+
+        socket_name
+    }
+
+    pub fn surface_under(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        self.space
+            .element_under(pos)
+            .and_then(|(window, location)| {
+                window
+                    .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
+                    .map(|(s, p)| (s, (p + location).to_f64()))
+            })
+    }
+}
+
+#[derive(Default)]
+pub struct ClientState {
+    pub compositor_state: CompositorClientState,
+}
+impl ClientData for ClientState {
+    fn initialized(&self, _client_id: ClientId) {}
+    fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+}
+
+// --- Compositor / Buffer / Shm ---
+
+impl CompositorHandler for State {
+    fn compositor_state(&mut self) -> &mut CompositorState {
+        &mut self.compositor_state
+    }
+    fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+        &client.get_data::<ClientState>().unwrap().compositor_state
+    }
+    fn commit(&mut self, surface: &WlSurface) {
+        on_commit_buffer_handler::<Self>(surface);
+        if !is_sync_subsurface(surface) {
+            let mut root = surface.clone();
+            while let Some(parent) = get_parent(&root) {
+                root = parent;
+            }
+            if let Some(window) = self
+                .space
+                .elements()
+                .find(|w| w.toplevel().unwrap().wl_surface() == &root)
+            {
+                window.on_commit();
+            }
+        }
+        handle_commit(&mut self.popups, &self.space, surface);
+    }
+}
+impl BufferHandler for State {
+    fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
+}
+impl ShmHandler for State {
+    fn shm_state(&self) -> &ShmState {
+        &self.shm_state
+    }
+}
+delegate_compositor!(State);
+delegate_shm!(State);
+
+// --- Seat / DataDevice / Output ---
+
+impl SeatHandler for State {
+    type KeyboardFocus = WlSurface;
+    type PointerFocus = WlSurface;
+    type TouchFocus = WlSurface;
+
+    fn seat_state(&mut self) -> &mut SeatState<State> {
+        &mut self.seat_state
+    }
+    fn cursor_image(
+        &mut self,
+        _seat: &Seat<Self>,
+        _image: smithay::input::pointer::CursorImageStatus,
+    ) {
+    }
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        let dh = &self.display_handle;
+        let client = focused.and_then(|s| dh.get_client(s.id()).ok());
+        set_data_device_focus(dh, seat, client);
+    }
+}
+delegate_seat!(State);
+
+impl SelectionHandler for State {
+    type SelectionUserData = ();
+}
+impl DataDeviceHandler for State {
+    fn data_device_state(&self) -> &DataDeviceState {
+        &self.data_device_state
+    }
+}
+impl ClientDndGrabHandler for State {}
+impl ServerDndGrabHandler for State {}
+delegate_data_device!(State);
+
+impl OutputHandler for State {}
+delegate_output!(State);
+
+// --- linux-dmabuf: lets EGL/GPU clients (e.g. alacritty) submit GPU buffers ---
+
+impl DmabufHandler for State {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.dmabuf_state
+    }
+    fn dmabuf_imported(
+        &mut self,
+        _global: &DmabufGlobal,
+        _dmabuf: Dmabuf,
+        notifier: ImportNotifier,
+    ) {
+        // Optimistically accept; the GLES renderer imports the buffer at render
+        // time when it builds the surface's render element.
+        let _ = notifier.successful::<State>();
+    }
+}
+delegate_dmabuf!(State);
+
+// --- Xdg Shell (no interactive grabs in a headless host) ---
+
+impl State {
+    /// Configure a toplevel to the single virtual output's size, activated and
+    /// fullscreen. This headless capture host always presents one app filling the
+    /// 1920x1080 virtual output, so every toplevel gets a real size up front.
+    /// Clients that wait for the compositor to tell them a size before rendering
+    /// — games via `winewayland`, SDL/gamescope fullscreen — otherwise sit on the
+    /// bare 0x0 "you decide" initial configure and never present a visible buffer
+    /// (the symptom: a live, GPU-busy game but a black captured output). Sets
+    /// pending state only; the configure is sent by the caller or, for the first
+    /// one, by the initial-commit path in [`handle_commit`].
+    fn configure_fullscreen(&self, surface: &ToplevelSurface) {
+        self.configure_fullscreen_on(surface, self.space.outputs().next());
+    }
+
+    /// Like [`Self::configure_fullscreen`] but sized to a *specific* output (for
+    /// the `extend` layout, where the Nth toplevel fills the Nth output). Falls
+    /// back to the first output's size when `output` is `None`.
+    fn configure_fullscreen_on(&self, surface: &ToplevelSurface, output: Option<&Output>) {
+        let size = output
+            .or_else(|| self.space.outputs().next())
+            .and_then(|o| o.current_mode())
+            .map(|m| (m.size.w, m.size.h));
+        surface.with_pending_state(|state| {
+            if let Some((w, h)) = size {
+                state.size = Some((w, h).into());
+            }
+            state.states.set(xdg_toplevel::State::Activated);
+            state.states.set(xdg_toplevel::State::Fullscreen);
+        });
+    }
+}
+
+impl XdgShellHandler for State {
+    fn xdg_shell_state(&mut self) -> &mut XdgShellState {
+        &mut self.xdg_shell_state
+    }
+    fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        // Window placement. In a MIRROR/single layout (one output, or several
+        // sharing the same origin) every new app maps to that shared origin so
+        // they stack cleanly on one z-order — no alternating between overlapping
+        // outputs (which made the Bravia render two apps with the newest on top
+        // and no way to switch). In an `extend` layout (outputs at distinct
+        // origins) we keep the Nth-toplevel-on-Nth-output spread so distinct apps
+        // land on distinct streams.
+        let outputs: Vec<Output> = self.space.outputs().cloned().collect();
+        let mirror = outputs.len() <= 1 || {
+            let first = self.space.output_geometry(&outputs[0]).map(|g| g.loc);
+            outputs
+                .iter()
+                .all(|o| self.space.output_geometry(o).map(|g| g.loc) == first)
+        };
+        let target = if outputs.is_empty() {
+            None
+        } else if mirror {
+            Some(outputs[0].clone())
+        } else {
+            Some(outputs[self.placed_toplevels.min(outputs.len() - 1)].clone())
+        };
+        self.configure_fullscreen_on(&surface, target.as_ref());
+        let origin = target
+            .as_ref()
+            .and_then(|o| self.space.output_geometry(o))
+            .map(|g| (g.loc.x, g.loc.y))
+            .unwrap_or((0, 0));
+        // Claim a pending launch so Switch-To can later raise this app by slug.
+        // Last-one-wins within the launch window: a Steam splash or winewayland
+        // throwaway window may map first, but the real game window maps a moment
+        // later and overwrites the association (the throwaway is swept once gone).
+        let wl = surface.wl_surface().clone();
+        match &self.pending_app_launch {
+            Some((slug, at)) if at.elapsed() < APP_CLAIM_WINDOW => {
+                self.app_surfaces.insert(slug.clone(), wl);
+            }
+            Some(_) => self.pending_app_launch = None, // window elapsed; stop claiming
+            None => {}
+        }
+        let window = Window::new_wayland_window(surface);
+        // activate=true: raise the freshly-launched app to the top of the stack and
+        // mark it activated (launch-to-front). The render loop's focus-on-count-
+        // change then routes keyboard input to it (it's now the topmost element).
+        self.space.map_element(window, origin, true);
+        self.placed_toplevels = self.placed_toplevels.saturating_add(1);
+    }
+    fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+        let _ = self.popups.track_popup(PopupKind::Xdg(surface));
+    }
+    fn fullscreen_request(
+        &mut self,
+        surface: ToplevelSurface,
+        _output: Option<wl_output::WlOutput>,
+    ) {
+        // A client (e.g. a game going fullscreen) asked for it — re-assert the
+        // output size + fullscreen state and ack, so it sizes its swapchain.
+        self.configure_fullscreen(&surface);
+        surface.send_configure();
+    }
+    fn maximize_request(&mut self, surface: ToplevelSurface) {
+        self.configure_fullscreen(&surface);
+        surface.send_configure();
+    }
+    fn move_request(&mut self, _surface: ToplevelSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
+    }
+    fn resize_request(
+        &mut self,
+        _surface: ToplevelSurface,
+        _seat: wl_seat::WlSeat,
+        _serial: Serial,
+        _edges: xdg_toplevel::ResizeEdge,
+    ) {
+    }
+    fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {}
+    fn reposition_request(
+        &mut self,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
+    ) {
+        surface.with_pending_state(|state| {
+            state.geometry = positioner.get_geometry();
+            state.positioner = positioner;
+        });
+        surface.send_repositioned(token);
+    }
+}
+delegate_xdg_shell!(State);
+delegate_viewporter!(State);
+
+/// Send the initial xdg configure on a surface's first commit (per protocol),
+/// for both toplevels and popups. Called from [`CompositorHandler::commit`].
+pub fn handle_commit(popups: &mut PopupManager, space: &Space<Window>, surface: &WlSurface) {
+    if let Some(window) = space
+        .elements()
+        .find(|w| w.toplevel().unwrap().wl_surface() == surface)
+        .cloned()
+    {
+        let initial_configure_sent = with_states(surface, |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .initial_configure_sent
+        });
+        if !initial_configure_sent {
+            window.toplevel().unwrap().send_configure();
+        }
+    }
+
+    popups.commit(surface);
+    if let Some(popup) = popups.find_popup(surface) {
+        match popup {
+            PopupKind::Xdg(ref xdg) => {
+                if !xdg.is_initial_configure_sent() {
+                    xdg.send_configure().expect("initial configure failed");
+                }
+            }
+            PopupKind::InputMethod(_) => {}
+        }
+    }
+}
+
+/// Run the headless compositor at the given mode until the process is killed.
+///
+/// `refresh_mhz` is millihertz (60_000 = 60.000 Hz), matching `pal::Mode`.
+pub fn run_headless(width: u32, height: u32, refresh_mhz: u32) -> anyhow::Result<()> {
+    let mut event_loop: EventLoop<CalloopData> = EventLoop::try_new()?;
+    let display: Display<State> = Display::new()?;
+    let dh = display.handle();
+    let mut state = State::new(&mut event_loop, display);
+
+    // The synthesized virtual output. We own the mode, so there is no EDID to
+    // misreport and no DRM connector to crash on.
+    let output = Output::new(
+        "HEADLESS-1".to_string(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "Pharos".into(),
+            model: "Virtual".into(),
+        },
+    );
+    let _global = output.create_global::<State>(&dh);
+    let mode = OutputMode {
+        size: (width as i32, height as i32).into(),
+        refresh: refresh_mhz as i32,
+    };
+    output.change_current_state(
+        Some(mode),
+        Some(Transform::Normal),
+        None,
+        Some((0, 0).into()),
+    );
+    output.set_preferred(mode);
+    state.space.map_output(&output, (0, 0));
+
+    let socket = state.socket_name.clone();
+    info!(
+        "Pharos headless compositor up — WAYLAND_DISPLAY={:?}, virtual output {}x{}@{:.3}Hz",
+        socket,
+        width,
+        height,
+        refresh_mhz as f64 / 1000.0
+    );
+
+    let mut data = CalloopData {
+        state,
+        display_handle: dh,
+    };
+    event_loop.run(Some(Duration::from_millis(16)), &mut data, |data| {
+        data.state.space.refresh();
+        data.state.popups.cleanup();
+        let _ = data.display_handle.flush_clients();
+    })?;
+    Ok(())
+}
+
+/// Render `frames` frames of the compositor output and encode them to `out_path`
+/// as HEVC via `hevc_nvenc`. M1 step 2 (first cut): proves the render → encode
+/// chain on NVENC. Frame content is an animated clear colour (no shm clients are
+/// installed to composite yet); real client surfaces arrive with the GLES +
+/// dmabuf path.
+pub fn run_capture(
+    width: u32,
+    height: u32,
+    fps: u32,
+    frames: u32,
+    out_path: &str,
+) -> anyhow::Result<()> {
+    let mut event_loop: EventLoop<CalloopData> = EventLoop::try_new()?;
+    let display: Display<State> = Display::new()?;
+    let dh = display.handle();
+    let mut state = State::new(&mut event_loop, display);
+
+    let output = Output::new(
+        "HEADLESS-1".to_string(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "Pharos".into(),
+            model: "Virtual".into(),
+        },
+    );
+    let _global = output.create_global::<State>(&dh);
+    let mode = OutputMode {
+        size: (width as i32, height as i32).into(),
+        refresh: (fps * 1000) as i32,
+    };
+    output.change_current_state(
+        Some(mode),
+        Some(Transform::Normal),
+        None,
+        Some((0, 0).into()),
+    );
+    output.set_preferred(mode);
+    state.space.map_output(&output, (0, 0));
+
+    // Software renderer + an offscreen CPU buffer we read back each frame.
+    let mut renderer = PixmanRenderer::new()?;
+    let mut buffer =
+        renderer.create_buffer(Fourcc::Argb8888, (width as i32, height as i32).into())?;
+    let mut damage = OutputDamageTracker::from_output(&output);
+    let no_elements: Vec<SolidColorRenderElement> = Vec::new();
+
+    let mut encoder = HevcEncoder::new(width, height, fps, "bgra", out_path)?;
+    info!(
+        "capturing {} frames at {}x{} → {} via hevc_nvenc",
+        frames, width, height, out_path
+    );
+
+    let mut data = CalloopData {
+        state,
+        display_handle: dh,
+    };
+    let row = (width * 4) as usize;
+
+    for i in 0..frames {
+        // Service any connected Wayland clients.
+        event_loop.dispatch(Some(Duration::from_millis(1)), &mut data)?;
+        data.state.space.refresh();
+
+        // Animated clear colour so the encoded stream has real motion.
+        let t = (i as f32 / frames.max(1) as f32) * std::f32::consts::TAU;
+        let clear = [
+            0.5 + 0.5 * t.sin(),
+            0.5 + 0.5 * (t + 2.094).sin(),
+            0.5 + 0.5 * (t + 4.188).sin(),
+            1.0,
+        ];
+
+        let mut fb = renderer.bind(&mut buffer)?;
+        damage.render_output(&mut renderer, &mut fb, 0, &no_elements, clear)?;
+        let region = Rectangle::new((0, 0).into(), Size::from((width as i32, height as i32)));
+        let mapping = renderer.copy_framebuffer(&fb, region, Fourcc::Argb8888)?;
+        let bytes = renderer.map_texture(&mapping)?;
+
+        // Repack to tightly-packed BGRA, tolerating any row padding.
+        let stride = bytes.len() / height as usize;
+        if stride == row {
+            encoder.submit(bytes)?;
+        } else {
+            let mut packed = Vec::with_capacity(row * height as usize);
+            for y in 0..height as usize {
+                packed.extend_from_slice(&bytes[y * stride..y * stride + row]);
+            }
+            encoder.submit(&packed)?;
+        }
+
+        drop(fb);
+        let _ = data.display_handle.flush_clients();
+    }
+
+    encoder.finish()?;
+    info!("capture complete: {}", out_path);
+    Ok(())
+}
+
+/// GLES variant of [`run_capture`]: renders via a headless EGL/GLES context off
+/// a DRM render node. This is the vendor-neutral GPU path (Mesa on AMD/Intel,
+/// NVIDIA's EGL on NVIDIA) that will later import client dmabufs and feed NVENC
+/// zero-copy. For now it reads back via `glReadPixels` → `hevc_nvenc`.
+pub fn run_capture_gl(
+    width: u32,
+    height: u32,
+    fps: u32,
+    frames: u32,
+    out_path: &str,
+    launch: Option<&str>,
+) -> anyhow::Result<()> {
+    use smithay::backend::allocator::gbm::GbmDevice;
+    use smithay::backend::egl::{EGLContext, EGLDisplay};
+    use smithay::backend::renderer::gles::{GlesRenderbuffer, GlesRenderer};
+
+    let mut event_loop: EventLoop<CalloopData> = EventLoop::try_new()?;
+    let display: Display<State> = Display::new()?;
+    let dh = display.handle();
+    let mut state = State::new(&mut event_loop, display);
+
+    let output = Output::new(
+        "HEADLESS-1".to_string(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "Pharos".into(),
+            model: "Virtual".into(),
+        },
+    );
+    let _global = output.create_global::<State>(&dh);
+    let mode = OutputMode {
+        size: (width as i32, height as i32).into(),
+        refresh: (fps * 1000) as i32,
+    };
+    output.change_current_state(
+        Some(mode),
+        Some(Transform::Normal),
+        None,
+        Some((0, 0).into()),
+    );
+    output.set_preferred(mode);
+    state.space.map_output(&output, (0, 0));
+
+    // Headless EGL/GLES off a DRM render node — vendor-neutral GPU path.
+    let node = "/dev/dri/renderD128";
+    let drm_fd = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(node)
+        .map_err(|e| anyhow::anyhow!("open {node}: {e}"))?;
+    let gbm = GbmDevice::new(drm_fd)?;
+    let egl_display = unsafe { EGLDisplay::new(gbm)? };
+    let egl_context = EGLContext::new(&egl_display)?;
+    let mut renderer = unsafe { GlesRenderer::new(egl_context)? };
+    info!("GLES renderer initialized on {node}");
+
+    let mut target: GlesRenderbuffer =
+        renderer.create_buffer(Fourcc::Abgr8888, (width as i32, height as i32).into())?;
+    let mut damage = OutputDamageTracker::from_output(&output);
+
+    // Advertise linux-dmabuf with the renderer's formats so EGL/GPU clients
+    // (alacritty) can submit GPU buffers, imported at render time.
+    let formats: Vec<_> = renderer.dmabuf_formats().into_iter().collect();
+    let _dmabuf_global = state.dmabuf_state.create_global::<State>(&dh, formats);
+    // winewayland (and gamescope) require wp_viewporter to set up their surfaces;
+    // without it the client creates a toplevel then immediately tears it down (the
+    // symptom: `new_toplevel` fires, then the window count drops back to 0).
+    let _viewporter = ViewporterState::new::<State>(&dh);
+    // Advertise wp_color_manager_v1 (HDR color-management negotiation), matching the
+    // multi path. OFF by default (opt in with PHAROS_ENABLE_COLOR_MGMT): the
+    // handshake is incomplete and stalls real games (see the multi path + HANDOFF.md).
+    let _color_mgmt = if std::env::var_os("PHAROS_ENABLE_COLOR_MGMT").is_some() {
+        Some(crate::color_mgmt::init(&dh))
+    } else {
+        None
+    };
+
+    let socket_name = state.socket_name.clone();
+    let mut encoder = HevcEncoder::new(width, height, fps, "rgba", out_path)?;
+    info!(
+        "capturing {} GLES frames at {}x{} → {} via hevc_nvenc",
+        frames, width, height, out_path
+    );
+
+    let mut data = CalloopData {
+        state,
+        display_handle: dh,
+    };
+
+    // Optionally launch a client into our compositor.
+    let child = match launch {
+        Some(cmd) => {
+            info!("launching client `{cmd}` on {socket_name:?}");
+            let mut parts = cmd.split_whitespace();
+            let program = parts.next().unwrap_or(cmd);
+            Some(
+                std::process::Command::new(program)
+                    .args(parts)
+                    .env("WAYLAND_DISPLAY", &socket_name)
+                    .env_remove("DISPLAY")
+                    .spawn()
+                    .map_err(|e| anyhow::anyhow!("spawn {cmd}: {e}"))?,
+            )
+        }
+        None => None,
+    };
+
+    // Warm up: let the client connect, map a window, and draw before capturing.
+    let warmup = std::time::Instant::now();
+    while warmup.elapsed() < Duration::from_millis(2000) {
+        event_loop.dispatch(Some(Duration::from_millis(16)), &mut data)?;
+        data.state.space.refresh();
+        let _ = data.display_handle.flush_clients();
+    }
+
+    let row = (width * 4) as usize;
+    for _ in 0..frames {
+        event_loop.dispatch(Some(Duration::from_millis(1)), &mut data)?;
+        data.state.space.refresh();
+
+        // Render elements for the mapped client windows over a dark background.
+        let elements = space_render_elements(&mut renderer, [&data.state.space], &output, 1.0)
+            .map_err(|_| anyhow::anyhow!("output has no mode"))?;
+
+        let mut fb = renderer.bind(&mut target)?;
+        damage.render_output(
+            &mut renderer,
+            &mut fb,
+            0,
+            &elements,
+            [0.05, 0.05, 0.08, 1.0],
+        )?;
+        let region = Rectangle::new((0, 0).into(), Size::from((width as i32, height as i32)));
+        let mapping = renderer.copy_framebuffer(&fb, region, Fourcc::Abgr8888)?;
+        let bytes = renderer.map_texture(&mapping)?;
+
+        let stride = bytes.len() / height as usize;
+        if stride == row {
+            encoder.submit(bytes)?;
+        } else {
+            let mut packed = Vec::with_capacity(row * height as usize);
+            for y in 0..height as usize {
+                packed.extend_from_slice(&bytes[y * stride..y * stride + row]);
+            }
+            encoder.submit(&packed)?;
+        }
+        drop(fb);
+
+        // Ask clients to produce the next frame.
+        let now = data.state.start_time.elapsed();
+        for window in data.state.space.elements() {
+            window.send_frame(&output, now, Some(Duration::ZERO), |_, _| {
+                Some(output.clone())
+            });
+        }
+        let _ = data.display_handle.flush_clients();
+    }
+
+    encoder.finish()?;
+    if let Some(mut c) = child {
+        let _ = c.kill();
+    }
+    info!("GLES capture complete: {}", out_path);
+    Ok(())
+}
+
+/// UNIX-epoch nanoseconds from the wall clock — the shared clock domain every
+/// latency timestamp that crosses the link uses (matches the client's reads and
+/// transport's `FrameStageMeta` stamps). A monotonic `Instant` has no shared
+/// epoch across two machines, so the bench must read `SystemTime`.
+pub(crate) fn unix_nanos_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// Translate one Trireme InputEvent into a smithay seat dispatch.
+///
+/// Trireme's wire scancode is a Linux evdev code (+ 0 — the host adds the xkb
+/// `+8` offset here). PointerAbs is normalised 0..=1 over the source
+/// dimensions; we scale to compositor pixels. PointerRel applies as a delta
+/// from the cached last absolute position; we don't try to teleport when only
+/// relative motion arrives (the cursor stays where it last was).
+fn dispatch_input(
+    data: &mut CalloopData,
+    width: u32,
+    height: u32,
+    focus_surface: Option<&smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+    ev: core_proto::InputEvent,
+) {
+    use smithay::backend::input::KeyState;
+    use smithay::input::keyboard::{FilterResult, Keycode};
+    use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
+    use smithay::utils::{Point, SERIAL_COUNTER};
+
+    let time = data.state.start_time.elapsed().as_millis() as u32;
+    match ev {
+        // Modifiers are tracked client-side; the host's xkb state derives mods
+        // from the key sequence we feed it, so we don't need `mods` here. (We
+        // forward the scancode and the press/release; that's enough.)
+        core_proto::InputEvent::Key {
+            scancode, pressed, ..
+        } => {
+            let Some(keyboard) = data.state.seat.get_keyboard() else {
+                return;
+            };
+            let state = if pressed {
+                KeyState::Pressed
+            } else {
+                KeyState::Released
+            };
+            keyboard.input::<(), _>(
+                &mut data.state,
+                Keycode::new(scancode + 8),
+                state,
+                SERIAL_COUNTER.next_serial(),
+                time,
+                |_, _, _| FilterResult::Forward,
+            );
+        }
+        core_proto::InputEvent::PointerAbs { x, y } => {
+            let Some(pointer) = data.state.seat.get_pointer() else {
+                return;
+            };
+            let loc = Point::from((x as f64 * width as f64, y as f64 * height as f64));
+            let focus = focus_surface.map(|s| (s.clone(), Point::from((0.0, 0.0))));
+            pointer.motion(
+                &mut data.state,
+                focus,
+                &MotionEvent {
+                    location: loc,
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time,
+                },
+            );
+            pointer.frame(&mut data.state);
+        }
+        core_proto::InputEvent::PointerRel { .. } => {
+            // Deferred: needs a cached "last absolute location" to add the
+            // delta into. The focus-mode capture sends absolute today anyway.
+        }
+        core_proto::InputEvent::PointerButton { button, pressed } => {
+            let Some(pointer) = data.state.seat.get_pointer() else {
+                return;
+            };
+            // evdev button codes: 0x110 = BTN_LEFT, 0x111 = BTN_RIGHT,
+            // 0x112 = BTN_MIDDLE, 0x113 = BTN_SIDE, 0x114 = BTN_EXTRA.
+            let evdev_button = 0x110u32 + button as u32;
+            let state = if pressed {
+                smithay::backend::input::ButtonState::Pressed
+            } else {
+                smithay::backend::input::ButtonState::Released
+            };
+            pointer.button(
+                &mut data.state,
+                &ButtonEvent {
+                    button: evdev_button,
+                    state,
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time,
+                },
+            );
+            pointer.frame(&mut data.state);
+        }
+        core_proto::InputEvent::Scroll { dx, dy } => {
+            let Some(pointer) = data.state.seat.get_pointer() else {
+                return;
+            };
+            let mut frame = AxisFrame::new(time).source(smithay::backend::input::AxisSource::Wheel);
+            if dy != 0.0 {
+                // Wayland wl_pointer axis is "discrete" units (notches) ↔ 15° per
+                // notch / 10 logical units; we hand it 10 * dy for one-notch-per-1.0.
+                frame = frame
+                    .value(smithay::backend::input::Axis::Vertical, -dy as f64 * 10.0)
+                    .v120(
+                        smithay::backend::input::Axis::Vertical,
+                        -(dy * 120.0) as i32,
+                    );
+            }
+            if dx != 0.0 {
+                frame = frame
+                    .value(smithay::backend::input::Axis::Horizontal, dx as f64 * 10.0)
+                    .v120(
+                        smithay::backend::input::Axis::Horizontal,
+                        (dx * 120.0) as i32,
+                    );
+            }
+            pointer.axis(&mut data.state, frame);
+            pointer.frame(&mut data.state);
+        }
+        // Controller input is routed to the virtual pads / gyro→mouse in the
+        // input drain loop before reaching here; arms kept for exhaustiveness.
+        core_proto::InputEvent::GamepadButton { .. }
+        | core_proto::InputEvent::GamepadAxis { .. }
+        | core_proto::InputEvent::GamepadConnect { .. }
+        | core_proto::InputEvent::GamepadDisconnect { .. }
+        | core_proto::InputEvent::GamepadMotion { .. }
+        | core_proto::InputEvent::ControllerTuning { .. } => {}
+    }
+}
+
+/// Inject a gyro-aim mouse delta: advance an absolute cursor (clamped to the
+/// output) AND emit relative motion, so both desktop apps and pointer-locked
+/// games (which read `wl_relative_pointer`) follow the gyro.
+fn dispatch_gyro_mouse(
+    data: &mut CalloopData,
+    width: u32,
+    height: u32,
+    focus_surface: Option<&smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+    cursor: &mut (f64, f64),
+    dx: f64,
+    dy: f64,
+) {
+    use smithay::input::pointer::{MotionEvent, RelativeMotionEvent};
+    use smithay::utils::{Point, SERIAL_COUNTER};
+    let Some(pointer) = data.state.seat.get_pointer() else {
+        return;
+    };
+    let time = data.state.start_time.elapsed().as_millis() as u32;
+    cursor.0 = (cursor.0 + dx).clamp(0.0, f64::from(width));
+    cursor.1 = (cursor.1 + dy).clamp(0.0, f64::from(height));
+    let focus = focus_surface.map(|s| (s.clone(), Point::from((0.0, 0.0))));
+    pointer.motion(
+        &mut data.state,
+        focus.clone(),
+        &MotionEvent {
+            location: Point::from((cursor.0, cursor.1)),
+            serial: SERIAL_COUNTER.next_serial(),
+            time,
+        },
+    );
+    pointer.relative_motion(
+        &mut data.state,
+        focus,
+        &RelativeMotionEvent {
+            delta: Point::from((dx, dy)),
+            delta_unaccel: Point::from((dx, dy)),
+            utime: u64::from(time) * 1000,
+        },
+    );
+    pointer.frame(&mut data.state);
+}

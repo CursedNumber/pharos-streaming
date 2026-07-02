@@ -1,0 +1,422 @@
+# rust-i18n locale file (v2: one file per module, each key carries per-locale
+# values). English is the default + fallback. To add a language, add its code
+# (e.g. `"fr"`) alongside `en` under each key — it then appears automatically in
+# Settings → Appearance → Language (driven by `available_locales!()`).
+#
+# This file is owned exclusively by the Input tab (crates/pharos-panel/src/tabs/
+# input.rs). Every key is namespaced `input.*` so it never clashes with another
+# tab's strings. Purely dynamic values (the user's own chords, the OS injector
+# name/api identifiers, and the core_proto wire-type names) stay as Rust
+# formatting — only the static labels and descriptions around them live here.
+_version = 2
+
+# --- Header -----------------------------------------------------------------
+["input.heading"]
+en = "Input"
+nb = "Inndata"
+
+["input.intro_desc"]
+en = "How keyboard and mouse from a Trireme client reach this host. Most of this tab is the connecting client's input-forwarding config — what its keystrokes/pointer do and which chords stay local — saved as a reference (the host doesn't push it to clients yet). The genuinely host-side part is the injector that receives whatever the client forwards."
+nb = "Hvordan tastatur og mus fra en Trireme-klient når denne verten. Det meste av denne fanen er den tilkoblede klientens konfigurasjon for videresending av inndata — hva tastetrykkene/pekeren gjør og hvilke tastekombinasjoner som blir lokale — lagret som referanse (verten dytter den ikke ut til klienter ennå). Den faktisk vert-siden delen er injektoren som mottar det klienten videresender."
+
+# Reframe banner + the two grouping sub-headings (host vs client).
+["input.client_banner"]
+en = "These settings configure the connecting Trireme client, not this host — and aren't pushed to clients yet (saved as a reference)."
+nb = "Disse innstillingene konfigurerer den tilkoblede Trireme-klienten, ikke denne verten — og dyttes ikke ut til klienter ennå (lagret som referanse)."
+
+["input.client_banner_desc"]
+en = "Pharos is the host control panel, but the forwarding mode, safety chords, and hotkeys below describe how a remote Trireme client behaves. There is no host→client config push yet, so editing them here records your intended client defaults in panel.toml; each client still loads its own config locally. The host-side injector (further down) is what actually receives and injects whatever a client forwards."
+nb = "Pharos er kontrollpanelet for verten, men videresendingsmodusen, sikkerhetstastene og hurtigtastene nedenfor beskriver hvordan en ekstern Trireme-klient oppfører seg. Det finnes ingen vert→klient-konfigurasjonsdytting ennå, så å redigere dem her lagrer dine tiltenkte klientstandarder i panel.toml; hver klient laster fortsatt sin egen konfigurasjon lokalt. Vert-sidens injektor (lenger ned) er det som faktisk mottar og injiserer det en klient videresender."
+
+["input.client_section"]
+en = "Client input defaults"
+nb = "Standarder for klientinndata"
+
+["input.client_section_desc"]
+en = "The remote Trireme client's input-forwarding behaviour: capture mode, which device classes forward, the safety chords kept local, and the client UI hotkeys. Saved as a reference; not pushed to clients yet."
+nb = "Den eksterne Trireme-klientens oppførsel for videresending av inndata: fangstmodus, hvilke enhetsklasser som videresendes, sikkerhetstastene som holdes lokalt, og hurtigtastene i klientgrensesnittet. Lagret som referanse; ikke dyttet ut til klienter ennå."
+
+["input.host_section"]
+en = "This host"
+nb = "Denne verten"
+
+["input.host_section_desc"]
+en = "The genuinely host-side part: the OS injector that turns whatever a client forwards into real keyboard/pointer events on this machine's desktop."
+nb = "Den faktisk vert-siden delen: OS-injektoren som gjør det en klient videresender om til faktiske tastatur-/pekerhendelser på denne maskinens skrivebord."
+
+# --- Forwarding policy ------------------------------------------------------
+["input.policy.heading"]
+en = "Forwarding policy"
+nb = "Retningslinjer for videresending"
+
+["input.policy.heading_desc"]
+en = "When the connecting Trireme client forwards keyboard/mouse to this host, and which input classes it sends. \"Focus\" means while the Trireme client *window* is focused — nothing to do with multi-monitor. These are the client's own modes; the panel records them as a reference and does not override a running client (no host→client push yet)."
+nb = "Når den tilkoblede Trireme-klienten videresender tastatur/mus til denne verten, og hvilke inndataklasser den sender. «Fokus» betyr mens Trireme-klientens *vindu* har fokus — det har ingenting med flere skjermer å gjøre. Dette er klientens egne moduser; panelet lagrer dem som referanse og overstyrer ikke en kjørende klient (ingen vert→klient-dytting ennå)."
+
+["input.policy.mode_label"]
+en = "Capture mode"
+nb = "Fangstmodus"
+
+["input.policy.mode_combo_desc"]
+en = "When the host accepts forwarded keyboard & mouse input from the client."
+nb = "Når verten godtar videresendt tastatur- og museinndata fra klienten."
+
+["input.policy.classes_label"]
+en = "Forward which inputs"
+nb = "Hvilke inndata skal videresendes"
+
+["input.policy.classes_desc"]
+en = "Independently enable or disable each class of input. A class that is off is never injected on the host, even in Always mode."
+nb = "Slå hver inndatatype av eller på uavhengig. En type som er av, injiseres aldri på verten, selv i Alltid-modus."
+
+["input.policy.keyboard"]
+en = "Keyboard"
+nb = "Tastatur"
+
+["input.policy.keyboard_desc"]
+en = "Forward key presses and releases. Turn off to keep the host keyboard local."
+nb = "Videresend tastetrykk og -slipp. Slå av for å holde vertens tastatur lokalt."
+
+["input.policy.mouse"]
+en = "Mouse"
+nb = "Mus"
+
+["input.policy.mouse_desc"]
+en = "Forward pointer position, relative motion, and mouse-button clicks. Turn off to keep the host pointer local."
+nb = "Videresend pekerposisjon, relativ bevegelse og museknappklikk. Slå av for å holde vertens peker lokalt."
+
+["input.policy.scroll"]
+en = "Scroll wheel"
+nb = "Rullehjul"
+
+["input.policy.scroll_desc"]
+en = "Forward scroll-wheel steps. Independent of the Mouse toggle."
+nb = "Videresend rullehjulsteg. Uavhengig av Mus-bryteren."
+
+["input.policy.off_warn"]
+en = "Capture mode is Off — nothing is forwarded."
+nb = "Fangstmodus er Av — ingenting videresendes."
+
+["input.policy.off_warn_desc"]
+en = "While the mode is Off the class toggles above have no effect; switch to Focus, Toggle, or Always to forward input."
+nb = "Mens modusen er Av, har bryterne over ingen effekt; bytt til Fokus, Veksle eller Alltid for å videresende inndata."
+
+# --- Capture modes ----------------------------------------------------------
+["input.mode.focus"]
+en = "Focus — while the Trireme window is focused"
+nb = "Fokus — mens Trireme-vinduet er i fokus"
+
+["input.mode.focus_desc"]
+en = "Forward input only while the Trireme window has focus, and release the keyboard and mouse the instant you alt-tab away. This is the default and the safest choice."
+nb = "Videresend inndata bare mens Trireme-vinduet har fokus, og slipp tastatur og mus i det øyeblikket du alt-tabber bort. Dette er standardvalget og det tryggeste."
+
+["input.mode.toggle"]
+en = "Toggle — hotkey to grab/release"
+nb = "Veksle — hurtigtast for å fange/slippe"
+
+["input.mode.toggle_desc"]
+en = "Input is not forwarded until you press the toggle-capture hotkey; it then stays captured until you press it again (or trigger a reserved local chord)."
+nb = "Inndata videresendes ikke før du trykker på veksle-fangst-hurtigtasten; den forblir deretter fanget til du trykker på den igjen (eller utløser en reservert lokal tastekombinasjon)."
+
+["input.mode.always"]
+en = "Always — forward unconditionally"
+nb = "Alltid — videresend ubetinget"
+
+["input.mode.always_desc"]
+en = "Always forward input whether or not the client window is focused. Good for a dedicated streaming box; risky on a daily driver, because the reserved local chords are then your only way to regain the client machine."
+nb = "Videresend alltid inndata uavhengig av om klientvinduet er i fokus eller ikke. Bra for en dedikert strømmemaskin; risikabelt på en daglig maskin, fordi de reserverte lokale tastekombinasjonene da er din eneste måte å få tilbake klientmaskinen på."
+
+["input.mode.off"]
+en = "Off — view only"
+nb = "Av — bare visning"
+
+["input.mode.off_desc"]
+en = "Forward nothing — the session is view-only. Video and audio still flow; the keyboard and mouse stay entirely on the client."
+nb = "Videresend ingenting — økten er bare for visning. Video og lyd flyter fortsatt; tastatur og mus blir helt værende på klienten."
+
+["input.mode.custom"]
+en = "Custom"
+nb = "Tilpasset"
+
+["input.mode.custom_desc"]
+en = "A non-standard mode loaded from panel.toml; it will round-trip unchanged."
+nb = "En ikke-standard modus lastet fra panel.toml; den bevares uendret."
+
+# --- Reserved local chords --------------------------------------------------
+["input.escapes.heading"]
+en = "Reserved local chords"
+nb = "Reserverte lokale tastekombinasjoner"
+
+["input.escapes.heading_desc"]
+en = "Key combinations handled by the Trireme client itself and never forwarded to this host — so you can always reach the client's task manager, lock screen, or window switcher. They stay local even in Always mode."
+nb = "Tastekombinasjoner som håndteres av Trireme-klienten selv og aldri videresendes til denne verten — slik at du alltid kan nå klientens oppgavebehandling, låseskjerm eller vindusveksler. De blir værende lokalt selv i Alltid-modus."
+
+["input.escapes.empty"]
+en = "None set — the client will forward everything."
+nb = "Ingen angitt — klienten videresender alt."
+
+["input.escapes.empty_desc"]
+en = "With no reserved chords, every combination is forwarded to the host. Add at least a lock-screen / task-manager chord, or use Reset to defaults."
+nb = "Uten reserverte tastekombinasjoner videresendes alle kombinasjoner til verten. Legg til minst en kombinasjon for låseskjerm / oppgavebehandling, eller bruk Tilbakestill til standard."
+
+["input.escapes.remove_name"]
+en = "Remove local chord {chord}"
+nb = "Fjern lokal tastekombinasjon {chord}"
+
+["input.escapes.remove_desc"]
+en = "Stop reserving this chord — it will be forwarded to the host again."
+nb = "Slutt å reservere denne kombinasjonen — den videresendes til verten igjen."
+
+["input.escapes.add_hint"]
+en = "add a chord…"
+nb = "legg til en tastekombinasjon…"
+
+["input.escapes.add_field_desc"]
+en = "Type a key combination (modifiers + key joined with “+”, e.g. Ctrl+Shift+Escape or Win+L) and press Enter or Add to reserve it."
+nb = "Skriv inn en tastekombinasjon (modifikatorer + tast satt sammen med «+», f.eks. Ctrl+Shift+Escape eller Win+L) og trykk Enter eller Legg til for å reservere den."
+
+["input.escapes.add"]
+en = "Add"
+nb = "Legg til"
+
+["input.escapes.add_desc"]
+en = "Reserve the typed chord so it stays on the client."
+nb = "Reserver den innskrevne kombinasjonen slik at den blir værende på klienten."
+
+["input.escapes.invalid"]
+en = "Not a valid chord — use modifiers (Ctrl/Shift/Alt/Super) + one key, e.g. Ctrl+Shift+Escape."
+nb = "Ikke en gyldig kombinasjon — bruk modifikatorer (Ctrl/Shift/Alt/Super) + én tast, f.eks. Ctrl+Shift+Escape."
+
+["input.escapes.invalid_desc"]
+en = "This chord is structurally malformed (an empty part, no main key, or two main keys), so it can never match and would be a dead binding. Note: a misspelled key name still passes this structural check but won't match a real key."
+nb = "Denne kombinasjonen er strukturelt feilformatert (en tom del, ingen hovedtast, eller to hovedtaster), så den kan aldri matche og ville vært en død binding. Merk: et feilstavet tastenavn passerer fortsatt denne strukturelle sjekken, men matcher ingen ekte tast."
+
+["input.escapes.reset"]
+en = "Reset to defaults"
+nb = "Tilbakestill til standard"
+
+["input.escapes.reset_desc"]
+en = "Restore the standard safety chords: Ctrl+Alt+Delete, Ctrl+Shift+Escape, Win+L, F11, Alt+Tab, Alt+Shift+Tab, Win+Tab."
+nb = "Gjenopprett standard sikkerhetstastene: Ctrl+Alt+Delete, Ctrl+Shift+Escape, Win+L, F11, Alt+Tab, Alt+Shift+Tab, Win+Tab."
+
+# --- Client hotkeys ---------------------------------------------------------
+["input.hotkeys.heading"]
+en = "Client hotkeys"
+nb = "Klienthurtigtaster"
+
+["input.hotkeys.heading_desc"]
+en = "Single key combinations the Trireme client acts on itself for session control. Like the reserved chords above, these are handled locally and never reach the host."
+nb = "Enkelttastekombinasjoner som Trireme-klienten selv reagerer på for øktstyring. Som de reserverte kombinasjonene over håndteres disse lokalt og når aldri verten."
+
+["input.hotkeys.toggle_capture"]
+en = "Toggle capture"
+nb = "Veksle fangst"
+
+["input.hotkeys.toggle_capture_desc"]
+en = "Grabs or releases forwarded input while in Toggle mode."
+nb = "Fanger eller slipper videresendt inndata i Veksle-modus."
+
+["input.hotkeys.toggle_fullscreen"]
+en = "Toggle fullscreen"
+nb = "Veksle fullskjerm"
+
+["input.hotkeys.toggle_fullscreen_desc"]
+en = "Switches the client window in and out of fullscreen."
+nb = "Bytter klientvinduet inn og ut av fullskjerm."
+
+["input.hotkeys.disconnect"]
+en = "Disconnect"
+nb = "Koble fra"
+
+["input.hotkeys.disconnect_desc"]
+en = "Ends the session and returns to the client's server list."
+nb = "Avslutter økten og går tilbake til klientens serverliste."
+
+["input.hotkeys.field_hint"]
+en = "e.g. Ctrl+Alt+End"
+nb = "f.eks. Ctrl+Alt+End"
+
+["input.hotkeys.field_desc"]
+en = "Enter a chord like Ctrl+Alt+End, F10, or Ctrl+Alt+Backspace."
+nb = "Skriv inn en tastekombinasjon som Ctrl+Alt+End, F10 eller Ctrl+Alt+Backspace."
+
+["input.hotkeys.invalid_desc"]
+en = "This chord is structurally malformed (an empty part, no main key, or two main keys) and can never match — it's a dead binding. Leave the field empty to disable the hotkey."
+nb = "Denne kombinasjonen er strukturelt feilformatert (en tom del, ingen hovedtast, eller to hovedtaster) og kan aldri matche — den er en død binding. La feltet stå tomt for å deaktivere hurtigtasten."
+
+# --- Save / revert ----------------------------------------------------------
+["input.save.button"]
+en = "Save input config"
+nb = "Lagre inndata-konfigurasjon"
+
+["input.save.button_desc"]
+en = "Write the forwarding policy, reserved chords, and hotkeys to panel.toml."
+nb = "Skriv retningslinjene for videresending, reserverte tastekombinasjoner og hurtigtaster til panel.toml."
+
+["input.save.ok"]
+en = "Saved input config to panel.toml."
+nb = "Lagret inndata-konfigurasjon til panel.toml."
+
+["input.save.err"]
+en = "Failed to save input config:"
+nb = "Kunne ikke lagre inndata-konfigurasjon:"
+
+["input.save.unsaved"]
+en = "unsaved changes"
+nb = "ulagrede endringer"
+
+["input.save.revert"]
+en = "Revert"
+nb = "Tilbakestill"
+
+["input.save.revert_desc"]
+en = "Discard your edits and reload the saved input config from panel.toml."
+nb = "Forkast endringene dine og last inn den lagrede inndata-konfigurasjonen fra panel.toml på nytt."
+
+["input.save.reverted"]
+en = "Reverted input config to the saved values."
+nb = "Tilbakestilte inndata-konfigurasjonen til de lagrede verdiene."
+
+# --- Injection backend (read-only) ------------------------------------------
+["input.backend.heading"]
+en = "Injection backend"
+nb = "Injeksjons-backend"
+
+["input.backend.active_label"]
+en = "Active injector"
+nb = "Aktiv injektor"
+
+["input.backend.auto_note"]
+en = "Chosen automatically by the build target — nothing to configure."
+nb = "Velges automatisk av byggemålet — ingenting å konfigurere."
+
+# Live injector-health probe (the badge colour + its description / inline note).
+["input.backend.health.ready"]
+en = "Probed OK: the host can inject input (/dev/uinput is writable)."
+nb = "Sondert OK: verten kan injisere inndata (/dev/uinput er skrivbar)."
+
+["input.backend.health.unknown"]
+en = "Injector health isn't probed on this platform — the compile-time backend is assumed available."
+nb = "Injektorhelsen sonderes ikke på denne plattformen — det kompilerte byggemålet antas tilgjengelig."
+
+["input.backend.health.no_device"]
+en = "No /dev/uinput — the uinput kernel module isn't loaded, so input can't be injected. Load it with `modprobe uinput`."
+nb = "Ingen /dev/uinput — uinput-kjernemodulen er ikke lastet, så inndata kan ikke injiseres. Last den med `modprobe uinput`."
+
+["input.backend.health.no_perm"]
+en = "/dev/uinput exists but isn't writable by this user — input injection will fail. Add a udev `uaccess` rule or join the `input` group (then re-log in)."
+nb = "/dev/uinput finnes, men er ikke skrivbar for denne brukeren — injisering av inndata vil mislykkes. Legg til en udev `uaccess`-regel eller bli med i `input`-gruppen (logg deretter inn på nytt)."
+
+["input.backend.health.error"]
+en = "Couldn't probe /dev/uinput (unexpected error) — input injection may not work."
+nb = "Kunne ikke sondere /dev/uinput (uventet feil) — injisering av inndata fungerer kanskje ikke."
+
+["input.backend.uinput_desc"]
+en = "Forwarded events become a virtual keyboard + pointer fed into the smithay compositor seat. The host process needs access to /dev/uinput (a udev rule or membership in the `input` group)."
+nb = "Videresendte hendelser blir et virtuelt tastatur + peker som mates inn i smithay-compositor-setet. Vertsprosessen trenger tilgang til /dev/uinput (en udev-regel eller medlemskap i `input`-gruppen)."
+
+["input.backend.sendinput_desc"]
+en = "Forwarded events are synthesised into the interactive desktop session via the Win32 SendInput() API. The host must run in the same session as the desktop being captured."
+nb = "Videresendte hendelser syntetiseres inn i den interaktive skrivebordsøkten via Win32 SendInput()-API-et. Verten må kjøre i samme økt som skrivebordet som fanges."
+
+["input.backend.cgevent_desc"]
+en = "Forwarded events would be posted via CGEventPost; host-side support is experimental on this platform."
+nb = "Videresendte hendelser ville blitt postet via CGEventPost; støtte på vertssiden er eksperimentell på denne plattformen."
+
+["input.backend.none_desc"]
+en = "No input-injection backend is available for this build target."
+nb = "Ingen backend for inndatainjeksjon er tilgjengelig for dette byggemålet."
+
+# --- InputEvent reference (collapsed) ---------------------------------------
+["input.event.heading"]
+en = "What the link forwards (reference)"
+nb = "Hva forbindelsen videresender (referanse)"
+
+["input.event.intro"]
+en = "Informational only — the message kinds the link carries, not settings. Hover any row for the full detail."
+nb = "Kun til informasjon — meldingstypene forbindelsen bærer, ikke innstillinger. Hold pekeren over en rad for full detalj."
+
+["input.event.intro_desc"]
+en = "A read-only reference of the core_proto::InputEvent message kinds carried over the QUIC back-channel. These describe the wire protocol; none of them are settings you change here."
+nb = "En skrivebeskyttet referanse over core_proto::InputEvent-meldingstypene som bæres over QUIC-bakkanalen. Disse beskriver wire-protokollen; ingen av dem er innstillinger du endrer her."
+
+["input.event.wire_prefix"]
+en = "Wire type:"
+nb = "Wire-type:"
+
+["input.event.keys.title"]
+en = "Keyboard keys"
+nb = "Tastaturtaster"
+
+["input.event.keys.line"]
+en = "Each key press and release, with modifiers."
+nb = "Hvert tastetrykk og -slipp, med modifikatorer."
+
+["input.event.keys.detail"]
+en = "Carries the key's scancode (the Linux evdev code; the host adds the xkb +8 offset, and non-Linux clients translate their native code to evdev first) plus the Ctrl / Shift / Alt / Meta modifier state (Meta = Win / Super / Command)."
+nb = "Bærer tastens scancode (Linux evdev-koden; verten legger til xkb +8-forskyvningen, og klienter som ikke kjører Linux oversetter sin egen kode til evdev først) pluss modifikatortilstanden Ctrl / Shift / Alt / Meta (Meta = Win / Super / Command)."
+
+["input.event.pos.title"]
+en = "Mouse position"
+nb = "Museposisjon"
+
+["input.event.pos.line"]
+en = "Where the cursor is, as a fraction of the screen."
+nb = "Hvor markøren er, som en brøkdel av skjermen."
+
+["input.event.pos.detail"]
+en = "Absolute pointer position normalised 0.0–1.0 across the source rectangle; the client has already removed any letterbox bars and window margins."
+nb = "Absolutt pekerposisjon normalisert 0.0–1.0 over kilderektangelet; klienten har allerede fjernet eventuelle letterbox-striper og vindusmarger."
+
+["input.event.motion.title"]
+en = "Mouse movement"
+nb = "Musebevegelse"
+
+["input.event.motion.line"]
+en = "Relative motion for locked-cursor aiming."
+nb = "Relativ bevegelse for sikting med låst markør."
+
+["input.event.motion.detail"]
+en = "Relative pointer motion in pixels — used for pointer-locked, game-style aiming where there is no on-screen cursor to place absolutely."
+nb = "Relativ pekerbevegelse i piksler — brukes til peker-låst sikting av spilltype der det ikke finnes noen markør på skjermen å plassere absolutt."
+
+["input.event.buttons.title"]
+en = "Mouse buttons"
+nb = "Museknapper"
+
+["input.event.buttons.line"]
+en = "Left / Right / Middle / Back / Forward clicks."
+nb = "Klikk med Venstre / Høyre / Midtre / Tilbake / Frem."
+
+["input.event.buttons.detail"]
+en = "A mouse-button transition: 0 = Left, 1 = Right, 2 = Middle, 3 = Back, 4 = Forward (matching evdev BTN_LEFT / RIGHT / MIDDLE / SIDE / EXTRA)."
+nb = "En overgang for en museknapp: 0 = Venstre, 1 = Høyre, 2 = Midtre, 3 = Tilbake, 4 = Frem (samsvarer med evdev BTN_LEFT / RIGHT / MIDDLE / SIDE / EXTRA)."
+
+["input.event.scroll.title"]
+en = "Scroll wheel"
+nb = "Rullehjul"
+
+["input.event.scroll.line"]
+en = "Wheel steps, one detent at a time."
+nb = "Hjulsteg, ett hakk om gangen."
+
+["input.event.scroll.detail"]
+en = "Wheel deltas in lines/columns where one detent equals 1.0; the client normalises platform units (Windows WHEEL_DELTA 120 → 1.0, Wayland discrete axis → 1.0)."
+nb = "Hjuldeltaer i linjer/kolonner der ett hakk tilsvarer 1.0; klienten normaliserer plattformenheter (Windows WHEEL_DELTA 120 → 1.0, Wayland diskret akse → 1.0)."
+
+# --- Gamepad cross-link -----------------------------------------------------
+["input.gamepad.lead"]
+en = "Gamepad & gyro forwarding (virtual Xbox pad, A/B swap, gyro-aim feel) lives in"
+nb = "Videresending av spillkontroller og gyro (virtuell Xbox-kontroller, A/B-bytte, gyro-sikte-følelse) finnes i"
+
+["input.gamepad.link"]
+en = "Controllers"
+nb = "Kontrollere"
+
+["input.gamepad.link_desc"]
+en = "Jump to the Controllers tab to tune per-controller profiles."
+nb = "Hopp til Kontrollere-fanen for å justere profiler per kontroller."
+
+["input.gamepad.tail"]
+en = "— not here."
+nb = "— ikke her."

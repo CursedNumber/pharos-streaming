@@ -1,0 +1,158 @@
+# rust-i18n locale file (v2: one file per module, each key carries per-locale
+# values). English is the default + fallback. To add a language, add its code
+# (e.g. `"fr"`) alongside `en` under each key — it then appears automatically in
+# Settings → Appearance → Language (driven by `available_locales!()`).
+_version = 2
+
+["app.title"]
+en = "Pharos Control"
+nb = "Pharos Control"
+
+["app.subtitle"]
+en = "control panel"
+nb = "kontrollpanel"
+
+["app.unsaved"]
+en = "● unsaved changes"
+nb = "● ulagrede endringer"
+
+["app.saved"]
+en = "✓ all saved"
+nb = "✓ alt lagret"
+
+["app.save_all"]
+en = "Save all"
+nb = "Lagre alt"
+
+["app.save_all_desc"]
+en = "Write every unsaved change — settings, input, controllers, and the compositor layout — to disk at once. Edits also save automatically when you close the window."
+nb = "Skriv alle ulagrede endringer — innstillinger, inndata, kontrollere og compositor-oppsettet — til disk samtidig. Endringer lagres også automatisk når du lukker vinduet."
+
+["app.saved_all"]
+en = "Saved all changes."
+nb = "Lagret alle endringer."
+
+["app.save_all_error"]
+en = "Save failed:"
+nb = "Lagring mislyktes:"
+
+# Top bar: the wordmark + the right-hand host/peer summary and its description.
+["app.wordmark"]
+en = "Pharos"
+nb = "Pharos"
+
+["app.unknown_host"]
+en = "unknown host"
+nb = "ukjent vert"
+
+["app.peer_one"]
+en = "peer"
+nb = "klient"
+
+["app.peer_many"]
+en = "peers"
+nb = "klienter"
+
+["app.topbar.host_desc_no_nics"]
+en = "This host's name. No advertised network interfaces were detected."
+nb = "Navnet på denne verten. Ingen annonserte nettverkskort ble oppdaget."
+
+# Followed at runtime by the comma-separated NIC list.
+["app.topbar.host_desc_nics_prefix"]
+en = "This host's name, and the number of paired clients. Advertised NICs:"
+nb = "Navnet på denne verten, og antallet parede klienter. Annonserte nettverkskort (NIC-er):"
+
+# Sidebar tab names (flat; none nested).
+["tab.status"]
+en = "Overview"
+nb = "Oversikt"
+
+["tab.compositor"]
+en = "Compositor"
+nb = "Compositor"
+
+["tab.video"]
+en = "Video"
+nb = "Video"
+
+["tab.audio"]
+en = "Audio"
+nb = "Lyd"
+
+["tab.input"]
+en = "Input"
+nb = "Inndata"
+
+["tab.controller"]
+en = "Controller"
+nb = "Kontroller"
+
+["tab.apps"]
+en = "Apps"
+nb = "Apper"
+
+["tab.settings"]
+en = "Settings"
+nb = "Innstillinger"
+
+# Accessibility: the keyboard landmark you land on when entering a panel from the
+# sidebar (Tab / Right arrow), and the sidebar's nav hint.
+["a11y.enter_panel"]
+en = "Panel content"
+nb = "Panelinnhold"
+
+["a11y.nav_hint"]
+en = "Use the up and down arrow keys to move between sections; press Tab or the right arrow to enter the panel."
+nb = "Bruk piltastene opp og ned for å flytte mellom seksjoner; trykk Tab eller høyre pil for å gå inn i panelet."
+
+# Sidebar item descriptions (hover + screen reader).
+["tab.status_desc"]
+en = "Overview: the Trireme clients paired with this host and their live state."
+nb = "Oversikt: Trireme-klientene som er paret med denne verten og deres sanntidstilstand."
+
+["tab.compositor_desc"]
+en = "Lay out a multi-display composite by dragging clients onto a virtual-desktop canvas."
+nb = "Sett opp et oppsett med flere skjermer ved å dra klienter inn på et virtuelt skrivebordslerret."
+
+["tab.video_desc"]
+en = "The encode → transport → decode pipeline and which codecs are available here."
+nb = "Pipelinen enkode → transport → dekode og hvilke kodeker som er tilgjengelige her."
+
+["tab.audio_desc"]
+en = "Host audio capture and streaming (Opus). Stub for now — outlines what's coming."
+nb = "Lydfangst og strømming på verten (Opus). Foreløpig en skisse — viser hva som kommer."
+
+["tab.input_desc"]
+en = "Keyboard & mouse forwarding policy, plus the safety chords kept on the client."
+nb = "Retningslinjer for videresending av tastatur og mus, samt sikkerhetstastene som holdes på klienten."
+
+["tab.controller_desc"]
+en = "Per-controller gamepad and gyro tuning profiles."
+nb = "Tuningprofiler for spillkontroller og gyro per kontroller."
+
+["tab.apps_desc"]
+en = "Create, edit, and launch applications into the virtual display — with box art, easy-mode Steam/installed-app suggestions, and a CLI slug."
+nb = "Opprett, rediger og start programmer inn på den virtuelle skjermen — med omslag, enkel modus med Steam-/installerte-app-forslag, og en CLI-slug."
+
+["tab.settings_desc"]
+en = "Appearance, language, resolution policy, encoding, security, network, and MQTT."
+nb = "Utseende, språk, retningslinjer for oppløsning, enkoding, sikkerhet, nettverk og MQTT."
+
+# Appearance section (Settings) — the language picker itself.
+["settings.appearance.language"]
+en = "Language"
+nb = "Språk"
+
+["settings.appearance.language_desc"]
+en = "Interface language. English is the default; other languages appear here once their locale files are added."
+nb = "Grensesnittspråk. Engelsk er standard; andre språk vises her når locale-filene deres er lagt til."
+
+# Display name for the English locale (other locales add their own under this key
+# space, e.g. ["lang.fr"] en = "French", fr = "Français").
+["lang.en"]
+en = "English"
+nb = "Engelsk"
+
+["lang.nb"]
+en = "Norwegian"
+nb = "Norsk"

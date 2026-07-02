@@ -1,0 +1,6 @@
+# trireme-kms config (optional). Copy to one of, in priority order:
+#   $TRIREME_KMS_CONFIG  ·  ./trireme-kms.toml  ·  /etc/trireme-kms.toml
+# All keys are optional; omitted keys use their defaults.
+
+# Show the idle badge between streams. false = a plain black idle screen.
+idle_badge = true

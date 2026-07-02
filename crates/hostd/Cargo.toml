@@ -1,0 +1,12 @@
+[package]
+name = "hostd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+core-proto = { workspace = true }
+media-capture = { path = "../media-capture" }
+media-encode = { path = "../media-encode" }
+media-audio = { path = "../media-audio" }
+input-inject = { path = "../input-inject" }

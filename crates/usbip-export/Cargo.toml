@@ -1,0 +1,25 @@
+[package]
+name = "usbip-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Trireme's USB export side: claim a local device via libusb and service USB/IP
+# URBs against it over the QUIC relay. Lean + headless (no GUI deps) so it builds
+# as a static musl binary for any export box.
+[[bin]]
+name = "trireme-usbexport"
+path = "src/main.rs"
+
+[dependencies]
+core-usbip = { path = "../core-usbip" }
+transport = { path = "../transport" }
+rusb = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
+tokio-util = "0.7"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# On-device settings (which devices to share + Pharos address), persisted.
+serde = { workspace = true }
+toml = "0.8"

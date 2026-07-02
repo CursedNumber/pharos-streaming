@@ -1,0 +1,18 @@
+[package]
+name = "gamepad-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Forward a paired evdev gamepad from the Trireme client (the couch Pi) to the
+# Pharos host as a uinput virtual device, over unreliable UDP datagrams — the
+# lowest-latency input path for couch streaming (one datagram per controller
+# report, fire-and-forget, no retransmit stalls over WiFi). LAN-only, no auth in
+# v1 (optional --peer IP filter); a QUIC-datagram + pairing upgrade can layer on.
+[[bin]]
+name = "gamepad-bridge"
+path = "src/main.rs"
+
+[dependencies]
+evdev = "0.12"
+anyhow = "1"

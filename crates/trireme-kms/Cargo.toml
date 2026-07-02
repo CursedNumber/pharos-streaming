@@ -1,0 +1,41 @@
+[package]
+name = "trireme-kms"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Headless DRM/KMS scanout client. Runs on a display-less box (e.g. a headless
+# GPU box with the GTX 1080) that owns an HDMI output: receive the Pharos HEVC stream over
+# QUIC, decode on NVDEC (ffmpeg hevc_cuvid), and present each frame to the
+# connector via the **atomic** DRM API (atomic page-flips, vblank-locked). No
+# Wayland/X display server — the wrong tool here is `trireme play` (winit/wgpu).
+# Linux-only (DRM/KMS); the binary stubs out elsewhere so the workspace builds.
+[[bin]]
+name = "trireme-kms"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+transport = { path = "../transport" }
+# Shared wire-port constants (default stream port).
+core-proto = { path = "../core-proto" }
+# Present our long-term identity on connect so an enforcing host authorizes us.
+core-crypto = { path = "../core-crypto" }
+# HEVC HW-decoder capability probe (picks hevc_cuvid/rkmpp/v4l2 at runtime).
+media-decode = { path = "../media-decode" }
+hex = "0.4"
+drm = "0.14"
+# Rasterize the idle "Ready to connect" text from a system sans font (pure Rust).
+ab_glyph = "0.2"
+# Optional TOML config (trireme-kms.toml) — mirrors the trireme-usb.toml pattern.
+serde = { workspace = true }
+toml = "0.8"
+gbm = { version = "0.18", features = ["drm-support"] }
+khronos-egl = { version = "6", features = ["dynamic"] }
+glow = "0.16"
+libloading = "0.8"
+nix = { version = "0.29", features = ["poll", "event"] }

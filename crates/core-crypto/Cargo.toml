@@ -1,0 +1,24 @@
+[package]
+name = "core-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
+toml = "0.8"
+# PAKE — RustCrypto SPAKE2 (RFC 9382, balanced variant).
+spake2 = "0.4"
+# Long-term peer identities.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# Key derivation from the PAKE-shared secret.
+hkdf = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+# Constant-time comparison for confirmation MACs.
+subtle = "2"
+# Hex encoding for on-disk identity files + display.
+hex = "0.4"
+rand_core = { version = "0.6", features = ["getrandom"] }

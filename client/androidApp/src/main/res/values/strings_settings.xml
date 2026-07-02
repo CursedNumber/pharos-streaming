@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Settings pane strings. Owned by the Navbar agent (contract C). Rows route to
+  the in-shell Controllers pane / UsbExportActivity, a pace selector, and an
+  about block.
+-->
+<resources>
+    <string name="settings_title">Settings</string>
+
+    <!-- Pace (presentation pacing) row. -->
+    <string name="settings_pace">Pace</string>
+    <string name="settings_pace_summary">How the stream trades latency for smoothness.</string>
+    <string name="settings_pace_low_latency">Low latency</string>
+    <string name="settings_pace_balanced">Balanced</string>
+    <string name="settings_pace_smooth">Smooth</string>
+    <string name="settings_pace_vrr">Variable refresh (VRR)</string>
+    <!-- stateDescription for the pace row, announcing the current choice. -->
+    <string name="settings_pace_state">Current pace: %1$s</string>
+    <!-- Detected panel refresh capability, shown under the pace row. %1$d = Hz. -->
+    <string name="settings_display_fixed">Display: %1$d Hz fixed</string>
+    <string name="settings_display_range">Display: up to %1$d Hz</string>
+
+    <!-- Controllers row → in-shell Controllers pane (NavDest.Controllers). -->
+    <string name="settings_controllers">Controllers</string>
+    <string name="settings_controllers_summary">Gamepad slots, button swaps, and gyro tuning.</string>
+
+    <!-- Stream-time gyro relay opt-in. Off by default; applies on next dial. -->
+    <string name="settings_gyro">Send controller gyro to host</string>
+    <string name="settings_gyro_summary">Applies on next stream connect. Slight overhead while on.</string>
+    <string name="settings_gyro_state_on">On</string>
+    <string name="settings_gyro_state_off">Off</string>
+
+    <!-- USB/IP master toggle. Off by default — no forwarding, no plug-in dialogs. -->
+    <string name="settings_usbip">USB/IP forwarding</string>
+    <string name="settings_usbip_summary">Master switch for sharing attached USB devices with the host. Off = no forwarding, no plug-in prompts.</string>
+
+    <!-- Controller handling master toggle. Off forwards pads raw. -->
+    <string name="settings_controller_handling">Controller handling</string>
+    <string name="settings_controller_handling_summary">Apply Trireme profiles, button swaps and gyro. Off forwards pads raw.</string>
+
+    <!-- USB export row → UsbExportActivity. -->
+    <string name="settings_usb">USB export</string>
+    <string name="settings_usb_summary">Forward attached USB devices to the host.</string>
+
+    <!-- About row. -->
+    <string name="settings_about">About Trireme</string>
+    <!-- versionName is interpolated, e.g. "Version 0.0.0". -->
+    <string name="settings_about_version">Version %1$s</string>
+    <string name="settings_about_summary">Pharos / Trireme low-latency streaming client.</string>
+
+    <!-- Generic "opens another screen" affordance, spoken on the row. -->
+    <string name="settings_opens_screen">Opens a separate screen</string>
+</resources>
