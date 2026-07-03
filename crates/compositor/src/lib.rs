@@ -943,7 +943,7 @@ fn dispatch_input(
 ) {
     use smithay::backend::input::KeyState;
     use smithay::input::keyboard::{FilterResult, Keycode};
-    use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
+    use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent};
     use smithay::utils::{Point, SERIAL_COUNTER};
 
     let time = data.state.start_time.elapsed().as_millis() as u32;
@@ -988,9 +988,39 @@ fn dispatch_input(
             );
             pointer.frame(&mut data.state);
         }
-        core_proto::InputEvent::PointerRel { .. } => {
-            // Deferred: needs a cached "last absolute location" to add the
-            // delta into. The focus-mode capture sends absolute today anyway.
+        core_proto::InputEvent::PointerRel { dx, dy } => {
+            let Some(pointer) = data.state.seat.get_pointer() else {
+                return;
+            };
+            // Advance the current absolute location by the delta (clamped to the
+            // output) AND emit relative motion, so both desktop apps and
+            // pointer-locked games (which read `wl_relative_pointer`) follow —
+            // the same primitive the gyro-aim path uses (see `dispatch_gyro_mouse`).
+            let cur = pointer.current_location();
+            let loc = Point::from((
+                (cur.x + dx as f64).clamp(0.0, f64::from(width)),
+                (cur.y + dy as f64).clamp(0.0, f64::from(height)),
+            ));
+            let focus = focus_surface.map(|s| (s.clone(), Point::from((0.0, 0.0))));
+            pointer.motion(
+                &mut data.state,
+                focus.clone(),
+                &MotionEvent {
+                    location: loc,
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time,
+                },
+            );
+            pointer.relative_motion(
+                &mut data.state,
+                focus,
+                &RelativeMotionEvent {
+                    delta: Point::from((dx as f64, dy as f64)),
+                    delta_unaccel: Point::from((dx as f64, dy as f64)),
+                    utime: u64::from(time) * 1000,
+                },
+            );
+            pointer.frame(&mut data.state);
         }
         core_proto::InputEvent::PointerButton { button, pressed } => {
             let Some(pointer) = data.state.seat.get_pointer() else {
