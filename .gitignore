@@ -23,3 +23,16 @@
 .idea/
 *.iml
 .DS_Store
+
+# Personal rig artifacts — kept out of the public tree (belt-and-suspenders so
+# `git add -A` can't resurrect them). Tracked icons/scripts/WORKAROUNDS remain.
+/launcher_simulation
+/rig/bravia-backup*/
+/rig/*.log
+/rig/*.png
+/rig/*.py
+/rig/hdr-traces-*/
+/rig/newui-shots/
+/rig/launch-crimson-wayland.sh
+/rig/run-host-stream.sh
+/.claude/
