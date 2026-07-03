@@ -1,70 +1,82 @@
 # Trireme — Kotlin client
 
-Kotlin Multiplatform client (Android first; desktop shares the core at M1). At
-**M0** this is a minimal Android app that performs the "hello core" round-trip
-against the shared Rust core through UniFFI.
+Kotlin Multiplatform client (Android first; a Rust desktop client lives in
+`crates/trireme`). The Android app is a full streaming client: host discovery +
+pairing, hardware HEVC/AV1 video decode → render, gamepad/keyboard/touch input
+back to the host, gyro-capable controller profiles, and USB device export over
+USB/IP. It runs on phones and Android TV (validated on a Sony Bravia and a Xiaomi
+phone). The app's `applicationId` is `no.aasle.trireme` (`.debug` suffix for the
+side-by-side debug variant).
 
-> ✅ **Builds.** A debug APK assembles with the cross-compiled Rust core bundled
-> (arm64-v8a + x86_64). Verified locally with the toolchain below. The only
-> remaining M0 step is running it on a device/emulator to see the round-trip live.
+The app talks to the host through the shared Rust core via **UniFFI** (a
+cross-compiled `.so` + generated Kotlin bindings).
 
-## Toolchain used (Arch / CachyOS)
+## Canonical build
 
-- JDK **17** (`jdk17-openjdk`) — newer JDKs (e.g. 26) are rejected by Gradle/AGP.
-  The build sets `JAVA_HOME=/usr/lib/jvm/java-17-openjdk` without changing the
-  system default.
-- Android SDK at `/opt/android-sdk` (`android-sdk-cmdline-tools-latest`), with
-  `platform-tools`, `platforms;android-35`, `build-tools;35.0.0`, NDK r30.
-- **rustup** (userland, via rustup.rs) for the Android Rust targets — installed
-  alongside the Arch `rust` package, not replacing it. Use `~/.cargo/bin/cargo`
-  for cross-compiles (it has the Android std; the Arch `cargo` does not).
+Use the repo's build script — it regenerates the UniFFI bindings and the
+per-ABI `.so` **in lockstep**, which avoids the "checksum mismatch" crash you get
+on the first FFI call when a stale binding meets a freshly built core:
+
+```sh
+rig/build-android.sh          # generates bindings + .so, assembles the debug APK
+```
+
+Then install on an attached device/emulator:
+
+```sh
+adb install -r client/androidApp/build/outputs/apk/debug/androidApp-debug.apk
+```
+
+For a Kotlin-only change (no Rust core change) you can skip regeneration and just
+assemble: `gradle :androidApp:assembleDebug`.
+
+### ABI note
+
+Add `armeabi-v7a` for **32-bit** devices (some older Android TVs, e.g. the Bravia
+X90J) — an `arm64-v8a` `.so` will not load there. `rig/build-android.sh` documents
+the target list it builds.
+
+## Toolchain
+
+- **JDK 17** — newer JDKs are rejected by Gradle/AGP. Point `JAVA_HOME` at a
+  JDK 17 without changing your system default.
+- **Android SDK** with `platform-tools`, `platforms;android-35`,
+  `build-tools;35.0.0`, and an NDK (set `ANDROID_HOME` / `ANDROID_NDK_HOME`).
+- **rustup** for the Android Rust targets (installs the Android `std`; a distro
+  `cargo` may not have it). Use rustup's `cargo` for the cross-compile.
 - `cargo-ndk`, Gradle **8.9**, AGP **8.6**, Kotlin **2.0.20**.
 
-## 1. Generate Kotlin bindings (from repo root)
+## Manual build (if you're not using the script)
 
-```sh
-cargo build -p core-ffi
-cargo run -p core-ffi --bin uniffi-bindgen -- \
-  generate --library target/debug/libcore_ffi.so \
-  --language kotlin --out-dir client/shared/generated/kotlin
-```
+1. **Generate Kotlin bindings** (from repo root):
 
-Produces `client/shared/generated/kotlin/uniffi/core_ffi/core_ffi.kt`
-(package `uniffi.core_ffi`), already wired into `androidApp`'s source set.
+   ```sh
+   cargo build -p core-ffi
+   cargo run -p core-ffi --bin uniffi-bindgen -- \
+     generate --library target/debug/libcore_ffi.so \
+     --language kotlin --out-dir client/shared/generated/kotlin
+   ```
 
-## 2. Cross-compile the Rust core into the app's jniLibs
+   Produces `client/shared/generated/kotlin/uniffi/core_ffi/core_ffi.kt`
+   (package `uniffi.core_ffi`), already wired into `androidApp`'s source set.
 
-```sh
-. "$HOME/.cargo/env"                       # use rustup's cargo
-export ANDROID_HOME=/opt/android-sdk
-export ANDROID_NDK_HOME=/opt/android-sdk/ndk/30.0.14904198
-cargo ndk -o client/androidApp/src/main/jniLibs \
-  -t arm64-v8a -t x86_64 \
-  build -p core-ffi --lib --release
-```
+2. **Cross-compile the core** into the app's jniLibs:
 
-Places `libcore_ffi.so` per-ABI where Gradle expects it. The generated Kotlin
-loads it by name `core_ffi` (via JNA). Add `-t armeabi-v7a` for 32-bit devices.
+   ```sh
+   cargo ndk -o client/androidApp/src/main/jniLibs \
+     -t arm64-v8a -t x86_64 \      # add -t armeabi-v7a for 32-bit devices
+     build -p core-ffi --lib --release
+   ```
 
-## 3. Build / install the app
+3. **Assemble / install** (from `client/`, with `JAVA_HOME`/`ANDROID_HOME` set):
 
-```sh
-cd client
-export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
-export ANDROID_HOME=/opt/android-sdk
-~/.local/gradle-8.9/bin/gradle :androidApp:assembleDebug   # -> debug APK
-# with a device/emulator attached:
-~/.local/gradle-8.9/bin/gradle :androidApp:installDebug
-```
-
-APK: `androidApp/build/outputs/apk/debug/androidApp-debug.apk`.
-Launching shows the core agent, version, protocol version, and a greeting — all
-returned across the FFI boundary from Rust, completing the M0 exit criterion
-"UniFFI→Kotlin hello core round-trips on Android".
+   ```sh
+   gradle :androidApp:assembleDebug     # -> androidApp/build/outputs/apk/debug/…
+   gradle :androidApp:installDebug      # with a device/emulator attached
+   ```
 
 ## Notes
 
-- Generated bindings + `*.so` + `local.properties` are git-ignored (reproducible
-  / machine-local). CI regenerates the Kotlin bindings as an artifact.
-- A `:shared` Kotlin Multiplatform module (Android + desktop shared logic) is
-  added at M1; for M0, `androidApp` consumes the bindings directly.
+- Generated bindings, `*.so`, and `local.properties` are git-ignored (they're
+  reproducible / machine-local). CI regenerates the Kotlin bindings as an artifact.
+- The generated Kotlin loads the core by name `core_ffi` (via JNA).

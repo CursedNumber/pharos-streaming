@@ -2,6 +2,30 @@
 //! testing. Defaults to 1920x1080@60; CLI/pal::Mode wiring comes later.
 
 #[cfg(target_os = "linux")]
+const USAGE: &str = "\
+pharos-compositor — Pharos headless Wayland compositor / capture harness
+
+USAGE:
+    pharos-compositor [COMMAND] [ARGS...]
+
+With no command, runs a headless compositor at 1920x1080@60.
+
+COMMANDS:
+    capture-zc-multi <cfg.toml>    multi-output capture/stream host (the main entry)
+    capture-zc [out] [frames] [client] [fps]    single-output zero-copy capture/stream
+    capture-gl [out] [frames] [client]          GLES capture path
+    capture [out] [frames]                      basic capture to HEVC/MP4
+    launch-app <slug>              ask the running host to launch a saved app
+    apps                           list saved apps (slug + name) from apps.toml
+    pair                           run the pairing flow
+    nvenc-test[-hdr] [out] [frames]             NVENC test pattern (SDR / HDR10)
+    input-demo [out] [frames]      inject keystrokes + capture the echo
+    -h, --help                     print this help
+    -V, --version                  print version
+
+An `out` of quic://host:port streams over QUIC; otherwise it is written to that path.";
+
+#[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
     if let Ok(filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
         tracing_subscriber::fmt().with_env_filter(filter).init();
@@ -142,6 +166,14 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or("pharos-nvenc-hdr10.hevc");
             let frames = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(120u32);
             compositor::nvenc::encode_test_pattern_hdr10(1920, 1080, 60, frames, out)
+        }
+        Some("--help") | Some("-h") | Some("help") => {
+            println!("{USAGE}");
+            Ok(())
+        }
+        Some("--version") | Some("-V") => {
+            println!("pharos-compositor {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
         }
         _ => compositor::run_headless(1920, 1080, 60_000),
     }
