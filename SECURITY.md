@@ -11,7 +11,7 @@ Please report security issues **privately**, not in a public issue:
 - Preferred: GitHub's **private vulnerability reporting** for this repository
   (repository **Security** tab → **Report a vulnerability**).
 - If that is unavailable, open a minimal public issue asking for a private contact
-  channel — do **not** include exploit details in it.
+  channel; do **not** include exploit details in it.
 
 Please include what you did, what you expected, and what happened. We'll acknowledge
 as soon as we can. There is no bug-bounty program.

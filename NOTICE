@@ -1,4 +1,4 @@
-Pharos / Trireme — third-party notices
+Pharos / Trireme: third-party notices
 ======================================
 
 This project is licensed under GPL-3.0-or-later (see LICENSE). It bundles or embeds
@@ -18,7 +18,7 @@ NVIDIA Video Codec interface headers
 
 Noto Sans Symbols fonts
   Path: crates/pharos-panel/assets/fonts/NotoSansSymbols*.ttf
-  © Google, SIL Open Font License v1.1 — see the accompanying OFL.txt in that
+  © Google, SIL Open Font License v1.1; see the accompanying OFL.txt in that
   directory.
 
 egui / eframe default fonts

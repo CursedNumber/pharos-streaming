@@ -1,4 +1,4 @@
-# Pharos / Trireme — Reference Documentation
+# Pharos / Trireme: Reference Documentation
 
 Detailed reference for the command-line tools, environment variables, and
 configuration files. For an overview and the feature list, see
@@ -38,7 +38,7 @@ configuration files. For an overview and the feature list, see
 | `compositor` | `pharos-compositor` | headless Smithay compositor → zero-copy NVENC HEVC/AV1 |
 | `trireme-kms` | `trireme-kms` | direct DRM/KMS scanout client (drive a real TV headless) |
 | `usbip-host` | `pharos-usbimport` | USB/IP import bridge (vhci-hcd virtual hub) |
-| `app-launcher` | — | launch apps/games into the virtual display; Steam redirect |
+| `app-launcher` |  | launch apps/games into the virtual display; Steam redirect |
 | `hostd` | `hostd` | proto self-test daemon (M0 skeleton) |
 
 **Windows host**
@@ -64,7 +64,7 @@ configuration files. For an overview and the feature list, see
 |---|---|---|
 | `trireme` | `trireme` | desktop/reference client: decode, render, input, USB export |
 | `usbip-export` | `trireme-usbexport` | share a local USB device to the host |
-| `client/` (Kotlin) | — | Android app (+ SwiftUI iOS baseline) |
+| `client/` (Kotlin) |  | Android app (+ SwiftUI iOS baseline) |
 
 ## Network ports
 
@@ -74,7 +74,7 @@ configuration files. For an overview and the feature list, see
 | **15778** | TCP | `CONTROL` | host↔panel control plane (`HostStatus`) |
 | **4432** | UDP/QUIC | `PAIR` | SPAKE2 pairing listener |
 | **4434** | UDP/QUIC | `USBIP` | USB/IP relay (export → import bridge) |
-| **4435** | UDP/QUIC | — | Windows host stream default bind |
+| **4435** | UDP/QUIC |  | Windows host stream default bind |
 | 4433 | UDP/QUIC | `STREAM_LEGACY` | **deprecated** legacy stream port |
 
 If you move the stream port, remember to open it on the firewall
@@ -90,7 +90,7 @@ Every binary supports the usual `RUST_LOG` tracing filter. Details below.
 
 The Linux host: a headless Wayland compositor and NVENC capture/stream harness.
 With **no command** it runs a resident 1920×1080@60 virtual display (a
-`WAYLAND_DISPLAY` socket, output `HEADLESS-1`, no EDID/DRM connector) — the bare
+`WAYLAND_DISPLAY` socket, output `HEADLESS-1`, no EDID/DRM connector); the bare
 compositor only, it does **not** encode. For the real streaming host use
 `capture-zc-multi`.
 
@@ -152,7 +152,7 @@ USAGE: pharos-host <SUBCOMMAND> [ARGS...]
   stream [bind] [output_idx] [fps] [qsv|nvenc|amf] [dda|wgc]
                                          Start the QUIC video host. bind default
                                          0.0.0.0:4435; output_idx 0; fps 60; encoder
-                                         qsv (default); capture dda (default) — use
+                                         qsv (default); capture dda (default); use
                                          wgc to capture an IddCx virtual display or
                                          across adapters.
   wgc-test [monitor_idx] [frames] [out.bgra]
@@ -214,7 +214,7 @@ EXIT CODES: 0 success · 1 runtime error · 2 unknown subcommand.
 ### trireme-usbexport
 
 Claims local USB devices via libusb and services USB/IP URBs against them over the
-QUIC relay to a Pharos import bridge — one connection per device, with QoS-lite
+QUIC relay to a Pharos import bridge; one connection per device, with QoS-lite
 fast/bulk lanes.
 
 ```
@@ -231,8 +231,8 @@ EXIT CODES: 0 success · 1 runtime error · 2 no/invalid subcommand.
 ```
 
 Routing is advisory: `relay` (HID, mass-storage, hubs…), `pair-and-forward`
-(Bluetooth radio — pair on the client instead; USB/IP can't carry BT bonding),
-`unsupported (iso)` (USB-audio / UVC — framed and cleanly rejected).
+(Bluetooth radio; pair on the client instead; USB/IP can't carry BT bonding),
+`unsupported (iso)` (USB-audio / UVC; framed and cleanly rejected).
 
 ### pharos-usbimport
 
@@ -343,7 +343,7 @@ tracing `EnvFilter`) is honored by every binary.
 
 **Standard OS vars consulted:** `HOSTNAME`, `COMPUTERNAME`, `HOME`,
 `XDG_RUNTIME_DIR`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_DATA_DIRS`,
-`WAYLAND_DISPLAY` (startup tripwire — the host refuses to bind its own socket
+`WAYLAND_DISPLAY` (startup tripwire; the host refuses to bind its own socket
 name), and the Windows `LOCALAPPDATA` / `ProgramFiles*` / `PATH`.
 
 ---
@@ -352,10 +352,10 @@ name), and the Windows `LOCALAPPDATA` / `ProgramFiles*` / `PATH`.
 
 Host config files live in `$PHAROS_CONFIG_DIR` (default `~/.config/pharos/`,
 `%APPDATA%\pharos\` on Windows). All host config is **opt-in and non-fatal**: a
-missing or malformed file yields safe defaults with every feature off — config
+missing or malformed file yields safe defaults with every feature off; config
 problems never stop the host streaming.
 
-### config.toml — host config
+### config.toml: host config
 
 ```toml
 [mqtt]                       # Home Assistant integration (off by default)
@@ -375,7 +375,7 @@ bind_mac = "AA:BB:CC:DD:EE:FF"   # pin the QUIC listener to this NIC's IP
 max_pixels_per_sec = 497664000   # Σ(w·h)·fps ceiling (default = one 4K@60; placeholder)
 ```
 
-### multi.toml — the live compositor layout
+### multi.toml: the live compositor layout
 
 Passed on the CLI (`capture-zc-multi <config.toml>`) or loaded from the config
 dir. One `[[output]]` per virtual monitor; each gets its own NVENC session + QUIC
@@ -384,7 +384,7 @@ the codec across a panel relaunch.
 
 | key | type | default | meaning |
 |---|---|---|---|
-| `fps` | u32 (req) | — | shared frame rate (single pacer + NVENC rate) |
+| `fps` | u32 (req) |  | shared frame rate (single pacer + NVENC rate) |
 | `fps_auto` | bool | false | adaptive pacing between ~24 fps and `fps` |
 | `frames` | u32 | 0 | frame budget (0 = until killed) |
 | `video_codec` | `hevc`\|`av1` | `hevc` | codec for every output (AV1 needs Ada+) |
@@ -392,10 +392,10 @@ the codec across a panel relaunch.
 | `max_bitrate_kbps` | u32 | none (=avg→CBR) | capped-VBR ceiling |
 | `launch` | string | none | client launched into the shared socket |
 | `mode` | string | none | round-trip tag: `mirror`/`extend`/`single` |
-| `[[output]].name` | string (req) | — | output name |
-| `[[output]].w` / `.h` | u32 (req) | — | mode width / height |
+| `[[output]].name` | string (req) |  | output name |
+| `[[output]].w` / `.h` | u32 (req) |  | mode width / height |
 | `[[output]].x` / `.y` | i32 | 0 | virtual-desktop placement (overlap at 0,0 = mirror) |
-| `[[output]].addr` | string (req) | — | `quic://host:port` to stream, else a file path |
+| `[[output]].addr` | string (req) |  | `quic://host:port` to stream, else a file path |
 | `[[output]].peer` | string | none | pinned peer pubkey (applies the input gate) |
 | `[[output]].input_enabled` | bool | true | whether this peer's input reaches the seat |
 
@@ -412,15 +412,15 @@ y = 0
 addr = "quic://0.0.0.0:15777"
 ```
 
-### apps.toml — the launchable app/game catalog
+### apps.toml: the launchable app/game catalog
 
 An array of `[[app]]` tables shown in the panel and the Trireme grid. A synthetic
 `desktop` entry is always present. Only `slug`/`name`/`command` are required.
 
 | key | type | default | meaning |
 |---|---|---|---|
-| `slug` | string (req) | — | stable lowercase id (the `launch-app` key) |
-| `name` | string (req) | — | display name |
+| `slug` | string (req) |  | stable lowercase id (the `launch-app` key) |
+| `name` | string (req) |  | display name |
 | `kind` | `app`\|`game`\|`desktop`\|`media` | `app` | drives the default icon |
 | `command` | string | "" | launch line (whitespace-tokenized unless `shell`) |
 | `[app.launch]` | tagged table | none | structured launch: `steam-game`(`appid`) / `desktop-file`(`exec`) / `raw-command`(`line`) |
@@ -446,7 +446,7 @@ kind = "steam-game"
 appid = 1245620
 ```
 
-### peers.toml — the host's paired-clients registry
+### peers.toml: the host's paired-clients registry
 
 Re-read on every connection: only listed pubkeys may stream (unless
 `PHAROS_ALLOW_UNPAIRED=1`). Written after each successful pairing.
@@ -458,7 +458,7 @@ alias = "Living Room TV"
 paired_at = "2026-07-01T20:15:00Z"
 ```
 
-### controller-profiles.toml — per-controller tuning
+### controller-profiles.toml: per-controller tuning
 
 Pharos is the source of truth for gamepad feel (button swaps + gyro), keyed by the
 canonical `vendor:product` id, so a pad gets its saved feel the instant it
@@ -488,25 +488,25 @@ invert_y = true
 axis_h = 0
 ```
 
-### compositor-presets.toml — named layout library
+### compositor-presets.toml: named layout library
 
 Managed by `pharos-panel`. Each preset is a full `CompositorLayout` snapshot (fps +
 every output tile's position/size/addr/peer + per-device `input_enabled`), so you
 can save an arrangement (e.g. *couch mirror*, *dual extend*) and re-apply it.
 Distinct from `multi.toml` (the one live layout the compositor reads).
 
-### trireme-sources.toml — the client's multi-source grid
+### trireme-sources.toml: the client's multi-source grid
 
-Each `[[source]]` is one Pharos stream (its own QUIC connection + decode) — or a
+Each `[[source]]` is one Pharos stream (its own QUIC connection + decode), or a
 native VNC/SPICE console. The grid lays sources left→right, top→bottom.
 
 | key | type | default | meaning |
 |---|---|---|---|
 | `present` | enum | `low-latency` | window present mode (see [pacing](#input-capture--pacing)) |
-| `layout.cols` / `rows` | u32 (req) | — | grid dims (cols×rows ≥ #sources) |
+| `layout.cols` / `rows` | u32 (req) |  | grid dims (cols×rows ≥ #sources) |
 | `highlight_px` / `highlight_color` | u32 / hex | 0 / `#33FF66` | active-cell border |
 | `[[source]].name` | string | none | cell label |
-| `[[source]].addr` | `host:port` (req) | — | primary address (QUIC endpoint for Pharos) |
+| `[[source]].addr` | `host:port` (req) |  | primary address (QUIC endpoint for Pharos) |
 | `[[source]].protocol` | `pharos`\|`vnc`\|`spice` | `pharos` | source type (spice needs the `spice` feature) |
 | `[[source]].password` | string | none | auth for vnc/spice |
 | `[[source]].alt_addrs` | `[host:port]` | [] | failover addresses for the same host |
@@ -553,18 +553,18 @@ authorized by a per-connection Ed25519 challenge against `peers.toml` on the hos
 
 Enforcement is **on by default**; `PHAROS_ALLOW_UNPAIRED=1` disables it (dev/test
 only). The QUIC TLS certificate is a **throwaway opaque tunnel**, never a trust
-anchor — the identity pinning above is the trust, not the cert. This is why the
+anchor; the identity pinning above is the trust, not the cert. This is why the
 control panel is a native app over the paired channel rather than a browser
 console: no self-signed-cert wall.
 
 ## Input capture & pacing
 
 **Input capture modes** (`[input].mode` in the client sources config):
-- `focus` (default) — forward when the window is focused *and* the pointer is in a
+- `focus` (default); forward when the window is focused *and* the pointer is in a
   source cell.
-- `toggle` — off until the `toggle_capture` hotkey turns it on.
-- `always` — forward whenever connected.
-- `off` — view-only, never forward.
+- `toggle`; off until the `toggle_capture` hotkey turns it on.
+- `always`; forward whenever connected.
+- `off`; view-only, never forward.
 
 `local_escapes` chords (Ctrl+Alt+Delete, Ctrl+Shift+Escape, Alt+Tab, F11, …) always
 stay local so you can reach your own desktop. Per-class gates
@@ -583,5 +583,5 @@ pointer (move/buttons/scroll); the Linux and Windows hosts also inject **relativ
 pointer motion (`PointerRel`) for pointer-locked/FPS games. Android/TV clients are
 gamepad-first (buttons, axes, gyro→mouse) and forward hardware-keyboard scancodes,
 but do not send mouse pointer events. All client input is gated **host-side per
-device** — it is silently discarded until that peer is input-enabled (via the
+device**: it is silently discarded until that peer is input-enabled (via the
 panel or `multi.toml`).
