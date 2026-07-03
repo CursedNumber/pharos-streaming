@@ -6,11 +6,13 @@ They are kept for provenance and context, **not** as current documentation.
 Network addresses and local paths in these files have been de-personalized
 (RFC 5737 `192.0.2.x`, generic home paths); they may otherwise be out of date.
 
-For current status and architecture, see the top-level [`README.md`](../../README.md)
-and [`BATTLE_PLAN.md`](../../BATTLE_PLAN.md).
+For current status and architecture, see the top-level [`README.md`](../../README.md).
 
 | File | What it was |
 |---|---|
+| `BATTLE_PLAN.md` | Original architecture + milestone roadmap (status column is a historical snapshot) |
+| `TEST_MATRIX.md` | Cross-hardware test-coverage tracker |
+| `MIRROR_EXTEND_PLAN.md` | Multi-client mirror/extend design note |
 | `HANDOFF.md` | Last dev-session handoff (HDR10 end-to-end + the controller-input saga) |
 | `TODO.md` | Long-running engineering TODO / journal |
 | `ADAPTIVE_QUALITY_SCOPE.md` | Adaptive bitrate/resolution scoping — **executed** (resolution ladder shipped) |

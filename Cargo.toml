@@ -1,5 +1,5 @@
 # Pharos (host) / Trireme (client) — clean-slate KVM-over-IP + game streaming.
-# See BATTLE_PLAN.md for the architecture this layout mirrors (§3).
+# See docs/history/BATTLE_PLAN.md for the original architecture this layout mirrors (§3).
 [workspace]
 resolver = "2"
 members = [

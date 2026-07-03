@@ -1,0 +1,28 @@
+Pharos / Trireme — third-party notices
+======================================
+
+This project is licensed under GPL-3.0-only (see LICENSE). It bundles or embeds
+the following third-party material, each under its own license:
+
+Brand artwork (lighthouse mark + idle screen)
+  Files: rig/icons/*.svg, rig/icons/pharos-app.png, and the Android/iOS app icons.
+  AI-generated for this project; considered original project artwork and released
+  under the project's GPL-3.0-only license.
+
+NVIDIA Video Codec interface headers
+  Path: vendor/nvidia-video-codec-sdk/ (a vendored copy of the crates.io crate
+  `nvidia-video-codec-sdk`, © 2023 Viliam Vadocz, MIT). The bundled NVIDIA headers
+  (nvEncodeAPI.h, cuviddec.h, nvcuvid.h) carry NVIDIA's own MIT permission notice
+  for the interface headers (© 2010-2023 NVIDIA Corporation). See that directory's
+  LICENSE and header files. No proprietary SDK components are included.
+
+Noto Sans Symbols fonts
+  Path: crates/pharos-panel/assets/fonts/NotoSansSymbols*.ttf
+  © Google, SIL Open Font License v1.1 — see the accompanying OFL.txt in that
+  directory.
+
+egui / eframe default fonts
+  Bundled transitively by the `egui` crate for the desktop panel; licensed
+  (MIT OR Apache-2.0) AND OFL-1.1 AND LicenseRef-UFL-1.0 by their upstreams.
+
+For the full dependency license set, run `cargo metadata` / `cargo tree`.

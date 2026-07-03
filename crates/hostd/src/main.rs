@@ -33,5 +33,5 @@ fn main() {
     println!("proto round-trip:   OK ({} bytes)", bytes.len());
 
     println!();
-    println!("Pharos host self-test passed. Architecture & status: BATTLE_PLAN.md.");
+    println!("Pharos host self-test passed. See README.md.");
 }

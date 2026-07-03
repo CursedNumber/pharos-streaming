@@ -11,8 +11,8 @@ Polaris·Nova forks), written in **Rust** (host + shared core) and **Kotlin** (c
 - **core** — one Rust core (protocol, crypto/pairing, session, USB/IP framing)
   shared by both ends via UniFFI.
 
-See [`BATTLE_PLAN.md`](BATTLE_PLAN.md) for the full architecture and roadmap, and
-[`docs/history/`](docs/history/) for archived design notes.
+The original architecture/roadmap and other design notes are archived under
+[`docs/history/`](docs/history/) (kept for context; may be out of date).
 
 ## Status
 
