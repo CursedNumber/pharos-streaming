@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! `quic-recv [server_addr] [out_file] [max_mb]` — connect to a Pharos QUIC
 //! streamer and save the received HEVC stream. For verifying the host transport.
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! `trireme-usbexport` — the Trireme USB export side.
 //!
 //! Claims selected local USB devices via libusb and services USB/IP URBs against

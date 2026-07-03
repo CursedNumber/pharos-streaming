@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Linux redirect provider: a POSIX-sh Launch-Options shim + idempotent
 //! `localconfig.vdf` injection, with the Steam-running clobber guard.
 

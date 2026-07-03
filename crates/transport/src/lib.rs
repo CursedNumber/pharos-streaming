@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! QUIC transport (quinn) for Pharos → Trireme.
 //!
 //! #2 step 1: prove the encoded HEVC bitstream round-trips over QUIC. The host

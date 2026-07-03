@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! USB/IP framing + device-class policy (BATTLE_PLAN §8).
 //!
 //! Direction is reversed vs textbook USB/IP: the CLIENT exports its local

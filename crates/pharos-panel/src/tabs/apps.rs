@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Apps tab — a box-art launcher grid plus a full visual "Create application"
 //! editor.
 //!

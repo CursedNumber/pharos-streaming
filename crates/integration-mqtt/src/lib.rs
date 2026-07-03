@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! MQTT integration for Pharos/Trireme → Home Assistant.
 //!
 //! Publishes **HA MQTT-Discovery** entities (so they auto-appear in Home

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Pharos Control — the host-side control panel.
 //!
 //! A cross-platform egui/eframe desktop app for managing a Pharos streaming

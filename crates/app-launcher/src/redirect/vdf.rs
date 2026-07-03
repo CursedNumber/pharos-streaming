@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Minimal, *surgical* editor for Steam's `localconfig.vdf` — just enough to set
 //! one game's `LaunchOptions` idempotently without reflowing the rest of the file.
 //!

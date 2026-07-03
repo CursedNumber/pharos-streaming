@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! The eframe application shell: top bar (host identity), left sidebar (tab
 //! switcher), central panel (the selected tab's body), and a bottom status bar
 //! with the Save indicator. Applies the user's chosen theme + font scale (see

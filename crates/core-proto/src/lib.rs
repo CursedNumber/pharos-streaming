@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Wire protocol for Pharos <-> Trireme (clean-slate, QUIC transport).
 //!
 //! See BATTLE_PLAN.md §5. This crate is transport-agnostic: it defines the

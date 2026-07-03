@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Live control client — the panel's bridge to a running host.
 //!
 //! The reconnecting client (the worker, the UDS/TCP transport, the cached

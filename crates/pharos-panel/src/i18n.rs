@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Internationalisation (i18n) — modular, English-default.
 //!
 //! Backed by `rust-i18n`. The `rust_i18n::i18n!("locales", fallback = "en")`

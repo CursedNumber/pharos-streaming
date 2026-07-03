@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! `pharos-host` — the Pharos streaming host for Windows (BATTLE_PLAN.md M3).
 //!
 //! Pipeline: capture a display → HEVC (Quick Sync / NVENC via an ffmpeg

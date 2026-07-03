@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Live-preview JPEG writer.
 //!
 //! The render loop hands a captured RGBA frame here (opt-in + 20s-capped, ~2fps,

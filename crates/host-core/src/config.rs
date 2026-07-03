@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Optional host config (`config.toml` in the Pharos config dir).
 //!
 //! Everything here is **opt-in**: a missing or partial file yields safe defaults

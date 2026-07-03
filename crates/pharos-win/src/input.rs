@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Input injection via Win32 `SendInput`.
 //!
 //! The Trireme back-channel carries `core_proto::InputEvent`s whose `Key`

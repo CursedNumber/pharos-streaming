@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! The persisted application catalog (`apps.toml`).
 //!
 //! Shape on disk (an array of tables so it reads cleanly and merges by hand):

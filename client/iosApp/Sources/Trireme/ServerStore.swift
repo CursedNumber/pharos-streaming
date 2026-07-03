@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //
 // UserDefaults-backed persistence for the registry on iOS. Stores a single
 // JSON-encoded Registry under "trireme.servers"; identity.toml lives in the

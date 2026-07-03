@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! CUDA ↔ EGL interop bridge (M1 #1, Stage B).
 //!
 //! NVIDIA can't render into an imported dmabuf, so the render target is a

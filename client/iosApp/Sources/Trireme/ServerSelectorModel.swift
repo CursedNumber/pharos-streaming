@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //
 // View model for ServerSelectorView. Holds the in-memory registry, tracks
 // modal targets (add / edit / delete / pair), and bridges to the Rust core

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Default wire ports for the Pharos ⇄ Trireme transports.
 //!
 //! These were previously repeated as bare string literals (`"0.0.0.0:4432"`,

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Environment detection for *easy mode*: where Steam lives and how to phrase a
 //! launch command so it works on this machine's distro/packaging.
 //!

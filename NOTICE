@@ -1,13 +1,13 @@
 Pharos / Trireme — third-party notices
 ======================================
 
-This project is licensed under GPL-3.0-only (see LICENSE). It bundles or embeds
+This project is licensed under GPL-3.0-or-later (see LICENSE). It bundles or embeds
 the following third-party material, each under its own license:
 
 Brand artwork (lighthouse mark + idle screen)
   Files: rig/icons/*.svg, rig/icons/pharos-app.png, and the Android/iOS app icons.
   AI-generated for this project; considered original project artwork and released
-  under the project's GPL-3.0-only license.
+  under the project's GPL-3.0-or-later license.
 
 NVIDIA Video Codec interface headers
   Path: vendor/nvidia-video-codec-sdk/ (a vendored copy of the crates.io crate

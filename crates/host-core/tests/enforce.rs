@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! End-to-end pairing enforcement: a real `peers.toml` gates real QUIC clients.
 //! A client whose identity is listed is admitted; one that isn't is rejected.
 

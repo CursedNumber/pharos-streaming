@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Disk + probe access for the panel. Every loader is **non-panicking**: a
 //! missing/unparseable file yields safe defaults, and savers do an atomic
 //! tmp-write + rename. The on-disk shapes are mirrored here with serde structs

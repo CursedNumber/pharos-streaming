@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //
 // SwiftUI port of the desktop egui server selector + Android Compose
 // selector. **Untested**: this file is built only on macOS (Swift Package

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 import SwiftUI
 
 /// The iOS launcher hosts the [`ServerSelectorView`] introduced in the

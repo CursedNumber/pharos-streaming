@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Spawning an [`AppEntry`] into the right place, environment-aware.
 //!
 //! The host fills in a [`LaunchContext`] (the live virtual-display socket) and

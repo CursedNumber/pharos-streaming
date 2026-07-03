@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Server registry — what the menu shows as tiles, what `trireme` remembers
 //! across runs.
 //!

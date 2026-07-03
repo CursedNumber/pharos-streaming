@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Steam readiness probe + pre-warm.
 //!
 //! "Ready" means the Steam client is past startup and will actually honour a

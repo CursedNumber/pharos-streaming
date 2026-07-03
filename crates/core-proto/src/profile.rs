@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Per-controller tuning profile — shared by the client (editor UI), the wire
 //! (the `ControllerTuning` message), and the host (applies + persists it).
 //!

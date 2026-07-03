@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Session FSM + capability negotiation (BATTLE_PLAN §3). Skeleton for M0;
 //! fleshed out alongside the QUIC transport at M1.
 

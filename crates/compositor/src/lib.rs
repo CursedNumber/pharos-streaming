@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Pharos headless Wayland compositor (Smithay).
 //!
 //! M1, step 1: a hand-rolled headless compositor that advertises a *synthesized*

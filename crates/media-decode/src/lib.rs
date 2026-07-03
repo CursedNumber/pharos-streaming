@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! HEVC hardware-decoder capability probe.
 //!
 //! Trireme decodes the Pharos HEVC stream by piping it into an `ffmpeg`

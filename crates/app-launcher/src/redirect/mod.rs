@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Seamless redirect of Pharos-launched Steam games into the virtual display.
 //!
 //! The problem: `steam://rungameid/<id>` is delivered to whatever Steam is already

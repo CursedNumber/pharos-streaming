@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Theming: explicit, contrast-controlled palettes + the status/accent colours.
 //!
 //! Unlike the Trireme client (which honours `follow_system_theme`), the panel

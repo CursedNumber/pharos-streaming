@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Wake-on-LAN — a Trireme client feature, fully opt-in.
 //!
 //! Trireme only ever sends a magic packet when the user has supplied the target

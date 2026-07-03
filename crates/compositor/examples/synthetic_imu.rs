@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Synthetic controller IMU for validating the host→client gyro telemetry path
 //! without a physical gyro pad. Creates a uinput device named "… IMU" with the
 //! gyro axes `gyro_imu` reads (ABS_RX/RY/RZ, codes 3/4/5) and emits an

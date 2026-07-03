@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! SPICE primary-surface pixels → tightly-packed top-down RGBA.
 //!
 //! A SPICE `SPICE_SURFACE_FMT_32_xRGB` (and `_32_ARGB`) primary is 32 bpp,

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Demo: drive this machine's real cursor from a controller's gyro, using the
 //! exact `gyro_imu` reader that backs path-2 gyro→mouse in the streaming host.
 //!

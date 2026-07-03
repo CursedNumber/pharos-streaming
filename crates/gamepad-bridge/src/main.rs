@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! `gamepad-bridge` — lowest-latency gamepad forwarding for couch streaming.
 //!
 //! The controller is paired to the *couch* Pi (the Trireme client). The game

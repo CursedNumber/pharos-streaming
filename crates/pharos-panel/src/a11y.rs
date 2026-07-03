@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Universal-design helpers.
 //!
 //! **Project directive:** every meaningful, interactive, or non-obvious widget in

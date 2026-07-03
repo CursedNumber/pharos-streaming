@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Native screen capture via **Windows.Graphics.Capture** (WGC).
 //!
 //! Replaces ffmpeg's `ddagrab` as the capture source: WGC grabs a monitor (by

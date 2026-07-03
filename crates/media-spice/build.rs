@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Link `libspice-client-glib-2.0` — but only when the `ffi` feature is on.
 //!
 //! With the feature off (the workspace default) this is a no-op, so the crate

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Overview tab — one host card up top, the Trireme fleet below.
 //!
 //! Two blocks:

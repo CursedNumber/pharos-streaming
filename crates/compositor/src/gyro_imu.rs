@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Host-side gyro→mouse from a USB/IP-imported or directly-paired controller IMU.
 //!
 //! Android won't hand a controller's gyroscope to apps, so the pad reaches the

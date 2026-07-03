@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Capture backends (BATTLE_PLAN §6): Linux hand-rolled Smithay compositor
 //! output, Windows IddCx + WGC/DXGI. M0 stub — backends land M1 (Linux) / M3 (Win).
 

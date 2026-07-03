@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Standalone binding generator (uniffi "library mode"). Built from this crate
 //! so its uniffi version always matches the scaffolding in `lib.rs`.
 

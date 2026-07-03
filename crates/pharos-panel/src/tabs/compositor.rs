@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Compositor tab — the marquee feature: a drag-and-drop virtual-display
 //! layout editor that writes the compositor's `multi.toml` (`MultiCfg` /
 //! `OutputCfg`).

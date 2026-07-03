@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Per-controller tuning persistence (`controller-profiles.toml` in the Pharos
 //! config dir).
 //!

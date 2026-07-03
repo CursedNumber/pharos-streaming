@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Direct NVENC (nvEncodeAPI) HEVC encoding from a CUDA device buffer.
 //!
 //! M1 #1, Stage C: proves the NVENC-from-CUDA path end to end (no ffmpeg) by

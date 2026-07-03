@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Virtual Xbox 360 gamepad on the host.
 //!
 //! A Trireme client (e.g. the Bravia) captures its local controller and forwards

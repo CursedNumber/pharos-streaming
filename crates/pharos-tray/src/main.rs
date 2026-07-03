@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! `pharos-tray` — a three-state lighthouse system-tray daemon for the Pharos
 //! host:
 //!

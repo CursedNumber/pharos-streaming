@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Audio tab — the host's audio codecs + routing.
 //!
 //! Moved here from the Video tab: the audio codec strip (Opus today, AAC-ELD as

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Latency-benchmark wire types for Pharos ↔ Trireme.
 //!
 //! These ride over QUIC as **postcard-encoded datagram bodies**. The exchange is

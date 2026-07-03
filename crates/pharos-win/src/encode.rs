@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Capture + HEVC encode via an ffmpeg subprocess.
 //!
 //! Bring-up uses ffmpeg's `ddagrab` (DXGI Desktop Duplication, D3D11) to capture

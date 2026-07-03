@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Pharos pair listener.
 //!
 //! `pharos-compositor pair [addr]` brings up a QUIC endpoint, loads (or

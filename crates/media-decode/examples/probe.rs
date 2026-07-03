@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Manual probe check: `cargo run -p media-decode --example probe`.
 fn main() {
     tracing_subscriber::fmt()

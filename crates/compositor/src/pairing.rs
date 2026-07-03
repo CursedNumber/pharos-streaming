@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Pairing-window manager: the compositor side of the panel's "pair a new
 //! device" flow.
 //!

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! USB/IP keyboard relay.
 //!
 //! A keyboard exported from the client over USB/IP is attached to the host

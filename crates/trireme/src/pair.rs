@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Client-side pairing driver — opens a QUIC pair link to Pharos, runs the
 //! SPAKE2 handshake from `core-crypto`, and reports the host's pinned
 //! pubkey on success.

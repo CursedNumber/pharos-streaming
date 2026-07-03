@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Annex-B HEVC access-unit splitter.
 //!
 //! ffmpeg emits a raw Annex-B HEVC elementary stream on its stdout pipe with no

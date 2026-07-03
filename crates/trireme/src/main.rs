@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! `trireme` — the Linux reference client for the Pharos stream.
 //!
 //! Milestone 1 (this file): prove the Linux **decode backend**. Connect to the

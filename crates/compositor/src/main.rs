@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! `pharos-compositor` — runs the headless Wayland compositor standalone for
 //! testing. Defaults to 1920x1080@60; CLI/pal::Mode wiring comes later.
 

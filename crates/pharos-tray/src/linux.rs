@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Linux tray backend: the freedesktop StatusNotifierItem protocol via `ksni`
 //! (pure-Rust D-Bus, KDE Plasma's tray / GNOME with the AppIndicator
 //! extension), driven by a tokio runtime. Converts the shared RGBA icons into

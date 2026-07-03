@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Idle "no app running" screen for the streamed output.
 //!
 //! When NO client window is mapped, the compositor would otherwise stream a flat

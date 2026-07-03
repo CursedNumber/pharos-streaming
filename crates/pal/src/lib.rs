@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Platform Abstraction Layer (PAL) for Pharos.
 //!
 //! These traits are the seam that lets the Windows and Linux host backends be

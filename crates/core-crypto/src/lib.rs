@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Pairing + identity for Pharos/Trireme.
 //!
 //! Shared by host and client (via `core-ffi` on Android/iOS, directly on

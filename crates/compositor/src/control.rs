@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Local control server: the compositor side of the `control-ipc` protocol.
 //!
 //! `pharos-panel` (the cross-platform desktop control app) connects over a Unix

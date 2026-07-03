@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Local control + telemetry protocol between **pharos-compositor** (the server)
 //! and **pharos-panel** (the client).
 //!

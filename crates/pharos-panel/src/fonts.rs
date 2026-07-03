@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Bundled fonts, so glyphs render identically on every platform.
 //!
 //! egui's built-in fonts only cover a Latin subset — arrows (`→`), technical

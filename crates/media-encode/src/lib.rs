@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Encode backends (BATTLE_PLAN §7). HEVC/NVENC first; AV1 is cheap on Ada;
 //! VAAPI/software behind the same `pal::Encoder` trait. M0 stub.
 

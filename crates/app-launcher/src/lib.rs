@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Pharos application launcher.
 //!
 //! One launchable application is an [`AppEntry`]: a short `slug`, a display

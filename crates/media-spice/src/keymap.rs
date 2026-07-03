@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Linux evdev keycode → SPICE wire scancode (PC "XT set-1" make codes).
 //!
 //! `spice_inputs_channel_key_press` expects an XT set-1 make code. For the

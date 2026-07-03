@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Video tab — the encode → codec → decode → audio path matrix.
 //!
 //! Modelled on the Sunshine/Moonlight "supported codecs" flowchart: three

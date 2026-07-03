@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! mDNS browser — listens for Pharos hosts advertising `_pharos._udp.local.`
 //! and forwards their details to the menu via an mpsc channel.
 //!

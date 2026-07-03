@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Game-controller classifier — shared by the host and every Trireme client.
 //!
 //! Identifies a controller model from its USB VID:PID (+ a name fallback for

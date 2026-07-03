@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! GLES → GBM-surface → atomic scanout: the full-rate (120 Hz) presenter.
 //!
 //! The dumb-buffer path caps at ~60 Hz because nvidia-drm does a per-flip

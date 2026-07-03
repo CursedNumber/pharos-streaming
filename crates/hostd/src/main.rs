@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Pharos host daemon — M0 skeleton.
 //!
 //! At M0 this just proves the workspace wires together: it runs the proto

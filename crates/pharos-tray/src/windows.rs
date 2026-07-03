@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Windows tray backend: the Win32 notification area via `tray-icon`, driven by
 //! a `tao` event loop (the message pump that owns the tray's HWND — Win32
 //! requires the icon to live on a thread with a running message loop). A poller

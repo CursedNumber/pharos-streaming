@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Controllers tab — per-controller gyro/swap tuning + reusable presets.
 //!
 //! Mirrors the Trireme Android controller UI (HANDOFF.md + the

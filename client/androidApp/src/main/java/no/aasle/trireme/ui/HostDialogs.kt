@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 package no.aasle.trireme.ui
 
 import androidx.compose.foundation.layout.Column

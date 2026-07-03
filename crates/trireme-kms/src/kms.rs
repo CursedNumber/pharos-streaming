@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! DRM/KMS plumbing shared by the scanout backends.
 //!
 //! [`Target`] selects the connected connector / CRTC / primary plane / mode and

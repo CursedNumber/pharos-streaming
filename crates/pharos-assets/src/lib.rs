@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Shared Pharos branding assets + a tiny SVG→RGBA rasterizer.
 //!
 //! The lighthouse art lives in `rig/icons/` (the canonical source); this crate

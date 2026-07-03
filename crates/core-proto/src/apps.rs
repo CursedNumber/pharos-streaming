@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! App-launcher catalog relay between the host and a Trireme client.
 //!
 //! Carried on a dedicated bidirectional QUIC stream the **host opens** after a

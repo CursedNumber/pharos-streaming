@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Frame capture → HEVC. M1 step 2 (first cut).
 //!
 //! The compositor renders its output into a CPU buffer (software/pixman path)

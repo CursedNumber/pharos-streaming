@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! `pharos-usbimport` — the Pharos USB/IP import bridge.
 //!
 //! Accepts a Trireme exporter over the standalone QUIC relay, reads the device's

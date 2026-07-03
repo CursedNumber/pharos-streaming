@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Server-side `wp_color_manager_v1` (color-management-v1 staging, version 2).
 //!
 //! Smithay ships no handler for this protocol — only the generated Wire bindings

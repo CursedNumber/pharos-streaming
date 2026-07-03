@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Input tab — keyboard / mouse / HID forwarding policy.
 //!
 //! Most of this tab is the connecting Trireme *client's* input-forwarding config

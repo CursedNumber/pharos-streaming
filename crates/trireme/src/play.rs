@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Windowed multi-source player.
 //!
 //! Each "source" is one Pharos stream (its own QUIC connection, its own NVDEC

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! `trireme-kms` — headless atomic DRM/KMS scanout client.
 //!
 //! Runs on a display-less box that owns an HDMI output (e.g. a headless GPU box

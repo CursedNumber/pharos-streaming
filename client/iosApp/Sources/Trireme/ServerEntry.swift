@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //
 // Mirror of the desktop ServerEntry schema (crates/trireme/src/servers.rs)
 // and the Android one (ServerEntry.kt). Field names match the JSON keys

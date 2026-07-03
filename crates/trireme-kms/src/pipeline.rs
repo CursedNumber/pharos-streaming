@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Pharos/Trireme authors
+
 //! Live pipeline: QUIC recv → ffmpeg HW decode (probed: NVDEC/Rockchip MPP/V4L2)
 //! → GL atomic scanout.
 //!
