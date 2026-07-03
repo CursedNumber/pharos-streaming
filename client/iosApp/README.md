@@ -28,7 +28,7 @@ rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 
 Then, in Xcode:
 
-1. New iOS App (SwiftUI), product name **Trireme**, bundle id `dev.pharos.trireme`.
+1. New iOS App (SwiftUI), product name **Trireme**, bundle id `no.aasle.trireme`.
 2. Add the sources in `Sources/Trireme/` (`TriremeApp.swift`, `ContentView.swift`).
 3. Add `client/shared/generated/swift/core_ffi.swift` to the target.
 4. Drag `CoreFFI.xcframework` into *Frameworks, Libraries, and Embedded Content*.

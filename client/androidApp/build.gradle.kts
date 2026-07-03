@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "dev.pharos.trireme"
+    namespace = "no.aasle.trireme"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "dev.pharos.trireme"
+        applicationId = "no.aasle.trireme"
         minSdk = 26
         targetSdk = 35
         versionCode = 1
@@ -38,7 +38,7 @@ android {
     }
 
     // The debug variant installs SIDE-BY-SIDE with release: applicationIdSuffix
-    // gives it its own package id (dev.pharos.trireme.debug) + data dir, so an
+    // gives it its own package id (no.aasle.trireme.debug) + data dir, so an
     // e2e test build coexists with a "daily driver" release and has its own
     // pairing/identity (pair it once; it won't clash with release). The
     // src/debug/res override renames it "Trireme Debug" in the launcher. The
