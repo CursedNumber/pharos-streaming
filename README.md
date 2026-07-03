@@ -1,101 +1,146 @@
 # pharos-streaming — Pharos (host) · Trireme (client)
 
-A clean-slate, low-latency **KVM-over-IP** (keyboard, video, mouse + USB over the
-network), with game streaming as a first-class mode on the same pipeline.
-A from-scratch spiritual successor to Sunshine/Moonlight (and the Apollo·Artemis /
-Polaris·Nova forks), written in **Rust** (host + shared core) and **Kotlin** (client).
+**Self-hosted, low-latency game streaming and remote desktop (KVM-over-IP).**
+A clean-slate, from-scratch successor to Sunshine/Moonlight — Rust host and shared
+core, Kotlin/Android + Rust desktop client, a hand-rolled headless Wayland
+compositor, and zero-copy NVENC/AV1 over QUIC.
 
 - **Pharos** — the host daemon (Rust). The lighthouse the client navigates by.
-- **Trireme** — the client (Kotlin Multiplatform; Android first, plus a Rust
-  desktop client). The small craft that comes alongside.
-- **core** — one Rust core (protocol, crypto/pairing, session, USB/IP framing)
-  shared by both ends via UniFFI.
+- **Trireme** — the client (Kotlin Multiplatform, Android first; plus a Rust
+  desktop/reference client). The small craft that comes alongside.
+- **core** — one Rust core (protocol, crypto/pairing, session, USB/IP framing),
+  shared by both ends via UniFFI, so the wire format and pairing have exactly one
+  implementation.
 
-The original architecture/roadmap and other design notes are archived under
-[`docs/history/`](docs/history/) (kept for context; may be out of date).
+> Detailed CLI, environment variables, and config reference live in
+> [`DOCUMENTATION.md`](DOCUMENTATION.md). Archived design notes are in
+> [`docs/history/`](docs/history/).
 
-## Status
+---
 
-Proven on real hardware, actively used for day-to-day game streaming:
+## Highlights
 
-- **Linux host → client:** headless Smithay compositor → zero-copy NVENC **HEVC/AV1**
-  → QUIC → Trireme decode/render, **120 fps @ 1080p**, pixel-correct on a Sony Bravia
-  and a Xiaomi phone; keyboard + relative/absolute mouse + gamepad injected back into
-  the compositor seat.
-- **Game mode:** real Proton games stream end-to-end (native Wayland), with gamepad
-  passthrough, a live resolution/bitrate ladder, and an optional Steam-launch redirect.
-- **Audio:** end-to-end low-latency Opus.
-- **USB/IP relay** (HID + mass-storage): a client exports a local USB device to the
-  host's virtual hub, verified over the LAN.
-- **Windows host:** the Rust desktop client plays on Windows (Quick Sync decode); the
-  Windows host captures desktop **and** a headless virtual display → Quick Sync / NVENC /
-  AMF HEVC. NVENC HEVC hosting validated on a real GPU rig.
-- **HDR:** host HDR10 encode (BT.2020/PQ + SEI) is implemented; Proton *game*-HDR on
-  Linux is currently blocked upstream in Wine's Vulkan/Wayland WSI and is deferred to
-  the Windows-native host path.
+Proven on real hardware, and used day-to-day for game streaming:
 
-This is pre-1.0 research-quality software. Interfaces, config keys, and env vars may
-change between commits.
+- **120 fps @ 1080p, zero dropped frames** — headless Smithay → GLES→CUDA→NVENC
+  HEVC → QUIC → decode/render, **~3 ms encode**, zero-copy end to end on an
+  RTX 4070; pixel-correct on a Sony Bravia and a Xiaomi phone. This is the
+  regression baseline later work may not fall below.
+- **Real Proton games stream end-to-end** over native Wayland (winewayland /
+  proton-cachyos) — gamepad passthrough, live resolution/bitrate ladder, and an
+  optional Steam-launch redirect, validated in live sessions.
+- **End-to-end HDR10** — the host emits conformant 10-bit HEVC Main10 (BT.2020 /
+  PQ + Mastering-Display/CLL SEI) and the TV **enters HDR mode off the stream on
+  its own**.
+- **AV1 validated end-to-end**, including **4K60** — nearly free on Ada GPUs, and
+  a royalty-free alternative to HEVC.
+- **Sub-second mid-stream resync** — 1 s IDRs with repeated sequence headers, so a
+  client that joins mid-stream is watching in ≤1 s.
+- **Reversed USB/IP** — export a controller, stick, or drive **from the client**
+  and it appears as a *real* device on the host (HID + mass-storage, verified over
+  the LAN).
+- **Windows host** — WGC/ddagrab + an IddCx headless virtual display →
+  Quick Sync / NVENC / AMF HEVC with SendInput; NVENC HEVC hosting validated on a
+  real GPU rig.
+
+## Features
+
+**Streaming pipeline**
+- One QUIC pipeline for **keyboard, video, mouse, and USB** — operate a headless
+  host remotely; game streaming is a first-class *mode* on the same
+  capture→encode→transport path, not a separate product.
+- **Headless Smithay compositor** (Linux) that owns the display and captures its
+  own GLES output **zero-copy** through CUDA into NVENC. Xwayland inside for X11
+  apps. No EVDI, no gamescope wrap — full frame-lifecycle control for latency.
+- **Selectable HEVC + AV1**, plus a real **HDR10** 10-bit Main10 path (behind
+  `PHAROS_HDR=1`).
+- **End-to-end low-latency Opus** audio (48 kHz stereo, 20 ms frames, LowDelay),
+  captured from a per-session PipeWire null-sink monitor.
+- **Adaptive resolution / bitrate / fps ladder** — a QoS pacer and live actuators
+  step quality down under sustained link pressure; the top rung is a
+  byte-identical direct blit.
+
+**Input**
+- **Keyboard + mouse (move, buttons, scroll) + gamepad** from the desktop client
+  into the host seat; **relative mouse** (for pointer-locked / FPS games) is
+  handled host-side on both Linux and Windows.
+- **Controller profiles + gyro-aim** — per-controller button-swap and gyro tuning,
+  relayed live and persisted host-side; gyro angular velocity becomes relative
+  mouse motion. Client gamepads land on per-slot virtual Xbox 360 pads.
+
+**Beyond one screen**
+- **Native VNC and SPICE console sources** in the client, so a Proxmox/QEMU VM
+  console can share a split-screen cell alongside a Pharos stream, fully
+  interactive.
+- **Multi-client mirror/extend** fan-out (keep-N) — *experimental, off by default,
+  not yet two-device-validated.*
+- **Home Assistant MQTT + Wake-on-LAN** — auto-discovered HA entities and remote
+  wake.
+
+**Control & trust**
+- **Native control plane, no browser** — a cross-platform egui panel
+  (`pharos-panel`) and a KDE tray (`pharos-tray`) drive the host live over an
+  authenticated channel. No self-signed-cert wall.
+- **SPAKE2 pairing + per-connection Ed25519 auth, on by default** — pairing pins a
+  long-term identity; every connection is authorized against `peers.toml`. The
+  QUIC TLS cert is a throwaway opaque tunnel, never a trust anchor.
 
 ## ⚠️ Security notice
 
-Pharos is a **network-listening daemon that injects input and can bridge USB devices**
-into the host. Treat it accordingly:
+Pharos is a **network-listening daemon that injects input and can bridge USB
+devices** into the host. Treat it accordingly:
 
 - Run it on a **trusted LAN**, not the open internet. There is no hardening audit yet.
-- Client authentication (SPAKE2 pairing + per-connection Ed25519) is **on by default**;
-  `PHAROS_ALLOW_UNPAIRED=1` disables it — don't set that on an untrusted network.
-- Exposing the stream port to the internet (e.g. via port-forward or a reverse proxy)
-  is at your own risk. Prefer a VPN/WireGuard tunnel.
+- Client authentication is **on by default**; `PHAROS_ALLOW_UNPAIRED=1` disables
+  it — don't set that on an untrusted network.
+- Exposing the stream port to the internet is at your own risk; prefer a
+  VPN/WireGuard tunnel.
 
-Found a security issue? Please report it privately rather than opening a public issue
-(see `SECURITY.md`).
+Found a security issue? Please report it privately — see [`SECURITY.md`](SECURITY.md).
 
-## Layout
+## Architecture
+
+One shared Rust **core** is the keystone — `core-proto` (QUIC channel map,
+length-prefixed access-unit framing, the input wire format), `core-crypto` (SPAKE2
+pairing + Ed25519 identity/session keys), `core-session` (session FSM + capability
+negotiation), and `core-usbip` (USB/IP URB framing) are compiled natively into the
+host and exported to the Kotlin/Swift clients via `core-ffi`/**UniFFI**, so pairing
+and the protocol have exactly one implementation and test suite. A `pal` trait
+crate is the Windows/Linux co-equal seam.
 
 ```
-crates/                  # --- shared core (host + client, exported via UniFFI) ---
-  pal            platform-abstraction traits (the Windows/Linux co-equal seam)
-  core-proto     wire protocol: channel map, framing, access units   [+tests]
-  core-crypto    pairing / identity / session keys (SPAKE2)
-  core-session   session FSM + capability negotiation
-  core-usbip     USB/IP URB wire protocol + device-class policy       [+tests]
-  core-ffi       UniFFI surface → Kotlin + Swift bindings
-  host-core      shared host glue (pairing/identity) for both OS hosts
-  host-info      host capability / backend probing
-  control-ipc    control-plane IPC (panel ⇄ host: status, config, live actuation)
-  transport      QUIC (quinn) channels: video, input, USB/IP
-                         # --- Linux host ---
-  compositor     hand-rolled headless Smithay → zero-copy GLES→CUDA→NVENC HEVC/AV1
-  trireme-kms    direct DRM/KMS atomic-scanout client (drive a real TV headless)
-  usbip-host     USB/IP import side — bin `pharos-usbimport` (vhci-hcd virtual hub)
-  app-launcher   launch apps/games into the virtual display; Steam redirect shim
-  hostd          host daemon: proto self-test + banner
-                         # --- Windows host ---
-  pharos-win     bin `pharos-host` — WGC/ddagrab → Quick Sync/NVENC/AMF HEVC, SendInput
-                         # --- media (real impls live in the host/client crates above) ---
-  media-audio    Opus capture/encode (real)
-  media-decode   client decode helpers (real)
-  media-spice    native SPICE source via libspice FFI (feature-gated)
-  media-capture / media-encode / input-inject   trait crates (thin; refactor targets)
-                         # --- desktop UI / integrations ---
-  pharos-panel   cross-platform egui control panel (Overview/Compositor/Video/HID/…)
-  pharos-tray    KDE StatusNotifier tray (lighthouse states from host GPU health)
-  pharos-assets  shared embedded art (lighthouse icons, idle screen)
-  gamepad-bridge gamepad handling / virtual-pad glue
-  integration-mqtt  Home-Assistant MQTT discovery + Wake-on-LAN
-                         # --- client / device export ---
-  trireme        desktop + reference client: decode, render, input, USB export
-  usbip-export   bin `trireme-usbexport` — share a local USB device to the host
-client/          Trireme — Kotlin Multiplatform (Android) + SwiftUI iOS baseline
-rig/             build + launch helper scripts, embedded icon sources, workarounds log
+                          ┌───────────────────────────────┐
+                          │   core (Rust, shared)         │
+                          │  proto · crypto/SPAKE2 ·       │
+                          │  session · usbip framing       │
+                          └──────▲──────────────▲──────────┘
+                       native    │              │  UniFFI (JNI)
+              ┌──────────────────┴──┐    ┌──────┴───────────────────┐
+              │  Pharos host (Rust)  │    │  Trireme client          │
+              │  compositor·NVENC·   │    │  decode·render·input·    │
+              │  inject·usbip-host   │    │  USB export (Kotlin+Rust)│
+              └──────────────────────┘    └──────────────────────────┘
 ```
 
-## Build requirements
+**QUIC channel map** (`transport`, quinn): a reliable bidi **control** stream, a
+reliable **input** back-channel, **video/audio** as unreliable deadline-aware
+datagrams, and **one reliable stream per USB/IP device** (so a stalled device can't
+head-of-line-block your gamepad).
 
-**Rust:** stable toolchain (CI builds on `stable`; no MSRV is pinned yet).
+- **Linux host** — `compositor` (headless Smithay → zero-copy NVENC), `trireme-kms`
+  (direct DRM/KMS scanout to a real TV), `usbip-host` (`pharos-usbimport`),
+  `app-launcher` (launch into the display + Steam redirect).
+- **Windows host** — `pharos-win` (`pharos-host`): WGC/ddagrab + IddCx virtual
+  display → Quick Sync/NVENC/AMF HEVC with SendInput.
+- **Clients** — `trireme` (Rust desktop/reference: ffmpeg decode, winit render,
+  input, USB export) and the Kotlin Multiplatform Android app (MediaCodec decode,
+  controller/gyro input), with a SwiftUI iOS baseline.
 
-**Linux system packages** (Debian/Ubuntu names; use your distro's equivalents):
+For the full crate map, see [`DOCUMENTATION.md`](DOCUMENTATION.md).
+
+## Quickstart (Linux host)
+
+**System packages** (Debian/Ubuntu names; use your distro's equivalents):
 
 ```sh
 sudo apt-get install -y \
@@ -104,55 +149,57 @@ sudo apt-get install -y \
   libinput-dev libxcb1-dev libopus-dev pkg-config
 ```
 
-**`ffmpeg`** is required at **runtime** as a subprocess (client decode, some capture/
-encode paths) — install it from your distro.
+`ffmpeg` is required at **runtime** (client decode / some capture paths).
 
-**The `compositor` crate additionally needs an NVIDIA driver + CUDA** (it links
-`libnvidia-encode` / `libnvcuvid` for zero-copy NVENC). On a machine without them,
-build everything else and skip it:
+**Build.** The `compositor` crate needs an NVIDIA driver + CUDA (it links
+`libnvidia-encode` / `libnvcuvid`). Without them, build everything else:
 
 ```sh
-# No NVIDIA / CUDA present — build the whole workspace except the compositor:
-cargo build --workspace --exclude compositor
-cargo test  --workspace --exclude compositor
-
-# Full build (needs NVIDIA driver + CUDA):
-cargo build --workspace
+cargo build --workspace --exclude compositor   # no NVIDIA/CUDA
+cargo build --workspace                         # full (needs NVIDIA + CUDA)
+cargo run -p hostd                              # quick core self-test
 ```
 
-Quick self-test of the shared core:
+**Run the streaming host** and connect a client:
 
 ```sh
-cargo run -p hostd     # prints platform backends + proto self-test
+pharos-compositor capture-zc-multi              # resident multi-output host
+pharos-compositor --help                        # every subcommand
 ```
 
-### Kotlin bindings (UniFFI)
+The Android client is built via `rig/build-android.sh` — see
+[`client/README.md`](client/README.md). Full command reference, env vars, and
+config keys: [`DOCUMENTATION.md`](DOCUMENTATION.md).
 
-Generate the Kotlin bindings from the Rust core (library mode):
+## Status & honesty
 
-```sh
-cargo build -p core-ffi
-cargo run -p core-ffi --bin uniffi-bindgen -- \
-  generate --library target/debug/libcore_ffi.so \
-  --language kotlin --out-dir client/shared/generated/kotlin
-```
+Pre-1.0 research-quality software; interfaces, config keys, and env vars may change
+between commits. Known honest caveats:
 
-The Android client has its own build path — see [`client/README.md`](client/README.md)
-(`rig/build-android.sh` is the canonical build; note 32-bit TVs need `armeabi-v7a`).
+- The desktop client currently sends **absolute** pointer position; cursor-grab
+  **relative** capture (for FPS-style aim from a PC client) is the remaining
+  client-side piece — the host path for it is ready.
+- **Linux Proton *game*-HDR** is blocked upstream in Wine's Vulkan/Wayland WSI and
+  is deferred to the Windows-native host path. Host HDR10 encode itself works.
+- **Multi-client mirror** is shipped but **off by default and not two-device
+  validated**.
+- USB/IP **isochronous** (USB-audio / webcams) has wire format + framing but iso
+  servicing is deferred.
 
 ## Codecs & patents
 
-This project ships **no HEVC/AV1 codec implementation**. Encoding runs on the GPU's
-hardware encoder (NVENC / Quick Sync / AMF) or an external `ffmpeg` binary; decoding
-uses the client OS's decoder (Android MediaCodec) or `ffmpeg`. Any HEVC patent
-obligations attach to those hardware/OS vendors, not to this software. If you need
+This project ships **no HEVC/AV1 codec implementation** — encoding runs on the
+GPU's hardware encoder (NVENC / Quick Sync / AMF) or an external `ffmpeg` binary;
+decoding uses the client OS's decoder (Android MediaCodec) or `ffmpeg`. Any HEVC
+patent obligations attach to those hardware/OS vendors, not to this software. For
 royalty-free assurances, prefer the **AV1** path.
 
 ## Localization
 
-The Pharos control panel UI is localized (**English + Norwegian Bokmål**, live-switchable).
-The Trireme desktop client, tray, and CLI output are English-only for now. Translations
-are welcome — add your locale alongside `en` in `crates/pharos-panel/locales/*.toml`.
+The Pharos control panel is localized (**English + Norwegian Bokmål**,
+live-switchable). The Trireme desktop client, tray, and CLI output are English-only
+for now. Translations welcome — add your locale alongside `en` in
+`crates/pharos-panel/locales/*.toml`.
 
 ## License
 
@@ -169,5 +216,5 @@ PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 Given freely, for everyone — and copyleft so it stays that way for everyone
 downstream. Bundled third-party material (the NVIDIA interface headers under
-`vendor/`, the Noto Sans Symbols fonts) carries its own licenses; see [`NOTICE`](NOTICE)
-and the files themselves.
+`vendor/`, the Noto Sans Symbols fonts) carries its own licenses; see
+[`NOTICE`](NOTICE).
