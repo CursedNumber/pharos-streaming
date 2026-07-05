@@ -14,5 +14,9 @@ name = "gamepad-bridge"
 path = "src/main.rs"
 
 [dependencies]
-evdev = "0.12"
 anyhow = "1"
+
+# evdev/uinput are Linux kernel interfaces; on other targets the bin is a stub
+# (same pattern as the compositor), so the whole workspace builds on Windows CI.
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.12"
