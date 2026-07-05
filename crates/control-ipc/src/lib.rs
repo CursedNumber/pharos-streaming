@@ -202,6 +202,11 @@ pub enum Request {
 
 /// Compositor → panel. Tagged on `"kind"`; the data-bearing variants wrap a
 /// single struct so the payload nests cleanly (`{"kind":"Status","Status":{…}}`).
+// A protocol enum's size is dominated by its largest message by design; events
+// are transient (decoded, handled, dropped), never stored in bulk, so the
+// size skew clippy flags here costs nothing. Boxing `HostStatus` would touch
+// every construction site across four crates for no wire or memory win.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum Event {
@@ -1073,6 +1078,7 @@ mod tests {
             read_only: false,
             gpu_health: GpuHealth::default(),
             stream_mode: StreamMode::default(),
+            hdr_active: None,
         }
     }
 
@@ -1239,6 +1245,7 @@ mod tests {
                     client_count: 2,
                 }),
             },
+            hdr_active: Some("HEVC Main10 BT.2020/PQ".into()),
         });
         let json = serde_json::to_string(&ev).unwrap();
         let back: Event = serde_json::from_str(&json).unwrap();

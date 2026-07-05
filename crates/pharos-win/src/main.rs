@@ -273,6 +273,9 @@ fn build_status(
         gpu_health,
         // Single-client only — no mirror fan-out on the Windows path.
         stream_mode: control_ipc::StreamMode::Single,
+        // Windows host HDR capture+encode is the deferred game-HDR path; until
+        // it lands the Windows host always streams SDR.
+        hdr_active: None,
     }
 }
 
@@ -957,7 +960,7 @@ struct InjectSpec {
 impl InjectSpec {
     fn should_fire(&self, generation: u64, gen_frames: u64) -> bool {
         match self.periodic {
-            Some(p) => gen_frames > 0 && gen_frames % p == 0,
+            Some(p) => gen_frames > 0 && gen_frames.is_multiple_of(p),
             None => generation == 0 && gen_frames >= self.oneshot_after,
         }
     }

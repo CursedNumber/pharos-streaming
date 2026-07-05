@@ -140,81 +140,6 @@ fn detect_state() -> State {
     State::from_status(connected, status.as_ref(), faulted_offline)
 }
 
-#[cfg(test)]
-mod state_tests {
-    use super::State;
-    use control_ipc::{GpuHealth, HostStatus};
-
-    fn status(streaming: bool, gpu: GpuHealth) -> HostStatus {
-        HostStatus {
-            hostname: "rig".into(),
-            streaming,
-            clients: vec![],
-            outputs: vec![],
-            media: None,
-            pairing: None,
-            controllers: vec![],
-            video_codec: None,
-            read_only: false,
-            gpu_health: gpu,
-            stream_mode: control_ipc::StreamMode::Single,
-        }
-    }
-
-    #[test]
-    fn disconnected_with_no_fault_is_offline() {
-        assert_eq!(State::from_status(false, None, false), State::Offline);
-        // Even a streaming snapshot is Offline if the control link is down.
-        let s = status(true, GpuHealth::Healthy);
-        assert_eq!(State::from_status(false, Some(&s), false), State::Offline);
-    }
-
-    #[test]
-    fn disconnected_with_a_fault_file_is_faulted() {
-        // Host down + a durable fault marker = "faulted & gave up", not Offline.
-        assert_eq!(State::from_status(false, None, true), State::Faulted);
-    }
-
-    #[test]
-    fn healthy_maps_streaming_and_idle() {
-        assert_eq!(
-            State::from_status(true, Some(&status(true, GpuHealth::Healthy)), false),
-            State::Streaming
-        );
-        assert_eq!(
-            State::from_status(true, Some(&status(false, GpuHealth::Healthy)), false),
-            State::Idle
-        );
-        // Connected but no snapshot yet → Idle (handshake in flight).
-        assert_eq!(State::from_status(true, None, false), State::Idle);
-    }
-
-    #[test]
-    fn gpu_health_takes_priority_over_streaming() {
-        let degraded = status(
-            true,
-            GpuHealth::Degraded {
-                reason: "encode choke".into(),
-                throttle: Some("thermal".into()),
-            },
-        );
-        assert_eq!(
-            State::from_status(true, Some(&degraded), false),
-            State::Degraded
-        );
-        let faulted = status(
-            true,
-            GpuHealth::Faulted {
-                reason: "device lost".into(),
-                last_xid: Some(79),
-            },
-        );
-        assert_eq!(
-            State::from_status(true, Some(&faulted), false),
-            State::Faulted
-        );
-    }
-}
 
 /// One rasterized icon as straight RGBA (premultiplied, per tiny-skia). The
 /// Linux backend byte-swaps this into SNI's ARGB; the Windows backend feeds it
@@ -307,4 +232,82 @@ fn host_launcher() -> String {
         .unwrap_or(raw)
         .to_string_lossy()
         .into_owned()
+}
+
+
+#[cfg(test)]
+mod state_tests {
+    use super::State;
+    use control_ipc::{GpuHealth, HostStatus};
+
+    fn status(streaming: bool, gpu: GpuHealth) -> HostStatus {
+        HostStatus {
+            hostname: "rig".into(),
+            streaming,
+            clients: vec![],
+            outputs: vec![],
+            media: None,
+            pairing: None,
+            controllers: vec![],
+            video_codec: None,
+            read_only: false,
+            gpu_health: gpu,
+            stream_mode: control_ipc::StreamMode::Single,
+            hdr_active: None,
+        }
+    }
+
+    #[test]
+    fn disconnected_with_no_fault_is_offline() {
+        assert_eq!(State::from_status(false, None, false), State::Offline);
+        // Even a streaming snapshot is Offline if the control link is down.
+        let s = status(true, GpuHealth::Healthy);
+        assert_eq!(State::from_status(false, Some(&s), false), State::Offline);
+    }
+
+    #[test]
+    fn disconnected_with_a_fault_file_is_faulted() {
+        // Host down + a durable fault marker = "faulted & gave up", not Offline.
+        assert_eq!(State::from_status(false, None, true), State::Faulted);
+    }
+
+    #[test]
+    fn healthy_maps_streaming_and_idle() {
+        assert_eq!(
+            State::from_status(true, Some(&status(true, GpuHealth::Healthy)), false),
+            State::Streaming
+        );
+        assert_eq!(
+            State::from_status(true, Some(&status(false, GpuHealth::Healthy)), false),
+            State::Idle
+        );
+        // Connected but no snapshot yet → Idle (handshake in flight).
+        assert_eq!(State::from_status(true, None, false), State::Idle);
+    }
+
+    #[test]
+    fn gpu_health_takes_priority_over_streaming() {
+        let degraded = status(
+            true,
+            GpuHealth::Degraded {
+                reason: "encode choke".into(),
+                throttle: Some("thermal".into()),
+            },
+        );
+        assert_eq!(
+            State::from_status(true, Some(&degraded), false),
+            State::Degraded
+        );
+        let faulted = status(
+            true,
+            GpuHealth::Faulted {
+                reason: "device lost".into(),
+                last_xid: Some(79),
+            },
+        );
+        assert_eq!(
+            State::from_status(true, Some(&faulted), false),
+            State::Faulted
+        );
+    }
 }
