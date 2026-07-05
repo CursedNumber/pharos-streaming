@@ -138,6 +138,47 @@ head-of-line-block your gamepad).
 
 For the full crate map, see [`DOCUMENTATION.md`](DOCUMENTATION.md).
 
+## Install
+
+Prebuilt packages come from [GitHub Releases](https://github.com/CursedNumber/pharos-streaming/releases)
+(built by CI from the tagged source; x86_64 Linux and Windows). Two packages:
+**pharos** is the host (the gaming PC that streams out; needs an NVIDIA GPU),
+**trireme** is the client (the machine you play on).
+
+**Ubuntu / Debian** (22.04+/12+): the install script fetches the latest
+release's `.deb` and installs it with apt:
+
+```sh
+# host, client, or --both
+curl -fsSL https://raw.githubusercontent.com/CursedNumber/pharos-streaming/main/packaging/install.sh | bash -s -- --host
+curl -fsSL https://raw.githubusercontent.com/CursedNumber/pharos-streaming/main/packaging/install.sh | bash -s -- --client
+```
+
+Or grab the `.deb` from the release page yourself and
+`sudo apt install ./pharos_*_amd64.deb` (apt resolves the dependencies).
+
+**Arch / CachyOS**: AUR packages `pharos-streaming` (build from source) and
+`pharos-streaming-bin` (prebuilt release binaries); both split into `pharos`
+and `trireme`.
+
+**Anything else**: `pharos-<ver>-linux-x86_64.tar.gz` and
+`trireme-<ver>-linux-x86_64.tar.gz` on the release page carry the binaries,
+systemd units, and desktop files; copy them where your distro likes. Windows
+hosts get `pharos-host.exe`, `pharos-tray.exe`, and `pharos-panel.exe` as bare
+release assets.
+
+**After installing the host:**
+
+```sh
+systemctl --user enable --now pharos-host pharos-tray
+sudo systemctl enable --now pharos-usbimport   # optional: USB/IP forwarding
+pharos-panel                                   # configure outputs, apps, clients
+```
+
+After installing the client, run `trireme` (also in the app menu): hosts on
+the LAN are discovered automatically, then you pair once with the on-screen
+PIN. Packaging sources live in [`packaging/`](packaging/README.md).
+
 ## Quickstart (Linux host)
 
 **System packages** (Debian/Ubuntu names; use your distro's equivalents):

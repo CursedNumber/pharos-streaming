@@ -1,0 +1,33 @@
+# Pharos host: the headless streaming compositor (user unit).
+#
+# Enable with:  systemctl --user enable --now pharos-host
+#
+# ⚠️ SCREENSHOT-SAFETY INVARIANT: never add WAYLAND_DISPLAY to this unit's
+# environment, and never `systemctl --user import-environment WAYLAND_DISPLAY`
+# with Pharos's socket. The compositor mints its own private wayland-N socket
+# and hands it to launched apps per-process; if it leaks into the session or
+# D-Bus activation environment, desktop screenshots (Spectacle & co.) bind to
+# Pharos instead of the real compositor and go dark. See rig/WORKAROUNDS.md.
+
+[Unit]
+Description=Pharos streaming host (compositor + encoder)
+Documentation=https://github.com/CursedNumber/pharos-streaming
+# Circuit breaker: a crash-looping GPU fault stops after 5 tries/minute rather
+# than hammering the driver. `systemctl --user reset-failed pharos-host` re-arms.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+ExecStart=/usr/bin/pharos-compositor capture-zc-multi
+# sd_notify liveness: a fully hung render loop trips the watchdog and the unit
+# restarts instead of streaming black forever.
+Type=notify
+WatchdogSec=10
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=info
+# Session D-Bus for app launching + portal calls (%t = /run/user/<uid>).
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+
+[Install]
+WantedBy=default.target

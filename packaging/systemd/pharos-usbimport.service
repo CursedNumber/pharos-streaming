@@ -1,0 +1,20 @@
+# Pharos USB/IP import bridge (system unit; needs root for vhci-hcd).
+#
+# Enable with:  sudo systemctl enable --now pharos-usbimport
+#
+# Optional: only needed when streaming clients forward physical USB devices to
+# this host. The vhci-hcd kernel module is loaded on demand.
+
+[Unit]
+Description=Pharos USB/IP import bridge
+Documentation=https://github.com/CursedNumber/pharos-streaming
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/pharos-usbimport
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

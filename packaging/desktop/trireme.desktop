@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Trireme
+GenericName=Game Streaming Client
+Comment=Connect to a Pharos game-streaming host
+Exec=trireme
+Icon=trireme
+Terminal=false
+Categories=Game;RemoteAccess;
+Keywords=trireme;pharos;streaming;game;remote;client;moonlight;

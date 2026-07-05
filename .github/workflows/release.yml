@@ -1,0 +1,168 @@
+name: Release
+
+# Tag push (vX.Y.Z) builds the distributable packages and attaches them to the
+# GitHub Release for that tag (creating it if the tag was pushed bare, or
+# uploading into it if `gh release create` made it first). Assets:
+#
+#   pharos_<ver>-1_amd64.deb              host package (Ubuntu 22.04+/Debian 12+)
+#   trireme_<ver>-1_amd64.deb             client package
+#   pharos-<ver>-linux-x86_64.tar.gz      host tarball (AUR -bin, generic Linux)
+#   trireme-<ver>-linux-x86_64.tar.gz     client tarball
+#   pharos-host.exe / pharos-tray.exe / pharos-panel.exe   Windows host stack
+#   SHA256SUMS.txt
+#
+# workflow_dispatch runs the build jobs only (artifacts, no release): a dry run.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # audiopus_sys bundles libopus whose CMakeLists declares an ancient
+  # cmake_minimum_required; CMake 4 refuses to configure it without this floor.
+  # (Linux links the system libopus; this matters on the Windows job.)
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+jobs:
+  linux:
+    name: linux (.deb + tarballs)
+    runs-on: ubuntu-latest
+    # Build inside 22.04 for the glibc 2.35 floor: the debs must install on
+    # Ubuntu 22.04+/Debian 12+, and binaries built on the 24.04 runner would
+    # require its newer glibc.
+    container: ubuntu:22.04
+    steps:
+      - name: install system deps
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config curl ca-certificates \
+            libwayland-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev \
+            libdrm-dev libudev-dev libusb-1.0-0-dev libxkbcommon-dev \
+            libinput-dev libxcb1-dev libopus-dev
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: check the tag matches the workspace version
+        if: github.ref_type == 'tag'
+        run: |
+          VER="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          TAG="${GITHUB_REF_NAME#v}"
+          if [ "$VER" != "$TAG" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match workspace version $VER (bump [workspace.package] version first)"
+            exit 1
+          fi
+
+      # The NVENC crate links libnvidia-encode/libnvcuvid at build time, but the
+      # compositor only imports two symbols (everything else goes through the
+      # function table NvEncodeAPICreateInstance returns), so a runner without
+      # an NVIDIA driver links against these hand-made stubs. -soname makes the
+      # binary's DT_NEEDED entries libnvidia-encode.so.1/libnvcuvid.so.1, which
+      # the user's real driver provides at runtime. If a future change imports
+      # more driver symbols, the link fails here; list what's missing with
+      # `nm -D --undefined-only target/release/pharos-compositor` and add them.
+      - name: create NVIDIA link stubs
+        run: |
+          mkdir -p /opt/nvidia-link-stubs
+          cat > /tmp/nvenc-stub.c <<'EOF'
+          void NvEncodeAPICreateInstance(void) {}
+          void NvEncodeAPIGetMaxSupportedVersion(void) {}
+          EOF
+          gcc -shared -fPIC -Wl,-soname,libnvidia-encode.so.1 \
+            -o /opt/nvidia-link-stubs/libnvidia-encode.so /tmp/nvenc-stub.c
+          gcc -shared -fPIC -Wl,-soname,libnvcuvid.so.1 \
+            -o /opt/nvidia-link-stubs/libnvcuvid.so -x c /dev/null
+          echo "NVIDIA_VIDEO_CODEC_SDK_PATH=/opt/nvidia-link-stubs" >> "$GITHUB_ENV"
+
+      - name: build release binaries
+        run: |
+          cargo build --release --locked \
+            -p compositor -p pharos-panel -p pharos-tray -p usbip-host \
+            -p trireme -p trireme-kms
+
+      - name: build the .deb packages
+        run: |
+          cargo install cargo-deb --locked
+          mkdir -p dist
+          cargo deb -p compositor --no-build -o dist/
+          cargo deb -p trireme --no-build -o dist/
+
+      - name: assemble the Linux tarballs
+        run: |
+          VER="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+
+          H="pharos-$VER-linux-x86_64"
+          mkdir -p "stage/$H/systemd"
+          cp target/release/pharos-compositor target/release/pharos-panel \
+             target/release/pharos-tray target/release/pharos-usbimport "stage/$H/"
+          cp packaging/systemd/*.service "stage/$H/systemd/"
+          cp packaging/desktop/pharos-panel.desktop packaging/icons/pharos.png \
+             LICENSE README.md "stage/$H/"
+
+          C="trireme-$VER-linux-x86_64"
+          mkdir -p "stage/$C"
+          cp target/release/trireme target/release/trireme-kms "stage/$C/"
+          cp packaging/desktop/trireme.desktop packaging/icons/trireme.png \
+             LICENSE README.md "stage/$C/"
+
+          tar -C stage -czf "dist/$H.tar.gz" "$H"
+          tar -C stage -czf "dist/$C.tar.gz" "$C"
+          ls -sh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: dist/*
+
+  windows:
+    name: windows (host exes)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build release binaries
+        run: cargo build --release --locked -p pharos-win -p pharos-tray -p pharos-panel
+      - name: collect
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/pharos-host.exe target/release/pharos-tray.exe \
+             target/release/pharos-panel.exe dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-binaries
+          path: dist/*
+
+  release:
+    name: attach assets to the release
+    needs: [linux, windows]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      # Upload into an existing release for this tag (the `gh release create
+      # vX.Y.Z` flow), or create one if the tag was pushed bare.
+      - name: create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "$GITHUB_REF_NAME" --generate-notes -R "$GITHUB_REPOSITORY"
+          fi

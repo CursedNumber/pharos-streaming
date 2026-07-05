@@ -1,0 +1,23 @@
+# Pharos tray: the lighthouse status icon (user unit, KDE/SNI).
+#
+# Enable with:  systemctl --user enable --now pharos-tray
+#
+# Deliberately independent of pharos-host.service: the tray must stay up (and
+# show "offline") when the host stack is down or crash-looping, so it is never
+# tied to the host unit's lifecycle.
+
+[Unit]
+Description=Pharos system-tray status icon
+Documentation=https://github.com/CursedNumber/pharos-streaming
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/pharos-tray
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=info
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+
+[Install]
+WantedBy=graphical-session.target

@@ -3,6 +3,7 @@ name = "trireme"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Trireme game-streaming client for Pharos hosts"
 
 # The Linux reference client. Reuses the shared Rust `transport` directly (no
 # JNI hop) and decodes with NVDEC. The KMP/Compose-Desktop GUI can layer on top.
@@ -63,3 +64,41 @@ default = []
 # Compile in the native SPICE source (`protocol = "spice"`). Requires the
 # spice-gtk system library at build time (pkg-config: spice-client-glib-2.0).
 spice = ["dep:media-spice"]
+
+# ---------------------------------------------------------------------------
+# Debian packaging (issue #7): the client .deb. `cargo deb -p trireme
+# --no-build` after a workspace release build; ships both players (the
+# windowed desktop client and the headless KMS one for SBCs/TVs). Built by
+# .github/workflows/release.yml on tag push.
+# ---------------------------------------------------------------------------
+[package.metadata.deb]
+name = "trireme"
+maintainer = "CursedNumber <16852735+CursedNumber@users.noreply.github.com>"
+copyright = "2026 The Pharos/Trireme authors"
+license-file = ["../../LICENSE", "0"]
+section = "video"
+priority = "optional"
+extended-description = """\
+Trireme is the client side of Pharos, a clean-slate game-streaming stack in
+the Sunshine/Moonlight lineage: video arrives as HEVC/AV1 over QUIC, decodes
+through ffmpeg's hardware paths (cuvid/qsv/v4l2/rkmpp), and local input
+(keyboard, mouse, gamepads, even raw USB devices over USB/IP) flows back to
+the host. This package ships two players: trireme (windowed desktop client
+with LAN auto-discovery and a server selector) and trireme-kms (headless
+DRM/KMS player for SBCs and TVs; no desktop session needed).
+.
+Decode is delegated to the ffmpeg CLI; audio plays through a
+PulseAudio-compatible server (PipeWire's pipewire-pulse works)."""
+# Explicit, curated from `ldd` of the release binaries. ffmpeg is spawned as
+# a subprocess for video decode; pacat (pulseaudio-utils) for audio playback.
+depends = "libc6 (>= 2.35), libgcc-s1, libdrm2, libexpat1, libgbm1, libopus0, libudev1, libusb-1.0-0, ffmpeg, pulseaudio-utils"
+# The desktop player dlopens Wayland/X11/Vulkan at runtime; trireme-kms
+# dlopens EGL/GLES for its GBM scanout path.
+recommends = "libegl1, libgles2, libvulkan1, libwayland-client0, libx11-6, libxkbcommon0"
+assets = [
+    ["target/release/trireme", "usr/bin/", "755"],
+    ["target/release/trireme-kms", "usr/bin/", "755"],
+    ["../../packaging/desktop/trireme.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/icons/trireme.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["../../README.md", "usr/share/doc/trireme/", "644"],
+]
