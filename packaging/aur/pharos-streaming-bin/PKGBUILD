@@ -1,0 +1,60 @@
+# Maintainer: CursedNumber <16852735+CursedNumber@users.noreply.github.com>
+#
+# Binary split package: repacks the prebuilt Linux tarballs attached to the
+# tagged GitHub release (built on Ubuntu 22.04, glibc 2.35 floor, so they run
+# on any current Arch). Compile-from-source counterpart: pharos-streaming.
+#
+# Before pushing to the AUR: run `updpkgsums` against the real release assets
+# (sha256sums below are SKIP until the release exists), then regenerate
+# .SRCINFO with `makepkg --printsrcinfo > .SRCINFO`.
+
+pkgbase=pharos-streaming-bin
+pkgname=(pharos-bin trireme-bin)
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Clean-slate game-streaming stack in the Sunshine/Moonlight lineage (Pharos host + Trireme client, prebuilt)"
+arch=(x86_64)
+url="https://github.com/CursedNumber/pharos-streaming"
+license=(GPL-3.0-or-later)
+source=(
+  "$url/releases/download/v$pkgver/pharos-$pkgver-linux-x86_64.tar.gz"
+  "$url/releases/download/v$pkgver/trireme-$pkgver-linux-x86_64.tar.gz"
+)
+sha256sums=('SKIP'
+            'SKIP')
+
+package_pharos-bin() {
+  pkgdesc="Pharos game-streaming host (headless Wayland compositor + NVENC, prebuilt)"
+  depends=(glibc gcc-libs nvidia-utils mesa libdrm libxkbcommon pixman expat opus libpulse)
+  optdepends=(
+    'vulkan-driver: GPU-accelerated pharos-panel UI'
+  )
+  provides=(pharos)
+  conflicts=(pharos)
+
+  cd "pharos-$pkgver-linux-x86_64"
+  install -Dm755 pharos-{compositor,panel,tray,usbimport} -t "$pkgdir/usr/bin"
+  install -Dm644 systemd/pharos-{host,tray}.service \
+    -t "$pkgdir/usr/lib/systemd/user"
+  install -Dm644 systemd/pharos-usbimport.service \
+    -t "$pkgdir/usr/lib/systemd/system"
+  install -Dm644 pharos-panel.desktop -t "$pkgdir/usr/share/applications"
+  install -Dm644 pharos.png \
+    "$pkgdir/usr/share/icons/hicolor/256x256/apps/pharos.png"
+}
+
+package_trireme-bin() {
+  pkgdesc="Trireme game-streaming client for Pharos hosts (desktop + headless KMS players, prebuilt)"
+  depends=(glibc gcc-libs mesa libdrm expat opus libusb systemd-libs ffmpeg libpulse)
+  optdepends=(
+    'vulkan-driver: GPU-accelerated presentation in the desktop player'
+  )
+  provides=(trireme)
+  conflicts=(trireme)
+
+  cd "trireme-$pkgver-linux-x86_64"
+  install -Dm755 trireme{,-kms} -t "$pkgdir/usr/bin"
+  install -Dm644 trireme.desktop -t "$pkgdir/usr/share/applications"
+  install -Dm644 trireme.png \
+    "$pkgdir/usr/share/icons/hicolor/256x256/apps/trireme.png"
+}

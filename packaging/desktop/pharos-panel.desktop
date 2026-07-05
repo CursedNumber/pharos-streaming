@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Pharos Panel
+GenericName=Streaming Host Control Panel
+Comment=Configure and monitor the Pharos game-streaming host
+Exec=pharos-panel
+Icon=pharos
+Terminal=false
+Categories=Settings;
+Keywords=pharos;streaming;game;remote;host;moonlight;sunshine;

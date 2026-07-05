@@ -3,6 +3,7 @@ name = "compositor"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Pharos game-streaming host (headless Wayland compositor + NVENC)"
 
 [dependencies]
 anyhow = "1"
@@ -78,3 +79,52 @@ path = "src/main.rs"
 # Scaffold for mirroring an existing KDE/GNOME Wayland session (BATTLE_PLAN §6
 # "session-mirror", M6). Needs libpipewire-0.3 headers + clang at build time.
 portal-mirror = ["dep:ashpd", "dep:pipewire"]
+
+# ---------------------------------------------------------------------------
+# Debian packaging (issue #7). This crate doubles as the anchor for the host
+# .deb: `cargo deb -p compositor --no-build` after a workspace release build
+# packages ALL four host binaries (they live in sibling crates; cargo-deb only
+# needs one crate to hang the metadata on, and the compositor is the heart of
+# the host stack). Built by .github/workflows/release.yml on tag push.
+# ---------------------------------------------------------------------------
+[package.metadata.deb]
+name = "pharos"
+maintainer = "CursedNumber <16852735+CursedNumber@users.noreply.github.com>"
+copyright = "2026 The Pharos/Trireme authors"
+license-file = ["../../LICENSE", "0"]
+section = "video"
+priority = "optional"
+extended-description = """\
+Pharos is a clean-slate game-streaming host in the Sunshine/Moonlight
+lineage: a headless Wayland compositor captures apps zero-copy into NVENC
+(HEVC/AV1), streams over QUIC, and injects client input back as evdev/uinput
+devices. This package ships the host stack: pharos-compositor (the streaming
+host), pharos-panel (desktop control panel), pharos-tray (status tray icon),
+and pharos-usbimport (USB/IP import bridge, optional), plus systemd units
+for all three services.
+.
+Requires an NVIDIA GPU with the proprietary driver (libnvidia-encode /
+libnvcuvid) for encoding, and a PulseAudio-compatible sound server
+(PipeWire's pipewire-pulse works) for audio capture.
+.
+Start with: systemctl --user enable --now pharos-host pharos-tray"""
+# Explicit, curated from `ldd` of the release binaries (dpkg-shlibdeps would
+# pin the exact libnvidia-encode-NNN driver package, which must stay a soft
+# requirement; see Recommends).
+depends = "libc6 (>= 2.35), libgcc-s1, libdrm2, libexpat1, libgbm1, libopus0, libpixman-1-0, libxkbcommon0, pulseaudio-utils"
+# The compositor dlopens EGL/GLES for rendering and needs the NVIDIA driver's
+# encode/decode libs at load time; the panel presents via Vulkan/Wayland.
+# All soft deps: package names for the NVIDIA bits vary per driver series.
+recommends = "libegl1, libgles2, libvulkan1, libwayland-client0"
+assets = [
+    ["target/release/pharos-compositor", "usr/bin/", "755"],
+    ["target/release/pharos-panel", "usr/bin/", "755"],
+    ["target/release/pharos-tray", "usr/bin/", "755"],
+    ["target/release/pharos-usbimport", "usr/bin/", "755"],
+    ["../../packaging/systemd/pharos-host.service", "usr/lib/systemd/user/", "644"],
+    ["../../packaging/systemd/pharos-tray.service", "usr/lib/systemd/user/", "644"],
+    ["../../packaging/systemd/pharos-usbimport.service", "usr/lib/systemd/system/", "644"],
+    ["../../packaging/desktop/pharos-panel.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/icons/pharos.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["../../README.md", "usr/share/doc/pharos/", "644"],
+]
