@@ -18,10 +18,12 @@ use windows::Win32::Graphics::Gdi::{EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT
 /// pipeline encodes at native size; nothing scales).
 ///
 /// The size comes from the output's CURRENT DISPLAY MODE, not its desktop
-/// coordinates: this process is not DPI-aware, so `DesktopCoordinates` (like
-/// `GetMonitorInfo`) is DPI-virtualized (a 3840x2160 desktop at 300% scale
-/// reads 1280x720), while Desktop Duplication frames are always physical
-/// pixels. `EnumDisplaySettings` reports the mode and is never virtualized.
+/// coordinates: `DesktopCoordinates` (like `GetMonitorInfo`) is DPI-virtualized
+/// for a non-DPI-aware process (a 3840x2160 desktop at 300% scale reads
+/// 1280x720), while Desktop Duplication frames are always physical pixels.
+/// main() opts the process into per-monitor DPI awareness (issue #8), which
+/// also fixes those queries, but `EnumDisplaySettings` reports the mode and is
+/// correct under EVERY awareness state; keep it as the authoritative source.
 pub fn dda_output_size(output_idx: u32) -> Result<(u32, u32)> {
     let factory = unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }.context("CreateDXGIFactory1")?;
     let adapter = unsafe { factory.EnumAdapters1(0) }.context("DXGI adapter 0")?;

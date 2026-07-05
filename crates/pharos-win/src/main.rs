@@ -29,6 +29,25 @@ fn main() -> anyhow::Result<()> {
     use std::net::SocketAddr;
 
     init_tracing();
+    // Physical pixels everywhere (issue #8): without this the process is
+    // DPI-virtualized and every GDI/user32 monitor query lies by the scale
+    // factor (a 3840x2160 desktop at 300% reads 1280x720), poisoning the WGC
+    // monitor list and the pre-connect geometry announce. WGC's item.Size()
+    // and Desktop Duplication frames were always physical; this makes the
+    // rest of the process agree with them. Input is unaffected (the absolute
+    // path maps normalized 0..1 to SendInput's 0..65535, no pixel metrics).
+    // Must run before any monitor API; a failure (unlikely on Win10 1703+)
+    // just leaves the old virtualized behavior, so log and continue.
+    unsafe {
+        use windows::Win32::UI::HiDpi::{
+            SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        };
+        if let Err(e) = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) {
+            tracing::warn!(
+                "SetProcessDpiAwarenessContext failed: {e} (monitor sizes may be DPI-scaled)"
+            );
+        }
+    }
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         // `pharos-host pair [addr]` — run the pairing listener (shared crate).
