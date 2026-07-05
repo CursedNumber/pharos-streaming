@@ -157,6 +157,7 @@ mod windows {
     ///   3. %ProgramFiles(x86)%\Steam\Steam.exe
     ///   4. %ProgramFiles%\Steam\Steam.exe
     ///   5. bare "Steam.exe" (rely on %PATH%)
+    ///
     /// The debug log records which path won so a wrong guess is recoverable.
     fn resolve_steam_exe() -> (String, &'static str) {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);

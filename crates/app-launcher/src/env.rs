@@ -129,7 +129,7 @@ pub fn detect_steam() -> SteamInstall {
                 return SteamInstall::Windows { root };
             }
         }
-        return SteamInstall::None;
+        SteamInstall::None
     }
     #[cfg(not(windows))]
     {

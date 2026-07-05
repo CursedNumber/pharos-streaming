@@ -639,6 +639,8 @@ fn pid_alive(pid: u32) -> bool {
 
 /// Resolve an entry's concrete launch line (+ shell flag), mirroring [`launch`]'s
 /// front matter, so running/kill can detect the Steam handoff + appid.
+/// Linux-only like its callers (the /proc-based running/kill machinery).
+#[cfg(target_os = "linux")]
 fn resolved_line(entry: &AppEntry) -> (String, bool) {
     let kind = entry.resolved_kind();
     let install = detect_steam();
@@ -648,6 +650,7 @@ fn resolved_line(entry: &AppEntry) -> (String, bool) {
 /// The Steam appid this entry launches, if any (it hands off to Steam by URI).
 /// `appid 0` is rejected — `rungameid/0` is a Steam sentinel, not a real game, and
 /// an over-broad `AppId=0` marker would sweep unrelated processes.
+#[cfg(target_os = "linux")]
 fn entry_steam_appid(entry: &AppEntry) -> Option<u32> {
     let (line, _) = resolved_line(entry);
     appid_for_line(line.trim())
@@ -656,6 +659,7 @@ fn entry_steam_appid(entry: &AppEntry) -> Option<u32> {
 /// The Steam appid a resolved launch line targets (0 / non-Steam → None). Split
 /// from [`entry_steam_appid`] so callers that already resolved the line (and the
 /// Steam install) don't re-probe the filesystem per entry.
+#[cfg(target_os = "linux")]
 fn appid_for_line(line: &str) -> Option<u32> {
     if launches_via_steam(line) {
         parse_steam_appid(line).filter(|&a| a != 0)
@@ -1057,12 +1061,18 @@ mod tests {
     #[test]
     fn idempotent_second_launch_of_live_pid_is_noop() {
         // First launch spawns; record the slug→pid in the registry. A long-lived
-        // child (`sleep`) keeps /proc/<pid> alive across the second call.
+        // child keeps the pid alive across the second call: `sleep` on Unix,
+        // `ping -n` on Windows (ships in System32; there is no `sleep.exe`).
         let slug = format!("idem-test-{}", std::process::id());
+        let long_lived = if cfg!(windows) {
+            "ping -n 30 127.0.0.1"
+        } else {
+            "sleep 30"
+        };
         let e = AppEntry {
             slug: slug.clone(),
             name: "Idem".into(),
-            command: "sleep 30".into(),
+            command: long_lived.into(),
             ..AppEntry::new()
         };
         let first = launch(&e, &LaunchContext::default()).expect("first launch");
