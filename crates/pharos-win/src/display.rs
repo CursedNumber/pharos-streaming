@@ -9,11 +9,19 @@
 //! multi-monitor rigs.
 
 use anyhow::{anyhow, Context, Result};
+use windows::core::PCWSTR;
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, DXGI_OUTPUT_DESC};
+use windows::Win32::Graphics::Gdi::{EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS};
 
 /// Pixel size of DXGI output `output_idx` on adapter 0: the monitor ffmpeg's
 /// `ddagrab` captures, and therefore the encoded stream size (the ddagrab
 /// pipeline encodes at native size; nothing scales).
+///
+/// The size comes from the output's CURRENT DISPLAY MODE, not its desktop
+/// coordinates: this process is not DPI-aware, so `DesktopCoordinates` (like
+/// `GetMonitorInfo`) is DPI-virtualized (a 3840x2160 desktop at 300% scale
+/// reads 1280x720), while Desktop Duplication frames are always physical
+/// pixels. `EnumDisplaySettings` reports the mode and is never virtualized.
 pub fn dda_output_size(output_idx: u32) -> Result<(u32, u32)> {
     let factory = unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }.context("CreateDXGIFactory1")?;
     let adapter = unsafe { factory.EnumAdapters1(0) }.context("DXGI adapter 0")?;
@@ -21,14 +29,28 @@ pub fn dda_output_size(output_idx: u32) -> Result<(u32, u32)> {
         .with_context(|| format!("DXGI output {output_idx} on adapter 0"))?;
     let mut desc = DXGI_OUTPUT_DESC::default();
     unsafe { output.GetDesc(&mut desc) }.context("DXGI output GetDesc")?;
-    let r = desc.DesktopCoordinates;
-    let (w, h) = (
-        (r.right - r.left).max(0) as u32,
-        (r.bottom - r.top).max(0) as u32,
-    );
+
+    let mut dm = DEVMODEW {
+        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    let ok = unsafe {
+        EnumDisplaySettingsW(
+            PCWSTR(desc.DeviceName.as_ptr()),
+            ENUM_CURRENT_SETTINGS,
+            &mut dm,
+        )
+    };
+    if !ok.as_bool() {
+        return Err(anyhow!(
+            "EnumDisplaySettingsW({}) failed",
+            String::from_utf16_lossy(&desc.DeviceName)
+        ));
+    }
+    let (w, h) = (dm.dmPelsWidth, dm.dmPelsHeight);
     if w == 0 || h == 0 {
         return Err(anyhow!(
-            "DXGI output {output_idx} reports {w}x{h} (detached or disabled?)"
+            "DXGI output {output_idx} reports mode {w}x{h} (detached or disabled?)"
         ));
     }
     Ok((w, h))
