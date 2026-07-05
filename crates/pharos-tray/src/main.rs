@@ -140,7 +140,6 @@ fn detect_state() -> State {
     State::from_status(connected, status.as_ref(), faulted_offline)
 }
 
-
 /// One rasterized icon as straight RGBA (premultiplied, per tiny-skia). The
 /// Linux backend byte-swaps this into SNI's ARGB; the Windows backend feeds it
 /// to `tray_icon::Icon::from_rgba` directly.
@@ -233,7 +232,6 @@ fn host_launcher() -> String {
         .to_string_lossy()
         .into_owned()
 }
-
 
 #[cfg(test)]
 mod state_tests {

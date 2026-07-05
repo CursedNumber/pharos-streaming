@@ -504,7 +504,10 @@ fn run_stream(
                         set_health(
                             &gpu_health,
                             control_ipc::GpuHealth::Faulted {
-                                reason: format!("encoder build failed after {} tries: {e}", breaker.max),
+                                reason: format!(
+                                    "encoder build failed after {} tries: {e}",
+                                    breaker.max
+                                ),
                                 last_xid: None,
                             },
                         );
@@ -567,7 +570,10 @@ fn run_stream(
             set_health(
                 &gpu_health,
                 control_ipc::GpuHealth::Faulted {
-                    reason: format!("GPU/encoder unrecoverable after {} restarts: {rmsg}", breaker.max),
+                    reason: format!(
+                        "GPU/encoder unrecoverable after {} restarts: {rmsg}",
+                        breaker.max
+                    ),
                     last_xid: None,
                 },
             );
@@ -781,7 +787,7 @@ fn spawn_stdout_reader(
             let mut buf = vec![0u8; 64 * 1024];
             loop {
                 match stdout.read(&mut buf) {
-                    Ok(0) => break,                 // ffmpeg exited
+                    Ok(0) => break, // ffmpeg exited
                     Ok(n) => {
                         if tx.send(buf[..n].to_vec()).is_err() {
                             break; // pump dropped the receiver
@@ -889,7 +895,10 @@ fn inner_pump(
                     }
                 }
                 if last_log.elapsed() >= Duration::from_secs(2) {
-                    info!("encode: {} access units sent", frames.load(Ordering::Relaxed));
+                    info!(
+                        "encode: {} access units sent",
+                        frames.load(Ordering::Relaxed)
+                    );
                     last_log = Instant::now();
                 }
             }
@@ -1165,7 +1174,7 @@ mod tests {
         assert!(s.should_fire(0, 120));
         assert!(!s.should_fire(0, 119));
         assert!(!s.should_fire(1, 500)); // one-shot fires in generation 0 only
-                                          // periodic: device_lost:30
+                                         // periodic: device_lost:30
         let p = parse_win_fault_inject("device_lost:30").unwrap();
         assert_eq!(p.periodic, Some(30));
         assert!(p.should_fire(0, 30));

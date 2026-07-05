@@ -309,9 +309,7 @@ pub fn mangohud_available() -> bool {
             return false;
         }
         let on_path = std::env::var_os("PATH")
-            .map(|paths| {
-                std::env::split_paths(&paths).any(|dir| dir.join("mangohud").is_file())
-            })
+            .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join("mangohud").is_file()))
             .unwrap_or(false);
         // The env-only path (MANGOHUD=1) needs the Vulkan implicit layer, which may
         // be present even when the `mangohud` wrapper binary isn't.
@@ -1017,7 +1015,10 @@ mod tests {
         // Overlay AND cap → visible HUD that also limits.
         let env = mangohud_env(Some(90), true);
         let cfg = &env.iter().find(|(k, _)| k == "MANGOHUD_CONFIG").unwrap().1;
-        assert!(cfg.contains("fps_limit=90") && cfg.contains("no_display=0"), "{cfg}");
+        assert!(
+            cfg.contains("fps_limit=90") && cfg.contains("no_display=0"),
+            "{cfg}"
+        );
     }
 
     #[test]

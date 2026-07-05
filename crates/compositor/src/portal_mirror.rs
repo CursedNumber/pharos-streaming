@@ -225,8 +225,9 @@ impl MirrorFrame {
 
     pub fn size(&self) -> (u32, u32) {
         match self {
-            MirrorFrame::DmaBuf { width, height, .. }
-            | MirrorFrame::Shm { width, height, .. } => (*width, *height),
+            MirrorFrame::DmaBuf { width, height, .. } | MirrorFrame::Shm { width, height, .. } => {
+                (*width, *height)
+            }
         }
     }
 }

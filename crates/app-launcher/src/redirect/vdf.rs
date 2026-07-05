@@ -423,10 +423,24 @@ mod tests {
             "\t\t\t\t\t\t\"LaunchOptions\"\t\t\"first %command%\"\n\t\t\t\t\t\t\"LaunchOptions\"\t\t\"second %command%\"",
         );
         let out = changed(set_launch_options(&f, 3321460, SHIM, TOKEN));
-        assert_eq!(out.matches('{').count(), f.matches('{').count(), "braces intact");
-        assert_eq!(out.matches('}').count(), f.matches('}').count(), "braces intact");
-        assert!(out.contains("\"first %command%\""), "first duplicate untouched");
-        assert!(out.contains(&format!("\"{SHIM} second %command%\"")), "last enveloped");
+        assert_eq!(
+            out.matches('{').count(),
+            f.matches('{').count(),
+            "braces intact"
+        );
+        assert_eq!(
+            out.matches('}').count(),
+            f.matches('}').count(),
+            "braces intact"
+        );
+        assert!(
+            out.contains("\"first %command%\""),
+            "first duplicate untouched"
+        );
+        assert!(
+            out.contains(&format!("\"{SHIM} second %command%\"")),
+            "last enveloped"
+        );
     }
 
     #[test]
@@ -438,8 +452,14 @@ mod tests {
             "\t\t\t\t\"News\"\n\t\t\t\t{\n\t\t\t\t\t\"LaunchOptions\"\t\t\"DECOY\"\n\t\t\t\t}\n\t\t\t\t\"apps\"",
         );
         let out = changed(set_launch_options(&f, 10, SHIM, TOKEN));
-        assert!(out.contains("\"DECOY\""), "decoy in other section untouched");
-        assert!(out.contains(&format!("\"{SHIM} %command%\"")), "real app 10 got the shim");
+        assert!(
+            out.contains("\"DECOY\""),
+            "decoy in other section untouched"
+        );
+        assert!(
+            out.contains(&format!("\"{SHIM} %command%\"")),
+            "real app 10 got the shim"
+        );
     }
 
     #[test]
@@ -451,8 +471,15 @@ mod tests {
             "\t\t\t\t\t\"3321460\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"LaunchOptions\"\t\t\"AAA %command%\"\n\t\t\t\t\t}\n\t\t\t\t\t\"3321460\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"LaunchOptions\"\t\t\"BBB %command%\"\n\t\t\t\t\t}",
         );
         let out = changed(set_launch_options(&f, 3321460, SHIM, TOKEN));
-        assert_eq!(out.matches('{').count(), f.matches('{').count(), "braces intact");
-        assert!(out.contains(&format!("\"{SHIM} AAA %command%\"")), "first block enveloped");
+        assert_eq!(
+            out.matches('{').count(),
+            f.matches('{').count(),
+            "braces intact"
+        );
+        assert!(
+            out.contains(&format!("\"{SHIM} AAA %command%\"")),
+            "first block enveloped"
+        );
         assert!(out.contains("\"BBB %command%\""), "second block untouched");
     }
 

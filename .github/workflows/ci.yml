@@ -5,6 +5,12 @@ on:
     branches: [ main ]
   pull_request:
 
+env:
+  # audiopus_sys bundles libopus whose CMakeLists declares an ancient
+  # cmake_minimum_required; CMake 4 (now on the runners) refuses to configure
+  # it without this compatibility floor.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
 jobs:
   rust:
     name: rust (${{ matrix.os }})
