@@ -400,15 +400,35 @@ fn run_stream(
 
     // Input back-channel → SendInput, on its own thread. `try_recv` works
     // outside a tokio runtime; sleep briefly when the queue is empty.
+    // Telemetry: the first few events verbatim plus a periodic rate line, so a
+    // silent input path (client not sending vs host not injecting) is
+    // diagnosable from the host log alone.
     if let Some(mut rx) = streamer.take_input_rx() {
         std::thread::Builder::new()
             .name("input-inject".into())
             .spawn(move || {
                 let injector = input::Injector::new();
+                let mut seen: u64 = 0;
+                let mut window: u64 = 0;
+                let mut last_rate = Instant::now();
                 loop {
                     match rx.try_recv() {
-                        Ok(ev) => injector.dispatch(&ev),
+                        Ok(ev) => {
+                            seen += 1;
+                            window += 1;
+                            if seen <= 20 {
+                                tracing::info!("input[{seen}]: {ev:?}");
+                            }
+                            injector.dispatch(&ev);
+                        }
                         Err(_) => std::thread::sleep(Duration::from_millis(1)),
+                    }
+                    if last_rate.elapsed() >= Duration::from_secs(5) {
+                        if window > 0 {
+                            tracing::info!("input: {window} events in last 5s ({seen} total)");
+                        }
+                        last_rate = Instant::now();
+                        window = 0;
                     }
                 }
             })?;
@@ -701,10 +721,24 @@ fn spawn_pacer(
                 // further queued frames so we always emit the newest one.
                 let now = Instant::now();
                 if now < next {
-                    if let Some(f) = cap.recv_timeout(next - now) {
-                        last = Some(f.bgra);
-                        while let Some(f2) = cap.try_recv() {
-                            last = Some(f2.bgra);
+                    match cap.recv_timeout(next - now) {
+                        wgc::Recv::Frame(f) => {
+                            last = Some(f.bgra);
+                            while let wgc::Recv::Frame(f2) = cap.try_recv() {
+                                last = Some(f2.bgra);
+                            }
+                        }
+                        wgc::Recv::Empty => {}
+                        // Capture thread died (device/session fault). Stop the
+                        // pacer: dropping ffmpeg's stdin EOFs the encoder, the
+                        // pump reports the fault, and the supervisor respawns
+                        // with a fresh WGC session + D3D11 device. Without this
+                        // the held frame streams on as a silent freeze-frame.
+                        wgc::Recv::Dead => {
+                            tracing::warn!(
+                                "wgc-pacer: capture thread gone; stopping so the supervisor respawns"
+                            );
+                            break;
                         }
                     }
                 }
@@ -1122,7 +1156,7 @@ fn run_wgc_test(monitor_idx: usize, frames: u32, out: &str) -> anyhow::Result<()
     let mut wrote = false;
     while n < frames && t0.elapsed() < std::time::Duration::from_secs(5) {
         match cap.recv_timeout(std::time::Duration::from_millis(1000)) {
-            Some(f) => {
+            wgc::Recv::Frame(f) => {
                 n += 1;
                 // Keep the latest frame on disk, so even a single (change-driven)
                 // frame yields an inspectable image.
@@ -1132,7 +1166,10 @@ fn run_wgc_test(monitor_idx: usize, frames: u32, out: &str) -> anyhow::Result<()
                     info!("  {n} frames…");
                 }
             }
-            None => info!("  no new frame within 1s (WGC is change-driven; idle desktop)"),
+            wgc::Recv::Empty => {
+                info!("  no new frame within 1s (WGC is change-driven; idle desktop)")
+            }
+            wgc::Recv::Dead => anyhow::bail!("WGC capture thread died mid-test"),
         }
     }
     let secs = t0.elapsed().as_secs_f64().max(1e-6);

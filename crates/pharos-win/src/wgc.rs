@@ -14,7 +14,9 @@
 //! that owns all the (non-Send) COM objects — only the finished `Vec<u8>` BGRA
 //! frame crosses the channel, so we avoid wrapping COM handles in `Send`.
 
-use std::sync::mpsc::{sync_channel, Receiver, Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{
+    sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError,
+};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -46,6 +48,18 @@ pub struct Frame {
     pub width: u32,
     pub height: u32,
     pub bgra: Vec<u8>,
+}
+
+/// Result of polling the capturer: a fresh frame, nothing new (WGC is
+/// change-driven, so a static screen is LEGITIMATE idle), or `Dead` — the
+/// capture thread exited (device/session fault) and no frame will ever come
+/// again. Callers must treat `Dead` as a pipeline fault: conflating it with
+/// idle is how a wedged capture turns into a silent 60 fps freeze-frame (the
+/// pacer would re-emit the held frame forever and nothing downstream notices).
+pub enum Recv {
+    Frame(Frame),
+    Empty,
+    Dead,
 }
 
 pub struct WgcCapturer {
@@ -80,23 +94,35 @@ impl WgcCapturer {
         ))
     }
 
-    /// Block for the next frame, or `None` once the capture thread has stopped.
+    /// Block for the next frame, or [`Recv::Dead`] once the capture thread has
+    /// stopped.
     #[allow(dead_code)] // the host loop will use the blocking form
-    pub fn recv(&self) -> Option<Frame> {
-        self.rx.recv().ok()
+    pub fn recv(&self) -> Recv {
+        match self.rx.recv() {
+            Ok(f) => Recv::Frame(f),
+            Err(_) => Recv::Dead,
+        }
     }
 
     /// Like [`recv`], but gives up after `dur` (WGC is change-driven, so a static
     /// screen produces no new frames — callers pace/hold the last frame).
-    pub fn recv_timeout(&self, dur: Duration) -> Option<Frame> {
-        self.rx.recv_timeout(dur).ok()
+    pub fn recv_timeout(&self, dur: Duration) -> Recv {
+        match self.rx.recv_timeout(dur) {
+            Ok(f) => Recv::Frame(f),
+            Err(RecvTimeoutError::Timeout) => Recv::Empty,
+            Err(RecvTimeoutError::Disconnected) => Recv::Dead,
+        }
     }
 
-    /// Non-blocking: the next queued frame, or `None` if none is ready. The pacer
-    /// drains with this to keep only the freshest frame (the bounded channel holds
-    /// at most a couple, so stale frames don't accumulate).
-    pub fn try_recv(&self) -> Option<Frame> {
-        self.rx.try_recv().ok()
+    /// Non-blocking: the next queued frame if one is ready. The pacer drains with
+    /// this to keep only the freshest frame (the bounded channel holds at most a
+    /// couple, so stale frames don't accumulate).
+    pub fn try_recv(&self) -> Recv {
+        match self.rx.try_recv() {
+            Ok(f) => Recv::Frame(f),
+            Err(TryRecvError::Empty) => Recv::Empty,
+            Err(TryRecvError::Disconnected) => Recv::Dead,
+        }
     }
 }
 
@@ -129,20 +155,37 @@ fn capture_loop(
 
         let row_bytes = (w as usize) * 4;
         let mut staging: Option<ID3D11Texture2D> = None;
-        let mut empties = 0u64;
         let mut got_first = false;
+        let mut gap_start: Option<std::time::Instant> = None;
+        let mut gap_logged = false;
         loop {
             let frame = match pool.TryGetNextFrame() {
                 Ok(f) => f,
-                Err(_) => {
-                    empties += 1;
-                    if empties == 500 {
-                        tracing::warn!("WGC: no frame after ~1s of polling TryGetNextFrame");
+                // windows-rs surfaces WinRT's "no frame available" null return
+                // as Err with an OK code; anything else is a real device or
+                // session fault. Treating faults as idle is the silent-freeze
+                // bug: the thread would poll forever while the pacer re-emits
+                // the last frame as a perfectly healthy-looking stream.
+                Err(e) if e.code().is_ok() => {
+                    let start = *gap_start.get_or_insert_with(std::time::Instant::now);
+                    if !gap_logged && start.elapsed() > Duration::from_secs(2) {
+                        gap_logged = true;
+                        tracing::debug!("WGC: no frames for 2s (change-driven idle)");
                     }
                     std::thread::sleep(Duration::from_millis(2));
                     continue;
                 }
+                Err(e) => return Err(anyhow!("TryGetNextFrame: {e:?} (capture session dead)")),
             };
+            if let Some(start) = gap_start.take() {
+                if gap_logged {
+                    tracing::info!(
+                        "WGC: frames resumed after a {:.1}s gap",
+                        start.elapsed().as_secs_f64()
+                    );
+                }
+                gap_logged = false;
+            }
             if !got_first {
                 tracing::info!("WGC: first frame retrieved");
                 got_first = true;
