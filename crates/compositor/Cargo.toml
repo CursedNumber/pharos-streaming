@@ -64,7 +64,17 @@ sd-notify = "0.4"
 # for the status text (composited once into the streamed background).
 pharos-assets = { path = "../pharos-assets" }
 ab_glyph = "0.2"
+# Experimental session-mirror capture (mirror the user's REAL desktop instead of
+# the headless Pharos session): xdg-desktop-portal RemoteDesktop+ScreenCast via
+# ashpd, frames via PipeWire. Off by default; see the `portal-mirror` feature.
+ashpd = { version = "0.13.12", default-features = false, features = ["tokio", "remote_desktop", "screencast"], optional = true }
+pipewire = { version = "0.10.0", optional = true }
 
 [[bin]]
 name = "pharos-compositor"
 path = "src/main.rs"
+
+[features]
+# Scaffold for mirroring an existing KDE/GNOME Wayland session (BATTLE_PLAN §6
+# "session-mirror", M6). Needs libpipewire-0.3 headers + clang at build time.
+portal-mirror = ["dep:ashpd", "dep:pipewire"]

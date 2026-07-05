@@ -23,6 +23,8 @@ COMMANDS:
     pair                           run the pairing flow
     nvenc-test[-hdr] [out] [frames]             NVENC test pattern (SDR / HDR10)
     input-demo [out] [frames]      inject keystrokes + capture the echo
+    mirror                         EXPERIMENTAL: portal session-mirror smoke test
+                                   (needs a build with --features portal-mirror)
     -h, --help                     print this help
     -V, --version                  print version
 
@@ -170,6 +172,11 @@ fn main() -> anyhow::Result<()> {
             let frames = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(120u32);
             compositor::nvenc::encode_test_pattern_hdr10(1920, 1080, 60, frames, out)
         }
+        // EXPERIMENTAL session-mirror smoke test: negotiate the portal session
+        // against the user's real desktop, stream a few frames from the first
+        // monitor, and report what arrives (dmabuf vs shm, format, size).
+        // Proves the portal + PipeWire plumbing without touching the encoder.
+        Some("mirror") => run_mirror_smoke(),
         Some("--help") | Some("-h") | Some("help") => {
             println!("{USAGE}");
             Ok(())
@@ -180,6 +187,77 @@ fn main() -> anyhow::Result<()> {
         }
         _ => compositor::run_headless(1920, 1080, 60_000),
     }
+}
+
+/// `mirror` (feature `portal-mirror`): the session-mirror smoke test. Opens the
+/// combined RemoteDesktop+ScreenCast portal session (one permission dialog on
+/// the real desktop), connects a PipeWire stream to the first granted monitor,
+/// and prints what arrives for ~10 seconds. No encoding, no streaming; this
+/// exists to prove the portal + PipeWire legs on a rig before the GL/NVENC
+/// wiring lands.
+#[cfg(all(target_os = "linux", feature = "portal-mirror"))]
+fn run_mirror_smoke() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use compositor::portal_mirror;
+
+    // Current-thread runtime for the async portal negotiation. The zbus
+    // executor is only needed while negotiating; once the cast is running,
+    // frames flow over PipeWire regardless (the D-Bus connection object
+    // stays open, which is all the portal requires).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let session = rt.block_on(portal_mirror::MirrorSession::open(None))?;
+    println!(
+        "portal session: {} stream(s) granted, restore_token={}",
+        session.streams.len(),
+        session.restore_token.as_deref().unwrap_or("(none)"),
+    );
+    for s in &session.streams {
+        println!(
+            "  node {} size {:?} position {:?}",
+            s.node_id, s.size, s.position
+        );
+    }
+    let first = session
+        .streams
+        .first()
+        .context("the portal granted no streams")?;
+
+    let (tx, rx) = std::sync::mpsc::sync_channel::<portal_mirror::MirrorFrame>(4);
+    let handle = portal_mirror::spawn_frame_stream(first.node_id, tx)?;
+
+    let mut count = 0u32;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(frame) => {
+                count += 1;
+                if count == 1 || count.is_multiple_of(30) {
+                    let (w, h) = frame.size();
+                    println!("frame {count}: {} {}x{}", frame.kind(), w, h);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    handle.stop();
+    drop(session);
+    anyhow::ensure!(count > 0, "no frames arrived within 10s");
+    println!("mirror smoke test OK: {count} frame(s) received");
+    Ok(())
+}
+
+/// `mirror` without the feature: explain how to get it instead of silently
+/// falling through to the headless default.
+#[cfg(all(target_os = "linux", not(feature = "portal-mirror")))]
+fn run_mirror_smoke() -> anyhow::Result<()> {
+    eprintln!(
+        "this build has no session-mirror support; rebuild with\n    \
+         cargo build -p compositor --features portal-mirror\n\
+         (needs libpipewire-0.3 headers + clang)"
+    );
+    std::process::exit(2);
 }
 
 /// `launch-app <slug>`: connect to the running host's control socket, ask it to

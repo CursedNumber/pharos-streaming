@@ -9,7 +9,8 @@
 pub enum CaptureBackend {
     /// Linux: hand-rolled Smithay headless compositor (primary path).
     SmithayHeadless,
-    /// Linux: mirror an existing KDE/GNOME session via PipeWire portal (M6).
+    /// Linux: mirror an existing KDE/GNOME session via PipeWire portal; scaffolded
+    /// behind the compositor crate's `portal-mirror` feature (compositor::portal_mirror).
     PipewirePortal,
     /// Windows: IddCx virtual display + Windows.Graphics.Capture.
     WindowsIddcx,

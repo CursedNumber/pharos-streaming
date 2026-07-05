@@ -11,6 +11,7 @@ configuration files. For an overview and the feature list, see
   - [pharos-compositor](#pharos-compositor-linux-host) · [pharos-host](#pharos-host-windows-host) · [hostd](#hostd) · [trireme](#trireme-desktop-client) · [trireme-usbexport](#trireme-usbexport) · [pharos-usbimport](#pharos-usbimport)
 - [Environment variables](#environment-variables)
 - [Configuration files](#configuration-files)
+- [Desktop mirroring (experimental)](#desktop-mirroring-experimental)
 - [Pairing & trust model](#pairing--trust-model)
 - [Input capture & pacing](#input-capture--pacing)
 
@@ -117,6 +118,9 @@ DIAGNOSTIC / TEST
   nvenc-test [out] [frames]        Direct NVENC-from-CUDA SDR test pattern.
   nvenc-test-hdr [out] [frames]    10-bit HEVC Main10 (BT.2020/PQ + HDR10 SEI) pattern.
   input-demo [out] [frames]        Launch `alacritty -e cat`, inject "pharos", capture.
+  mirror                           EXPERIMENTAL session-mirror smoke test; needs a
+                                   build with --features portal-mirror (see the
+                                   Desktop mirroring section below).
 
 CONTROL / MANAGEMENT
   launch-app <slug>                Ask the RUNNING host to launch a saved app
@@ -542,6 +546,40 @@ disconnect = "Ctrl+Alt+Backspace"
 ```
 
 ---
+
+## Desktop mirroring (experimental)
+
+Pharos's primary model is the **headless session**: the compositor owns a virtual
+display, and apps launch into it. Mirroring your **real** desktop session (the
+KDE/GNOME desktop you are physically using) is a separate capture source, in two
+stages of doneness:
+
+**Today, via VNC:** the Trireme player's native VNC source works against any VNC
+server, so running one on your desktop session gives an interactive (keyboard +
+pointer) mirror right now; add a `protocol = "vnc"` source pointing at it (see
+the sources config above). Expect VNC-tier latency and quality, not the HEVC
+pipeline; on Plasma 6 Wayland note that KDE's built-in remote desktop speaks RDP,
+so you need an actual VNC server (e.g. `krfb`) for this route.
+
+**Scaffolded, the real path:** the `portal-mirror` compositor feature
+(`compositor::portal_mirror`) implements the portal side of low-latency session
+mirroring: one combined xdg-desktop-portal **RemoteDesktop + ScreenCast** session
+(a single permission dialog, restore-token aware), and a dedicated PipeWire
+thread delivering frames as either DMA-BUF planes or SHM bytes over a bounded
+channel. Not yet wired: the EGLImage import into the existing GLES -> CUDA ->
+NVENC path, DMA-BUF modifier negotiation, and the libei input bridge (the
+session already hands over the EIS fd). Build and smoke-test it with:
+
+```sh
+# needs libpipewire-0.3 headers + clang at build time
+cargo build -p compositor --features portal-mirror
+pharos-compositor mirror     # negotiate, stream ~10 s, report what arrives
+```
+
+The smoke test opens the permission dialog on the local desktop, connects to the
+first granted monitor, and prints the negotiated format plus per-frame kind
+(dmabuf or shm) and size; it proves the portal and PipeWire legs on a given rig
+without touching the encoder.
 
 ## Pairing & trust model
 

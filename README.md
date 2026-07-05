@@ -179,6 +179,11 @@ between commits. Known honest caveats:
 - The desktop client currently sends **absolute** pointer position; cursor-grab
   **relative** capture (for FPS-style aim from a PC client) is the remaining
   client-side piece; the host path for it is ready.
+- **Mirroring your real desktop session** (rather than the headless Pharos
+  session) is scaffolded behind the experimental `portal-mirror` feature
+  (portal + PipeWire negotiation work; the encoder wiring does not exist yet).
+  The client's native VNC source can bridge the gap today; see
+  [`DOCUMENTATION.md`](DOCUMENTATION.md#desktop-mirroring-experimental).
 - **Linux Proton *game*-HDR** is blocked upstream in Wine's Vulkan/Wayland WSI and
   is deferred to the Windows-native host path. Host HDR10 encode itself works.
 - **Multi-client mirror** is shipped but **off by default and not two-device

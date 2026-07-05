@@ -74,6 +74,10 @@ pub mod cuegl;
 pub mod multi;
 pub mod nvenc;
 pub mod pairing;
+// Session-mirror capture scaffold (mirror the user's real desktop via the
+// xdg-desktop-portal + PipeWire); experimental, off by default.
+#[cfg(feature = "portal-mirror")]
+pub mod portal_mirror;
 pub mod preview;
 pub mod usbkbd;
 // Pairing + identity glue now lives in the cross-platform `host-core` crate
