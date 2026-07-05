@@ -149,7 +149,16 @@ fn build_args(output_idx: u32, fps: u32, enc: Encoder) -> Vec<String> {
     let loglevel = if debug { "info" } else { "error" };
     let fps_s = fps.to_string();
     let gop = fps.max(1).to_string();
-    let grab = format!("ddagrab=output_idx={output_idx}:framerate={fps_s}");
+    // Default: composite the Windows cursor into captured frames (TV/phone
+    // clients render no local pointer, so the baked-in one is all they get).
+    // PHAROS_DRAW_MOUSE=0 captures cursor-free for desktop-KVM use, where the
+    // client draws its own instant pointer and the baked-in one lags and
+    // doubles (issue #9).
+    let draw_mouse = std::env::var("PHAROS_DRAW_MOUSE").map_or(true, |v| v.trim() != "0");
+    let grab = format!(
+        "ddagrab=output_idx={output_idx}:framerate={fps_s}:draw_mouse={}",
+        u8::from(draw_mouse)
+    );
 
     let mut a: Vec<String> = vec![
         "-hide_banner".into(),

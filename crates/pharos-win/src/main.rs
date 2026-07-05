@@ -404,13 +404,16 @@ fn run_stream(
     // silent input path (client not sending vs host not injecting) is
     // diagnosable from the host log alone.
     if let Some(mut rx) = streamer.take_input_rx() {
+        let streamer_input = streamer.clone();
         std::thread::Builder::new()
             .name("input-inject".into())
             .spawn(move || {
-                let injector = input::Injector::new();
+                let mut injector = input::Injector::new();
                 let mut seen: u64 = 0;
                 let mut window: u64 = 0;
                 let mut last_rate = Instant::now();
+                let mut last_conn_check = Instant::now();
+                let mut last_conn: Option<String> = None;
                 loop {
                     match rx.try_recv() {
                         Ok(ev) => {
@@ -422,6 +425,29 @@ fn run_stream(
                             injector.dispatch(&ev);
                         }
                         Err(_) => std::thread::sleep(Duration::from_millis(1)),
+                    }
+                    // Client change (disconnect, or preemption by a new one),
+                    // checked ~4 Hz by peer addr: purge whatever the departed
+                    // client still has queued (stale input must not replay into
+                    // the next session, issue #13) and release everything it
+                    // held down (its key-ups can never arrive now; a lost
+                    // release is a stuck modifier in the host session).
+                    if last_conn_check.elapsed() >= Duration::from_millis(250) {
+                        last_conn_check = Instant::now();
+                        let conn = streamer_input.connected_addr();
+                        if conn != last_conn {
+                            let mut purged = 0u64;
+                            while rx.try_recv().is_ok() {
+                                purged += 1;
+                            }
+                            if purged > 0 {
+                                tracing::info!(
+                                    "input: purged {purged} queued events on client change"
+                                );
+                            }
+                            injector.release_all();
+                            last_conn = conn;
+                        }
                     }
                     if last_rate.elapsed() >= Duration::from_secs(5) {
                         if window > 0 {

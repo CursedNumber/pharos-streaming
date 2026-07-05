@@ -150,6 +150,12 @@ fn capture_loop(
             size,
         )?;
         let session = pool.CreateCaptureSession(&item)?;
+        // Same knob as the ddagrab path (issue #9): PHAROS_DRAW_MOUSE=0
+        // captures cursor-free for clients that render their own pointer.
+        if std::env::var("PHAROS_DRAW_MOUSE").is_ok_and(|v| v.trim() == "0") {
+            session.SetIsCursorCaptureEnabled(false)?;
+            tracing::info!("WGC: cursor capture disabled (PHAROS_DRAW_MOUSE=0)");
+        }
         session.StartCapture()?;
         let _ = size_tx.send(Ok((w, h)));
 

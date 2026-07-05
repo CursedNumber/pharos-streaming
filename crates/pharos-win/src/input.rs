@@ -24,21 +24,46 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 
-pub struct Injector;
+/// Tracks what the remote client currently holds DOWN (evdev keycodes and
+/// mouse buttons), so a disconnect can release everything. Without this, a
+/// key-down whose matching up is lost to a disconnect, preemption, or a cut
+/// input backlog stays pressed in the host session indefinitely (the stuck
+/// Windows key from the 2026-07-05 validation).
+pub struct Injector {
+    held_keys: std::collections::HashSet<u32>,
+    held_buttons: std::collections::HashSet<u8>,
+}
 
 impl Injector {
     pub fn new() -> Self {
-        Injector
+        Injector {
+            held_keys: std::collections::HashSet::new(),
+            held_buttons: std::collections::HashSet::new(),
+        }
     }
 
-    pub fn dispatch(&self, ev: &InputEvent) {
+    pub fn dispatch(&mut self, ev: &InputEvent) {
         match *ev {
             InputEvent::Key {
                 scancode, pressed, ..
-            } => key(scancode, pressed),
+            } => {
+                if pressed {
+                    self.held_keys.insert(scancode);
+                } else {
+                    self.held_keys.remove(&scancode);
+                }
+                key(scancode, pressed);
+            }
             InputEvent::PointerAbs { x, y } => mouse_abs(x, y),
             InputEvent::PointerRel { dx, dy } => mouse_rel(dx, dy),
-            InputEvent::PointerButton { button, pressed } => mouse_button(button, pressed),
+            InputEvent::PointerButton { button, pressed } => {
+                if pressed {
+                    self.held_buttons.insert(button);
+                } else {
+                    self.held_buttons.remove(&button);
+                }
+                mouse_button(button, pressed);
+            }
             InputEvent::Scroll { dx, dy } => scroll(dx, dy),
             // Gamepad input isn't injected on the Windows host yet (would need a
             // ViGEm virtual pad); ignore for now so the protocol stays shared.
@@ -48,6 +73,24 @@ impl Injector {
             | InputEvent::GamepadDisconnect { .. }
             | InputEvent::GamepadMotion { .. }
             | InputEvent::ControllerTuning { .. } => {}
+        }
+    }
+
+    /// Release every key and button the remote still holds. Called when the
+    /// client disconnects or a new client preempts the session; the departing
+    /// client can never send its key-ups after that point, and replaying a
+    /// half-open hold into the next session (or the console user's lap) is
+    /// always wrong.
+    pub fn release_all(&mut self) {
+        let n = self.held_keys.len() + self.held_buttons.len();
+        for k in std::mem::take(&mut self.held_keys) {
+            key(k, false);
+        }
+        for b in std::mem::take(&mut self.held_buttons) {
+            mouse_button(b, false);
+        }
+        if n > 0 {
+            tracing::info!("input: released {n} held keys/buttons on client change");
         }
     }
 }
