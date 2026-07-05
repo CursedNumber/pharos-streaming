@@ -16,6 +16,8 @@
 #[cfg(any(windows, test))]
 mod au;
 #[cfg(windows)]
+mod display;
+#[cfg(windows)]
 mod encode;
 #[cfg(windows)]
 mod input;
@@ -223,6 +225,20 @@ fn start_mqtt(
 /// Linux dev box even though [`run_stream`] is Windows-only — only the thin
 /// wiring that feeds it needs Windows. The single-streamer Windows model fills
 /// `clients` with at most one entry and leaves the multi-output `outputs` empty.
+/// Pack/unpack a `(w, h)` pixel size into one `u64`, `(w<<32)|h`; the same
+/// packing `transport::QuicStreamer` uses for its latched geometry. Lets the
+/// ~4 Hz status thread share the capture size with the supervisor loop through
+/// a single `AtomicU64`.
+#[cfg(any(windows, test))]
+fn pack_wh(w: u32, h: u32) -> u64 {
+    ((w as u64) << 32) | h as u64
+}
+
+#[cfg(any(windows, test))]
+fn unpack_wh(g: u64) -> (u32, u32) {
+    ((g >> 32) as u32, g as u32)
+}
+
 #[cfg(any(windows, test))]
 #[allow(clippy::too_many_arguments)]
 fn build_status(
@@ -234,6 +250,7 @@ fn build_status(
     client_addr: Option<String>,
     client_pubkey: Option<String>,
     frames_sent: u64,
+    coded: (u32, u32),
     gpu_health: control_ipc::GpuHealth,
 ) -> control_ipc::HostStatus {
     let clients = if connected {
@@ -245,10 +262,12 @@ fn build_status(
             codec: codec_label.to_string(),
             fps,
             frames_sent,
-            // Resolution ladder is Linux/NVENC-only; the Windows host doesn't
-            // expose a coded size here yet (0,0 = unknown to the panel).
-            coded_w: 0,
-            coded_h: 0,
+            // The captured monitor's pixel size: the same value announced to
+            // the client as DG_STREAM_GEOMETRY, mirrored here for the panel;
+            // (0, 0) = unknown. The resolution LADDER stays Linux/NVENC-only,
+            // so ceiling/floor remain 0.
+            coded_w: coded.0,
+            coded_h: coded.1,
             res_ceiling_h: 0,
             res_floor_h: 0,
         }]
@@ -344,6 +363,19 @@ fn run_stream(
     )?);
     info!("QUIC video host on {bind}; waiting for Trireme to connect…");
 
+    // The client sizes its NV12 frame reader from the DG_STREAM_GEOMETRY
+    // announce; without one, trireme assumes 1920x1080 and mis-renders any
+    // other size as stride corruption (issue #1). Latch the captured monitor's
+    // size as soon as the streamer exists so the connect-time announce already
+    // carries the truth; the supervisor loop re-latches on every pipeline
+    // (re)build. `coded` mirrors the value into HostStatus for the panel.
+    let coded = Arc::new(AtomicU64::new(0));
+    if let Some((w, h)) = capture_size(capture, output_idx) {
+        streamer.set_geometry(w, h);
+        coded.store(pack_wh(w, h), Ordering::Relaxed);
+        info!("capture geometry {w}x{h} (output_idx {output_idx}); announcing to clients");
+    }
+
     // Optional MQTT / Home-Assistant telemetry — off unless enabled in config.toml.
     let mqtt = start_mqtt(encoder, capture, fps);
 
@@ -420,17 +452,19 @@ fn run_stream(
         streamer.connected_addr(),
         streamer.connected_pubkey(),
         0,
+        unpack_wh(coded.load(Ordering::Relaxed)),
         control_ipc::GpuHealth::Healthy,
     )));
     {
         // Refresh the published status ~4 Hz from the live streamer + frame
         // counter (the Windows analogue of the Linux render loop's status push).
-        let (status_r, streamer_r, frames_r, hostname_r, health_r) = (
+        let (status_r, streamer_r, frames_r, hostname_r, health_r, coded_r) = (
             status.clone(),
             streamer.clone(),
             frames.clone(),
             hostname.clone(),
             gpu_health.clone(),
+            coded.clone(),
         );
         std::thread::Builder::new()
             .name("control-status".into())
@@ -444,6 +478,7 @@ fn run_stream(
                     streamer_r.connected_addr(),
                     streamer_r.connected_pubkey(),
                     frames_r.load(Ordering::Relaxed),
+                    unpack_wh(coded_r.load(Ordering::Relaxed)),
                     health_r.lock().map(|g| g.clone()).unwrap_or_default(),
                 );
                 if let Ok(mut g) = status_r.lock() {
@@ -493,7 +528,7 @@ fn run_stream(
 
     'supervisor: loop {
         let pacer_stop = Arc::new(AtomicBool::new(false));
-        let (enc, stdout, stderr, pacer) =
+        let (enc, stdout, stderr, pacer, size) =
             match build_pipeline(capture, output_idx, fps, encoder, &pacer_stop) {
                 Ok(t) => t,
                 Err(e) => {
@@ -526,6 +561,15 @@ fn run_stream(
                     continue 'supervisor;
                 }
             };
+
+        // Re-latch geometry each generation: a display-mode change kills the
+        // pipeline (DDA access-lost, WGC device gone), so the respawn is where
+        // a new size becomes visible; transport only re-announces on change,
+        // so a same-size respawn sends nothing extra.
+        if let Some((w, h)) = size {
+            streamer.set_geometry(w, h);
+            coded.store(pack_wh(w, h), Ordering::Relaxed);
+        }
 
         let sig = FaultSignal::new(generation);
         let scanner = spawn_stderr_scanner(stderr, sig.clone());
@@ -801,10 +845,33 @@ fn spawn_stdout_reader(
     (rx, handle)
 }
 
+/// Best-effort pixel size of the monitor `output_idx` selects under `capture`.
+/// Dda asks DXGI (ffmpeg's ddagrab enumerates DXGI outputs on adapter 0); Wgc
+/// asks `EnumDisplayMonitors`, the same list `WgcCapturer::start` indexes.
+/// `None` means unknown: streaming proceeds without a geometry announce (the
+/// pre-fix behavior) and the client falls back to its 1080p default.
+#[cfg(windows)]
+fn capture_size(capture: CaptureBackend, output_idx: u32) -> Option<(u32, u32)> {
+    match capture {
+        CaptureBackend::Dda => match display::dda_output_size(output_idx) {
+            Ok(wh) => Some(wh),
+            Err(e) => {
+                tracing::warn!("capture geometry unknown: {e:#} (client will use its default)");
+                None
+            }
+        },
+        CaptureBackend::Wgc => wgc::list_monitors()
+            .get(output_idx as usize)
+            .copied()
+            .filter(|&(w, h)| w > 0 && h > 0),
+    }
+}
+
 /// Build one capture+encode pipeline generation. The SINGLE path used by both the
 /// first start and every respawn — its `Err` feeds the supervisor's breaker (no
-/// separate first-start bail). Returns the encoder, its stdout/stderr, and (WGC
-/// only) the pacer JoinHandle so the supervisor can stop+join it on teardown.
+/// separate first-start bail). Returns the encoder, its stdout/stderr, (WGC only)
+/// the pacer JoinHandle so the supervisor can stop+join it on teardown, and the
+/// capture pixel size for the geometry announce (`None` = unknown, no announce).
 #[cfg(windows)]
 #[allow(clippy::type_complexity)]
 fn build_pipeline(
@@ -818,9 +885,13 @@ fn build_pipeline(
     std::process::ChildStdout,
     std::process::ChildStderr,
     Option<std::thread::JoinHandle<()>>,
+    Option<(u32, u32)>,
 )> {
     match capture {
         CaptureBackend::Dda => {
+            // Resolve BEFORE spawning ffmpeg so each respawn re-reads the
+            // (possibly changed) mode the fresh ddagrab will capture.
+            let size = capture_size(capture, output_idx);
             let mut e = encode::CaptureEncoder::spawn(output_idx, fps, encoder)?;
             let stdout = e
                 .take_stdout()
@@ -828,7 +899,7 @@ fn build_pipeline(
             let stderr = e
                 .take_stderr()
                 .ok_or_else(|| anyhow::anyhow!("ffmpeg produced no stderr pipe"))?;
-            Ok((e, stdout, stderr, None))
+            Ok((e, stdout, stderr, None, size))
         }
         CaptureBackend::Wgc => {
             // Fresh WgcCapturer per generation: re-reads the monitor size and gets
@@ -846,7 +917,9 @@ fn build_pipeline(
                 .take_stderr()
                 .ok_or_else(|| anyhow::anyhow!("ffmpeg produced no stderr pipe"))?;
             let pacer = spawn_pacer(cap, stdin, fps, pacer_stop.clone())?;
-            Ok((e, stdout, stderr, Some(pacer)))
+            // WGC already knows the exact frame size it started with; announce
+            // that rather than re-enumerating monitors.
+            Ok((e, stdout, stderr, Some(pacer), Some((w, h))))
         }
     }
 }
@@ -1072,7 +1145,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_status, parse_win_fault_inject, RespawnBreaker};
+    use super::{build_status, pack_wh, parse_win_fault_inject, unpack_wh, RespawnBreaker};
 
     #[test]
     fn status_reflects_connected_client() {
@@ -1085,6 +1158,7 @@ mod tests {
             Some("192.0.2.5:51234".into()),
             Some("ab12cd".into()),
             4096,
+            (3840, 2160),
             control_ipc::GpuHealth::Healthy,
         );
         assert_eq!(s.hostname, "winrig");
@@ -1098,6 +1172,15 @@ mod tests {
         assert_eq!(c.frames_sent, 4096);
         assert_eq!(c.addr.as_deref(), Some("192.0.2.5:51234"));
         assert_eq!(c.pubkey.as_deref(), Some("ab12cd"));
+        // Issue #1: the captured monitor's size reaches the panel.
+        assert_eq!((c.coded_w, c.coded_h), (3840, 2160));
+    }
+
+    #[test]
+    fn wh_packing_roundtrips() {
+        assert_eq!(unpack_wh(pack_wh(3840, 2160)), (3840, 2160));
+        assert_eq!(unpack_wh(pack_wh(0, 0)), (0, 0));
+        assert_eq!(unpack_wh(0), (0, 0)); // unset atomic = unknown
     }
 
     #[test]
@@ -1111,6 +1194,7 @@ mod tests {
             None,
             None,
             0,
+            (0, 0),
             control_ipc::GpuHealth::Healthy,
         );
         assert!(!s.streaming);
@@ -1131,6 +1215,7 @@ mod tests {
             None,
             None,
             0,
+            (1920, 1080),
             control_ipc::GpuHealth::Faulted {
                 reason: "device removed".into(),
                 last_xid: None,
