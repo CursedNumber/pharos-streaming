@@ -11,49 +11,64 @@
 //!
 //! Needs /dev/uinput write access (the `input` group). Ctrl-C to stop.
 
-use std::thread;
-use std::time::Duration;
+#[cfg(target_os = "linux")]
+mod imp {
+    use std::thread;
+    use std::time::Duration;
 
-use evdev::{
-    uinput::VirtualDeviceBuilder, AbsInfo, AbsoluteAxisType, BusType, EventType, InputEvent,
-    InputId, UinputAbsSetup,
-};
+    use evdev::{
+        uinput::VirtualDeviceBuilder, AbsInfo, AbsoluteAxisType, BusType, EventType, InputEvent,
+        InputId, UinputAbsSetup,
+    };
 
-const EV_ABS: EventType = EventType(3);
-const EV_SYN: EventType = EventType(0);
-const ABS_RX: u16 = 0x03;
-const ABS_RY: u16 = 0x04;
-const ABS_RZ: u16 = 0x05;
+    const EV_ABS: EventType = EventType(3);
+    const EV_SYN: EventType = EventType(0);
+    const ABS_RX: u16 = 0x03;
+    const ABS_RY: u16 = 0x04;
+    const ABS_RZ: u16 = 0x05;
 
+    pub fn run() -> anyhow::Result<()> {
+        // resolution = units per deg/s, so the host normalises value/res → deg/s.
+        // Matches the Switch Pro's hid-nintendo scale used during bring-up.
+        let res = 14247;
+        let info = AbsInfo::new(0, -4_000_000, 4_000_000, 0, 0, res);
+
+        let mut builder = VirtualDeviceBuilder::new()?
+            .name("Pharos Synthetic IMU")
+            .input_id(InputId::new(BusType(0x06), 0x057e, 0x2009, 1));
+        for code in [ABS_RX, ABS_RY, ABS_RZ] {
+            builder =
+                builder.with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisType(code), info))?;
+        }
+        let mut dev = builder.build()?;
+        eprintln!("Pharos Synthetic IMU up — oscillating yaw(RZ)/pitch(RY) (Ctrl-C to stop)");
+
+        let r = f64::from(res);
+        let mut t = 0.0f64;
+        loop {
+            t += 0.016;
+            // Angular velocity in deg/s → raw value = deg/s × resolution.
+            let yaw = (t * 1.6).sin() * 200.0 * r; // RZ → ←→
+            let pitch = (t * 1.1).cos() * 120.0 * r; // RY → ↑↓
+            let roll = (t * 0.7).sin() * 60.0 * r; // RX (unmapped)
+            let _ = dev.emit(&[
+                InputEvent::new(EV_ABS, ABS_RX, roll as i32),
+                InputEvent::new(EV_ABS, ABS_RY, pitch as i32),
+                InputEvent::new(EV_ABS, ABS_RZ, yaw as i32),
+                InputEvent::new(EV_SYN, 0, 0),
+            ]);
+            thread::sleep(Duration::from_millis(16)); // ~60 Hz
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
-    // resolution = units per deg/s, so the host normalises value/res → deg/s.
-    // Matches the Switch Pro's hid-nintendo scale used during bring-up.
-    let res = 14247;
-    let info = AbsInfo::new(0, -4_000_000, 4_000_000, 0, 0, res);
+    imp::run()
+}
 
-    let mut builder = VirtualDeviceBuilder::new()?
-        .name("Pharos Synthetic IMU")
-        .input_id(InputId::new(BusType(0x06), 0x057e, 0x2009, 1));
-    for code in [ABS_RX, ABS_RY, ABS_RZ] {
-        builder = builder.with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisType(code), info))?;
-    }
-    let mut dev = builder.build()?;
-    eprintln!("Pharos Synthetic IMU up — oscillating yaw(RZ)/pitch(RY) (Ctrl-C to stop)");
-
-    let r = f64::from(res);
-    let mut t = 0.0f64;
-    loop {
-        t += 0.016;
-        // Angular velocity in deg/s → raw value = deg/s × resolution.
-        let yaw = (t * 1.6).sin() * 200.0 * r; // RZ → ←→
-        let pitch = (t * 1.1).cos() * 120.0 * r; // RY → ↑↓
-        let roll = (t * 0.7).sin() * 60.0 * r; // RX (unmapped)
-        let _ = dev.emit(&[
-            InputEvent::new(EV_ABS, ABS_RX, roll as i32),
-            InputEvent::new(EV_ABS, ABS_RY, pitch as i32),
-            InputEvent::new(EV_ABS, ABS_RZ, yaw as i32),
-            InputEvent::new(EV_SYN, 0, 0),
-        ]);
-        thread::sleep(Duration::from_millis(16)); // ~60 Hz
-    }
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("synthetic_imu is a Linux-only example (evdev/uinput).");
+    std::process::exit(1);
 }
