@@ -24,6 +24,8 @@ tracing = "0.1"
 core-crypto = { path = "../core-crypto" }
 # Input event wire type + codec.
 core-proto = { path = "../core-proto" }
+# USB relay exporter-hello framing (v1/v2) — parsed by `read_usb_hello`.
+core-usbip = { path = "../core-usbip" }
 serde = { workspace = true }
 postcard = { workspace = true }
 # Nonce generation for the per-connection video auth challenge.

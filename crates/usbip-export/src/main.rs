@@ -352,7 +352,7 @@ fn service(dev: &Device, cmd: &CmdSubmit, out: &[u8]) -> RetSubmit {
 }
 
 /// Open `vid:pid`, detach kernel drivers, claim interfaces, map endpoint types.
-fn claim(vid: u16, pid: u16) -> Result<(Device, u32, u32, String)> {
+fn claim(vid: u16, pid: u16) -> Result<(Device, core_usbip::hello::Hello)> {
     let handle = rusb::open_device_with_vid_pid(vid, pid)
         .with_context(|| format!("device {vid:04x}:{pid:04x} not found / not openable"))?;
     let dev = handle.device();
@@ -364,10 +364,19 @@ fn claim(vid: u16, pid: u16) -> Result<(Device, u32, u32, String)> {
     let mut ep_types = HashMap::new();
     let mut ifaces = Vec::new();
     let mut int_in: Vec<(u8, usize)> = Vec::new();
+    let mut iface_triples = Vec::new();
     let cfg = dev.active_config_descriptor().context("active config")?;
     for iface in cfg.interfaces() {
         ifaces.push(iface.number());
-        for desc in iface.descriptors() {
+        for (i, desc) in iface.descriptors().enumerate() {
+            // The v2 hello carries the active alt-setting's class triple.
+            if i == 0 {
+                iface_triples.push(core_usbip::op::Interface {
+                    class: desc.class_code(),
+                    subclass: desc.sub_class_code(),
+                    protocol: desc.protocol_code(),
+                });
+            }
             for ep in desc.endpoint_descriptors() {
                 let num = ep.address() & 0x0f;
                 ep_types.insert(num, ep.transfer_type());
@@ -380,13 +389,36 @@ fn claim(vid: u16, pid: u16) -> Result<(Device, u32, u32, String)> {
             }
         }
     }
+    // Everything a Windows importer must echo into OP_REP_IMPORT (hello v2).
+    let v = dd.device_version();
+    let hello = core_usbip::hello::Hello {
+        name,
+        devid,
+        speed,
+        desc: Some(core_usbip::hello::DeviceDesc {
+            busnum: u32::from(dev.bus_number()),
+            devnum: u32::from(dev.address()),
+            id_vendor: dd.vendor_id(),
+            id_product: dd.product_id(),
+            bcd_device: (u16::from(v.major()) << 8)
+                | (u16::from(v.minor()) << 4)
+                | u16::from(v.sub_minor()),
+            device_class: dd.class_code(),
+            device_subclass: dd.sub_class_code(),
+            device_protocol: dd.protocol_code(),
+            configuration_value: cfg.number(),
+            num_configurations: dd.num_configurations(),
+            interfaces: iface_triples,
+        }),
+    };
     // Route check: warn loudly before relaying something the relay can't carry
     // well, and point at the right path. (We warn rather than hard-block so a
     // determined user can still experiment.)
     let route = relayability(&cfg);
     if route != Relayability::Relay {
         tracing::warn!(
-            "'{name}' [{vid:04x}:{pid:04x}] → {}: {}",
+            "'{}' [{vid:04x}:{pid:04x}] → {}: {}",
+            hello.name,
             route.label(),
             route.note()
         );
@@ -405,9 +437,7 @@ fn claim(vid: u16, pid: u16) -> Result<(Device, u32, u32, String)> {
             ifaces,
             int_in,
         },
-        devid,
-        speed,
-        name,
+        hello,
     ))
 }
 
@@ -421,8 +451,13 @@ async fn relay_device(
     pid: u16,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let (device, devid, speed, name) = claim(vid, pid)?;
-    tracing::info!("sharing '{name}' [{vid:04x}:{pid:04x}] (devid={devid:#010x}, speed={speed})");
+    let (device, hello) = claim(vid, pid)?;
+    let name = hello.name.clone();
+    tracing::info!(
+        "sharing '{name}' [{vid:04x}:{pid:04x}] (devid={:#010x}, speed={})",
+        hello.devid,
+        hello.speed
+    );
     let ifaces = device.ifaces.clone();
     let int_in = device.int_in.clone();
     let device = Arc::new(device);
@@ -437,15 +472,19 @@ async fn relay_device(
     };
 
     let mut link = link;
-    // Handshake: name (u16 len + bytes), then devid + speed (u32 each, BE).
-    let nb = name.as_bytes();
-    link.send
-        .write_all(&(nb.len() as u16).to_be_bytes())
-        .await?;
-    link.send.write_all(nb).await?;
-    link.send.write_all(&devid.to_be_bytes()).await?;
-    link.send.write_all(&speed.to_be_bytes()).await?;
-    tracing::info!("'{name}' attached on Pharos {}", link.remote());
+    // Hello: v2 (descriptor block — what a Windows import bridge needs) when
+    // the importer advertised it, else the legacy v1 triplet.
+    let hello_bytes = if link.importer_v2() {
+        hello.to_bytes_v2()
+    } else {
+        hello.to_bytes_v1()
+    };
+    link.send.write_all(&hello_bytes).await?;
+    tracing::info!(
+        "'{name}' attached on Pharos {} (hello {})",
+        link.remote(),
+        if link.importer_v2() { "v2" } else { "v1" }
+    );
 
     // Read-ahead: one poller thread per interrupt-IN endpoint feeding a latest-
     // report slot, so input is captured continuously instead of only while the

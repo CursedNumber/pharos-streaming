@@ -264,11 +264,15 @@ pub fn host_launcher() -> String {
         .into_owned()
 }
 
-/// Windows: stop the local host process (best-effort).
+/// Windows: stop the local host process (best-effort), and the USB/IP import
+/// bridge with it.
 #[cfg(windows)]
 pub fn stop_host() {
     let _ = std::process::Command::new("taskkill")
         .args(["/F", "/IM", "pharos-host.exe"])
+        .status();
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/IM", "pharos-usbimport.exe"])
         .status();
 }
 
@@ -286,7 +290,21 @@ pub fn launch_host() -> Result<(), String> {
         }
     };
     cmd.spawn().map_err(|e| format!("launch host: {e}"))?;
+    // The host alone can't import USB devices — bring up the USB/IP import
+    // bridge too (mirrors the Unix path). It needs no elevation on Windows;
+    // usbip-win2 (its driver + usbip.exe) is its own install, which the bridge
+    // detects and explains in its log if missing.
+    start_usbimport_best_effort();
     Ok(())
+}
+
+/// Windows: spawn the sibling `pharos-usbimport.exe`, fire-and-forget. If one
+/// is already running the new instance exits on its own (the USB relay port is
+/// taken), so this stays idempotent without process scanning. Failures are
+/// swallowed — USB import is an optional capability.
+#[cfg(windows)]
+fn start_usbimport_best_effort() {
+    let _ = std::process::Command::new(resolve_sibling_bin("pharos-usbimport")).spawn();
 }
 
 /// Fallback for exotic targets: there's no host to launch.

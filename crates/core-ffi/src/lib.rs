@@ -788,6 +788,59 @@ async fn do_pair(
 // Android, and no permission pop-up when paired with a manifest device-filter).
 // ---------------------------------------------------------------------------
 
+/// One interface's class triple, as the v2 hello carries it.
+#[derive(uniffi::Record, Clone)]
+pub struct UsbInterfaceInfo {
+    pub class: u8,
+    pub subclass: u8,
+    pub protocol: u8,
+}
+
+/// USB descriptor fields for the v2 exporter hello — everything a Windows
+/// import bridge must echo into OP_REP_IMPORT (the Linux importer ignores
+/// them). Built on the Kotlin side from `android.hardware.usb.UsbDevice`.
+#[derive(uniffi::Record, Clone)]
+pub struct UsbDeviceInfo {
+    pub busnum: u32,
+    pub devnum: u32,
+    pub vendor_id: u16,
+    pub product_id: u16,
+    /// BCD-coded device release (`bcdDevice`), e.g. 0x0100 for 1.00.
+    pub bcd_device: u16,
+    pub device_class: u8,
+    pub device_subclass: u8,
+    pub device_protocol: u8,
+    pub configuration_value: u8,
+    pub num_configurations: u8,
+    pub interfaces: Vec<UsbInterfaceInfo>,
+}
+
+impl From<&UsbDeviceInfo> for core_usbip::hello::DeviceDesc {
+    fn from(i: &UsbDeviceInfo) -> Self {
+        core_usbip::hello::DeviceDesc {
+            busnum: i.busnum,
+            devnum: i.devnum,
+            id_vendor: i.vendor_id,
+            id_product: i.product_id,
+            bcd_device: i.bcd_device,
+            device_class: i.device_class,
+            device_subclass: i.device_subclass,
+            device_protocol: i.device_protocol,
+            configuration_value: i.configuration_value,
+            num_configurations: i.num_configurations,
+            interfaces: i
+                .interfaces
+                .iter()
+                .map(|f| core_usbip::op::Interface {
+                    class: f.class,
+                    subclass: f.subclass,
+                    protocol: f.protocol,
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Result of one USB transfer performed by the Kotlin side.
 #[derive(uniffi::Record)]
 pub struct UsbTransferResult {
@@ -845,6 +898,7 @@ pub fn start_usb_export(
     name: String,
     devid: u32,
     speed: u32,
+    info: Option<UsbDeviceInfo>,
     sink: Box<dyn UsbTransfer>,
 ) -> std::sync::Arc<UsbExportHandle> {
     let cancel = CancellationToken::new();
@@ -867,6 +921,7 @@ pub fn start_usb_export(
             &name,
             devid,
             speed,
+            info,
             sink.into(),
             cancel,
         ));
@@ -885,10 +940,11 @@ async fn usb_export_loop(
     name: &str,
     devid: u32,
     speed: u32,
+    info: Option<UsbDeviceInfo>,
     sink: std::sync::Arc<dyn UsbTransfer>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    let result = usb_export_run(pharos, name, devid, speed, sink.clone(), cancel).await;
+    let result = usb_export_run(pharos, name, devid, speed, info, sink.clone(), cancel).await;
     sink.on_end(result.as_ref().err().map(|e| e.to_string()));
     result
 }
@@ -898,6 +954,7 @@ async fn usb_export_run(
     name: &str,
     devid: u32,
     speed: u32,
+    info: Option<UsbDeviceInfo>,
     sink: std::sync::Arc<dyn UsbTransfer>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
@@ -909,14 +966,21 @@ async fn usb_export_run(
         _ = cancel.cancelled() => return Ok(()),
         r = transport::usb_export_connect(addr) => r?,
     };
-    // Handshake: name (u16 len + UTF-8), then devid + speed (u32 each, BE).
-    let nb = name.as_bytes();
-    link.send
-        .write_all(&(nb.len() as u16).to_be_bytes())
-        .await?;
-    link.send.write_all(nb).await?;
-    link.send.write_all(&devid.to_be_bytes()).await?;
-    link.send.write_all(&speed.to_be_bytes()).await?;
+    // Hello: v2 (descriptor block — what a Windows import bridge needs) when
+    // the importer advertised it AND the caller supplied the descriptors;
+    // otherwise the legacy v1 triplet.
+    let hello = core_usbip::hello::Hello {
+        name: name.to_string(),
+        devid,
+        speed,
+        desc: info.as_ref().map(Into::into),
+    };
+    let hello_bytes = if link.importer_v2() && hello.desc.is_some() {
+        hello.to_bytes_v2()
+    } else {
+        hello.to_bytes_v1()
+    };
+    link.send.write_all(&hello_bytes).await?;
 
     // Pipeline URBs: each is serviced on a blocking thread so a pending
     // interrupt-IN (e.g. an HID gamepad waiting for input, or HCI events) never

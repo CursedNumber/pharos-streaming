@@ -171,6 +171,96 @@ fn client_config() -> Result<ClientConfig> {
     Ok(cfg)
 }
 
+/// Marker SAN a v2-capable importer adds to its USB-relay TLS cert, so an
+/// exporter knows — before sending a byte — whether the v2 hello (descriptor
+/// block for the Windows import bridge, `core_usbip::hello`) is understood.
+///
+/// Why a cert SAN and not ALPN: rustls *rejects* a client that offers no ALPN
+/// once the server configures any (`NoApplicationProtocol`), so ALPN would cut
+/// off every legacy exporter. The SAN is invisible to legacy peers instead:
+/// old exporters skip cert verification entirely and old importers simply
+/// don't carry the marker, so both downgrade quadrants stay v1 with no
+/// handshake risk. `.invalid` is the RFC 2606 reserved TLD — never a real host.
+const USB_V2_SAN: &str = "usb-v2.pharos.invalid";
+
+/// [`server_config`] with the [`USB_V2_SAN`] capability marker added to the
+/// self-signed cert. Only the USB import endpoint uses this.
+fn usb_server_config() -> Result<ServerConfig> {
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), USB_V2_SAN.to_string()])?;
+    let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+    let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    let mut cfg = ServerConfig::with_single_cert(vec![cert_der], key.into())?;
+    cfg.transport_config(transport_config()?);
+    Ok(cfg)
+}
+
+/// [`SkipServerVerification`] that additionally sniffs the server cert for the
+/// [`USB_V2_SAN`] capability marker. A SAN dNSName is embedded verbatim as
+/// ASCII in the DER, so a byte search is sufficient — and the tag is
+/// collision-proof in practice (reserved TLD, exact match). The flag is set
+/// during the TLS handshake, i.e. before `connect()` resolves.
+#[derive(Debug)]
+struct UsbV2Detect {
+    inner: SkipServerVerification,
+    saw_v2: Arc<AtomicBool>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for UsbV2Detect {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp: &[u8],
+        now: UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let der = end_entity.as_ref();
+        let tag = USB_V2_SAN.as_bytes();
+        if der.windows(tag.len()).any(|w| w == tag) {
+            self.saw_v2.store(true, Ordering::Release);
+        }
+        self.inner
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp, now)
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// [`client_config`] with the v2-marker sniffing verifier; `saw_v2` is set iff
+/// the server's cert carries [`USB_V2_SAN`].
+fn usb_client_config(saw_v2: Arc<AtomicBool>) -> Result<ClientConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(rustls::DEFAULT_VERSIONS)?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(UsbV2Detect {
+            inner: SkipServerVerification(provider),
+            saw_v2,
+        }))
+        .with_no_client_auth();
+    let mut cfg = ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?));
+    cfg.transport_config(transport_config()?);
+    Ok(cfg)
+}
+
 /// Split a `host:port` (or `[v6]:port`) string into its host and port parts.
 fn split_host_port(s: &str) -> Option<(&str, u16)> {
     if let Some(rest) = s.strip_prefix('[') {
@@ -3465,6 +3555,8 @@ pub struct UsbLink {
     conn: quinn::Connection,
     // Kept alive so the connection isn't torn down (client side owns its endpoint).
     _endpoint: Option<Endpoint>,
+    /// Exporter side only: the importer's cert carried [`USB_V2_SAN`].
+    importer_v2: bool,
 }
 
 impl UsbLink {
@@ -3472,13 +3564,65 @@ impl UsbLink {
     pub fn remote(&self) -> SocketAddr {
         self.conn.remote_address()
     }
+
+    /// Exporter side: whether the importer advertised the v2 hello (so the
+    /// descriptor block may be sent). Always `false` on the importer side —
+    /// there the version is read off the wire, see [`read_usb_hello`].
+    pub fn importer_v2(&self) -> bool {
+        self.importer_v2
+    }
+}
+
+/// Importer side: read the exporter's hello, v1 or v2, off the relay stream.
+/// The first u16 disambiguates — [`core_usbip::hello::V2_SENTINEL`] (an
+/// impossible name length, only ever sent to an importer that advertised v2
+/// via [`USB_V2_SAN`]) introduces v2; anything else is a v1 name length.
+pub async fn read_usb_hello(recv: &mut quinn::RecvStream) -> Result<core_usbip::hello::Hello> {
+    use core_usbip::hello::{DeviceDesc, Hello, MAX_NAME_LEN, V2_SENTINEL};
+
+    let mut u16b = [0u8; 2];
+    recv.read_exact(&mut u16b).await?;
+    let first = u16::from_be_bytes(u16b);
+    let (v2, nlen) = if first == V2_SENTINEL {
+        recv.read_exact(&mut u16b).await?;
+        (true, u16::from_be_bytes(u16b) as usize)
+    } else {
+        (false, first as usize)
+    };
+    if nlen > MAX_NAME_LEN {
+        anyhow::bail!("hello name length {nlen} exceeds {MAX_NAME_LEN} — garbage stream?");
+    }
+    let mut nb = vec![0u8; nlen];
+    recv.read_exact(&mut nb).await?;
+    let name = String::from_utf8_lossy(&nb).into_owned();
+    let mut hs = [0u8; 8];
+    recv.read_exact(&mut hs).await?;
+    let devid = u32::from_be_bytes([hs[0], hs[1], hs[2], hs[3]]);
+    let speed = u32::from_be_bytes([hs[4], hs[5], hs[6], hs[7]]);
+    let desc = if v2 {
+        let mut fixed = [0u8; DeviceDesc::FIXED_LEN];
+        recv.read_exact(&mut fixed).await?;
+        let (mut desc, n_ifaces) = DeviceDesc::parse_fixed(&fixed);
+        let mut ib = vec![0u8; n_ifaces * 3];
+        recv.read_exact(&mut ib).await?;
+        desc.parse_interfaces(&ib);
+        Some(desc)
+    } else {
+        None
+    };
+    Ok(Hello {
+        name,
+        devid,
+        speed,
+        desc,
+    })
 }
 
 /// Pharos (import side): bind the persistent USB-relay listener. The endpoint
 /// outlives individual device sessions — accept them with [`usb_import_accept`].
 pub fn usb_import_endpoint(addr: SocketAddr) -> Result<Endpoint> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    Ok(Endpoint::server(server_config()?, addr)?)
+    Ok(Endpoint::server(usb_server_config()?, addr)?)
 }
 
 /// Accept one exporter connection and its relay stream on the listener. Low
@@ -3496,6 +3640,7 @@ pub async fn usb_import_accept(endpoint: &Endpoint) -> Result<UsbLink> {
         recv,
         conn,
         _endpoint: None,
+        importer_v2: false,
     })
 }
 
@@ -3504,7 +3649,9 @@ pub async fn usb_import_accept(endpoint: &Endpoint) -> Result<UsbLink> {
 pub async fn usb_export_connect(server_addr: SocketAddr) -> Result<UsbLink> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut endpoint = Endpoint::client((Ipv4Addr::UNSPECIFIED, 0).into())?;
-    endpoint.set_default_client_config(client_config()?);
+    // The verifier flags the importer's v2 capability during the handshake.
+    let saw_v2 = Arc::new(AtomicBool::new(false));
+    endpoint.set_default_client_config(usb_client_config(saw_v2.clone())?);
     let conn = endpoint.connect(server_addr, "localhost")?.await?;
     // The exporter opens the stream and speaks first (device-info handshake),
     // which is what makes the importer's accept_bi() resolve.
@@ -3514,6 +3661,7 @@ pub async fn usb_export_connect(server_addr: SocketAddr) -> Result<UsbLink> {
         recv,
         conn,
         _endpoint: Some(endpoint),
+        importer_v2: saw_v2.load(Ordering::Acquire),
     })
 }
 
@@ -3729,6 +3877,94 @@ mod tests {
             link.send.finish().unwrap();
 
             assert_eq!(&server.await.unwrap(), b"DEV0");
+        });
+    }
+
+    /// Hello-version negotiation on the USB relay, all four quadrants. The
+    /// importer advertises v2 via the cert SAN; the exporter detects it and
+    /// picks the hello version; `read_usb_hello` disambiguates on the wire.
+    /// No quadrant may fail the QUIC handshake or misparse the hello.
+    #[test]
+    fn usb_hello_version_negotiation() {
+        use core_usbip::hello::{DeviceDesc, Hello};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let hello = Hello {
+            name: "DualSense".into(),
+            devid: (1 << 16) | 5,
+            speed: 3,
+            desc: Some(DeviceDesc {
+                busnum: 1,
+                devnum: 5,
+                id_vendor: 0x054c,
+                id_product: 0x0ce6,
+                interfaces: vec![core_usbip::op::Interface {
+                    class: 3,
+                    subclass: 0,
+                    protocol: 0,
+                }],
+                ..Default::default()
+            }),
+        };
+        rt.block_on(async {
+            let endpoint = super::usb_import_endpoint((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+            let addr = endpoint.local_addr().unwrap();
+            let expect = hello.clone();
+            let server = tokio::spawn(async move {
+                // New exporter: the importer must read back a v2 hello intact.
+                let mut a = super::usb_import_accept(&endpoint).await.unwrap();
+                let got = super::read_usb_hello(&mut a.recv).await.unwrap();
+                assert_eq!(got, expect, "v2 hello must round-trip");
+                // Legacy exporter: raw v1 bytes must parse with desc == None.
+                let mut b = super::usb_import_accept(&endpoint).await.unwrap();
+                let got = super::read_usb_hello(&mut b.recv).await.unwrap();
+                assert_eq!(got.name, "Old");
+                assert_eq!((got.devid, got.speed), (7, 3));
+                assert!(got.desc.is_none(), "legacy exporter must read as v1");
+            });
+
+            // New exporter sees the SAN and sends v2. (Await the write so the
+            // two connections reach the accept loop in order.)
+            let mut l1 = super::usb_export_connect(addr).await.unwrap();
+            assert!(l1.importer_v2(), "new importer must advertise v2");
+            l1.send.write_all(&hello.to_bytes_v2()).await.unwrap();
+
+            // Legacy exporter: the old code path — plain client config sending
+            // the v1 wire format directly.
+            let mut legacy = quinn::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+            legacy.set_default_client_config(super::client_config().unwrap());
+            let conn = legacy.connect(addr, "localhost").unwrap().await.unwrap();
+            let (mut send, _recv) = conn.open_bi().await.unwrap();
+            let old_hello = Hello {
+                name: "Old".into(),
+                devid: 7,
+                speed: 3,
+                desc: None,
+            };
+            send.write_all(&old_hello.to_bytes_v1()).await.unwrap();
+            server.await.unwrap();
+
+            // Legacy importer: the old code path — plain server config, no SAN.
+            // The new exporter must detect nothing and stay on v1.
+            let old_srv = quinn::Endpoint::server(
+                super::server_config().unwrap(),
+                (Ipv4Addr::LOCALHOST, 0).into(),
+            )
+            .unwrap();
+            let old_addr = old_srv.local_addr().unwrap();
+            let old_accept = tokio::spawn(async move {
+                let conn = old_srv.accept().await.unwrap().await.unwrap();
+                let (_s, mut r) = conn.accept_bi().await.unwrap();
+                let mut one = [0u8; 1];
+                r.read_exact(&mut one).await.unwrap();
+            });
+            let mut l3 = super::usb_export_connect(old_addr).await.unwrap();
+            assert!(!l3.importer_v2(), "legacy importer must not read as v2");
+            l3.send.write_all(b"z").await.unwrap();
+            old_accept.await.unwrap();
         });
     }
 

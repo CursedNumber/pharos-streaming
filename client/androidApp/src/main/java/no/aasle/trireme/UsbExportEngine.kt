@@ -22,7 +22,9 @@ import androidx.compose.runtime.mutableStateOf
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
+import uniffi.core_ffi.UsbDeviceInfo
 import uniffi.core_ffi.UsbExportHandle
+import uniffi.core_ffi.UsbInterfaceInfo
 import uniffi.core_ffi.UsbTransfer
 import uniffi.core_ffi.UsbTransferResult
 import uniffi.core_ffi.startUsbExport
@@ -351,8 +353,39 @@ class UsbExportEngine private constructor(context: Context) {
         val sink = TransferSink(conn, endpoints) { err -> onExportEnd(entry, err) }
         val devid = dev.deviceId.toUInt()
         Log.i(TAG, "exporting '${entry.name}' [${hex(entry.vid)}:${hex(entry.pid)}] → ${store.pharos()}")
-        val handle = startUsbExport(store.pharos(), entry.name, devid, 3u, sink) // speed 3 = high
+        val handle = startUsbExport(store.pharos(), entry.name, devid, 3u, deviceInfo(dev), sink) // speed 3 = high
         active[key(entry.vid, entry.pid)] = ActiveExport(conn, handle, sink)
+    }
+
+    /** Descriptor fields for the v2 hello (what a Windows import bridge echoes
+     *  into OP_REP_IMPORT). Android's `deviceId` encodes the Linux bus/dev pair
+     *  as `bus * 1000 + dev` (see AOSP `usb_device_get_unique_id`). */
+    private fun deviceInfo(dev: UsbDevice) = UsbDeviceInfo(
+        busnum = (dev.deviceId / 1000).toUInt(),
+        devnum = (dev.deviceId % 1000).toUInt(),
+        vendorId = dev.vendorId.toUShort(),
+        productId = dev.productId.toUShort(),
+        bcdDevice = bcdVersion(dev.version),
+        deviceClass = dev.deviceClass.toUByte(),
+        deviceSubclass = dev.deviceSubclass.toUByte(),
+        deviceProtocol = dev.deviceProtocol.toUByte(),
+        configurationValue = if (dev.configurationCount > 0) dev.getConfiguration(0).id.toUByte() else 1u,
+        numConfigurations = dev.configurationCount.toUByte(),
+        interfaces = (0 until dev.interfaceCount).map { i ->
+            val f = dev.getInterface(i)
+            UsbInterfaceInfo(f.interfaceClass.toUByte(), f.interfaceSubclass.toUByte(), f.interfaceProtocol.toUByte())
+        },
+    )
+
+    /** `UsbDevice.version` ("2.25") → BCD (0x0225), the `bcdDevice` coding.
+     *  Each of major/minor is two BCD nibbles; unparseable → 0. */
+    private fun bcdVersion(v: String): UShort {
+        val m = Regex("""(\d+)\.(\d+)""").find(v) ?: return 0u
+        val maj = (m.groupValues[1].toIntOrNull() ?: 0).coerceIn(0, 99)
+        val minor = m.groupValues[2].padStart(2, '0').take(2)
+        val bcd = ((maj / 10) shl 12) or ((maj % 10) shl 8) or
+            ((minor[0] - '0') shl 4) or (minor[1] - '0')
+        return bcd.toUShort()
     }
 
     private fun onExportEnd(entry: Entry, error: String?) {

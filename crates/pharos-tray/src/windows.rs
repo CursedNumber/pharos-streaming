@@ -128,10 +128,14 @@ pub fn run() -> Result<()> {
     });
 }
 
-/// Stop the host on Windows: no systemd here — terminate the host process.
+/// Stop the host on Windows: no systemd here — terminate the host process
+/// and the USB/IP import bridge that rides along with it.
 fn shutdown_host() {
-    info!("stopping pharos-host");
+    info!("stopping pharos-host + pharos-usbimport");
     let _ = std::process::Command::new("taskkill")
         .args(["/IM", "pharos-host.exe", "/F"])
+        .status();
+    let _ = std::process::Command::new("taskkill")
+        .args(["/IM", "pharos-usbimport.exe", "/F"])
         .status();
 }

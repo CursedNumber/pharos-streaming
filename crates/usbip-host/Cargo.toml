@@ -4,8 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# Pharos import bridge: accept the exporter, hand vhci_hcd a socket, relay URBs.
-# Linux-only (vhci_hcd); the binary stubs out elsewhere so the workspace builds.
+# Pharos import bridge: accept the exporter, materialize the device locally,
+# relay URBs. Linux: hand vhci_hcd a socketpair fd via sysfs. Windows: loopback
+# USB/IP shim + usbip-win2 (`usbip.exe attach`), see the win module (issue #3).
+# The binary stubs out on other platforms so the workspace builds.
 [[bin]]
 name = "pharos-usbimport"
 path = "src/bin/pharos-usbimport.rs"
@@ -16,6 +18,23 @@ transport = { path = "../transport" }
 core-proto = { path = "../core-proto" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 nix = { version = "0.29", features = ["socket"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(windows)'.dependencies]
+transport = { path = "../transport" }
+core-proto = { path = "../core-proto" }
+# OP_REQ/REP_DEVLIST + OP_REQ/REP_IMPORT framing for the loopback shim.
+core-usbip = { path = "../core-usbip" }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

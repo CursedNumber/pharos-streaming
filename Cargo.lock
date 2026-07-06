@@ -6436,6 +6436,7 @@ dependencies = [
  "bytes",
  "core-crypto",
  "core-proto",
+ "core-usbip",
  "idna",
  "postcard",
  "quinn",
@@ -6803,6 +6804,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "core-proto",
+ "core-usbip",
  "nix 0.29.0",
  "tokio",
  "tracing",

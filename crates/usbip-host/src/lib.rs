@@ -3,7 +3,9 @@
 
 //! USB/IP import side (BATTLE_PLAN §8): Linux vhci-hcd / Windows signed bridge.
 //! The host side that materializes a client-exported device into a virtual hub.
-//! M0 stub — lands at M5 (Linux) / M3 (Windows bridge).
+//! Both backends live in `bin/pharos-usbimport.rs`: Linux hands vhci_hcd a
+//! socketpair fd via sysfs; Windows drives the usbip-win2 vhci driver through
+//! a loopback USB/IP shim (issue #3).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportBackend {
