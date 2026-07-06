@@ -207,6 +207,8 @@ pub fn run(addr: SocketAddr) -> Result<()> {
         false,
         // CLI: no window cap — `pharos-compositor pair` runs until Ctrl-C.
         None,
+        // The standalone CLI is the host's only mDNS presence — announce.
+        true,
         |ev| match ev {
             PairEvent::Listening { pin, .. } => announce_pin(&pin),
             PairEvent::Attempt { peer } => info!("incoming pair attempt from {peer}"),
@@ -226,6 +228,15 @@ pub fn run(addr: SocketAddr) -> Result<()> {
 ///
 /// `initial_pin` is the first round's code — minted by the caller so it can be
 /// surfaced to the panel synchronously before this thread is even scheduled.
+///
+/// `announce_mdns`: whether this listener registers the host's mDNS instance
+/// for its lifetime. True when the pairing window IS the host's discovery
+/// presence (the Linux compositor, the standalone CLI). False when the host
+/// already advertises process-wide (the Windows stream host) — a second
+/// registration of the same instance name gets conflict-renamed by the daemon
+/// ("pharos (pharos) (2)") and lingers in client caches after the window
+/// closes, because a dropped daemon doesn't reliably send mDNS goodbyes.
+#[allow(clippy::too_many_arguments)]
 pub fn run_listener(
     addr: SocketAddr,
     identity: Identity,
@@ -233,6 +244,7 @@ pub fn run_listener(
     cancel: Arc<AtomicBool>,
     stop_after_pair: bool,
     max_window: Option<Duration>,
+    announce_mdns: bool,
     on_event: impl Fn(PairEvent),
 ) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -245,10 +257,12 @@ pub fn run_listener(
         cancel,
         stop_after_pair,
         max_window,
+        announce_mdns,
         on_event,
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
     addr: SocketAddr,
     identity: Identity,
@@ -256,6 +270,7 @@ async fn run_loop(
     cancel: Arc<AtomicBool>,
     stop_after_pair: bool,
     max_window: Option<Duration>,
+    announce_mdns: bool,
     on_event: impl Fn(PairEvent),
 ) -> Result<()> {
     // Bind error (e.g. port already in use) surfaces here so the manager can
@@ -285,13 +300,18 @@ async fn run_loop(
 
     // Announce ourselves over mDNS so Trireme's menu picks us up as a tile
     // without the user having to type host/port. _Held_ for the lifetime of
-    // the listener; dropping it withdraws the broadcast.
-    let _mdns = match announce_mdns(addr, &identity, core_proto::ports::STREAM) {
-        Ok(d) => Some(d),
-        Err(e) => {
-            warn!("mDNS announce failed: {e:?} (LAN discovery off; pair manually)");
-            None
+    // the listener; dropping it withdraws the broadcast. Skipped when the
+    // host already advertises process-wide (see `run_listener` docs).
+    let _mdns = if announce_mdns {
+        match self::announce_mdns(addr, &identity, core_proto::ports::STREAM) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                warn!("mDNS announce failed: {e:?} (LAN discovery off; pair manually)");
+                None
+            }
         }
+    } else {
+        None
     };
 
     let peers_path = peers_path()?;

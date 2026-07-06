@@ -48,6 +48,8 @@ pub struct PairingManager {
     /// thread's trailing `Stopped`/`Failed`/`Listening` (it may not exit for
     /// seconds) could clobber a freshly-opened round's PIN/active state.
     epoch: AtomicU64,
+    /// Whether an open window announces the host over mDNS — see [`Self::new`].
+    announce_mdns: bool,
 }
 
 /// The live listener: its cancel flag (flipped to stop) and the thread handle
@@ -59,11 +61,19 @@ struct Running {
 
 impl PairingManager {
     /// Build a manager sharing the control server's [`HostStatus`] mutex.
-    pub fn new(status: Arc<Mutex<HostStatus>>) -> Arc<Self> {
+    ///
+    /// `announce_mdns`: whether an open pairing window registers the host's
+    /// mDNS instance. Pass `true` when the pairing window is the host's only
+    /// discovery presence (the Linux compositor); `false` when the host
+    /// already advertises for its whole lifetime (the Windows stream host) —
+    /// a second registration conflict-renames to "… (2)" and the ghost
+    /// outlives the window in client caches (see `pair::run_listener`).
+    pub fn new(status: Arc<Mutex<HostStatus>>, announce_mdns: bool) -> Arc<Self> {
         Arc::new(Self {
             status,
             inner: Mutex::new(None),
             epoch: AtomicU64::new(0),
+            announce_mdns,
         })
     }
 
@@ -111,6 +121,7 @@ impl PairingManager {
 
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_thread = cancel.clone();
+        let announce_mdns = self.announce_mdns;
         let me_evt = self.clone();
         let me_err = self.clone();
         let handle = std::thread::Builder::new()
@@ -132,6 +143,7 @@ impl PairingManager {
                     cancel_thread,
                     stop_after_pair,
                     max_window,
+                    announce_mdns,
                     on_event,
                 ) {
                     // Bind failure (port in use) or a runtime error: report it

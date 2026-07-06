@@ -188,7 +188,8 @@ impl ControlServer {
         // The pairing window runs off the render loop (its own QUIC endpoint), so
         // it shares the status mutex directly rather than bouncing through a
         // ControlCmd. One manager per host run, shared across serve threads.
-        let pairing = crate::pairing::PairingManager::new(status.clone());
+        // announce_mdns: the pairing window is this host's only mDNS presence.
+        let pairing = crate::pairing::PairingManager::new(status.clone(), true);
         let listener = match control_ipc::bind() {
             Ok(l) => l,
             Err(e) => {
@@ -1355,7 +1356,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).expect("bind test control socket");
         let status = Arc::new(Mutex::new(default_status()));
-        let pairing = crate::pairing::PairingManager::new(status.clone());
+        let pairing = crate::pairing::PairingManager::new(status.clone(), true);
         // A standalone deadline handle whose backing atomic is dropped when the
         // test ends. The serve threads can `poke` it without affecting any
         // real render loop.
