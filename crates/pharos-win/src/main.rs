@@ -123,6 +123,19 @@ fn main() -> anyhow::Result<()> {
             let out = args.get(5).map(String::as_str).unwrap_or("nvenc-test.hevc");
             zerocopy::encode_test_pattern(w, h, 60, frames, out)
         }
+        // `pharos-host nvenc-test-hdr [w] [h] [frames] [out.hevc]` — the full
+        // HDR leg with no HDR display: fp16 scRGB ramp → PQ shader → Main10 +
+        // SEI (issue #4 bring-up; the compositor's nvenc-test-hdr sibling).
+        Some("nvenc-test-hdr") => {
+            let w: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1920);
+            let h: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1080);
+            let frames: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(120);
+            let out = args
+                .get(5)
+                .map(String::as_str)
+                .unwrap_or("nvenc-test-hdr.hevc");
+            zerocopy::encode_test_pattern_hdr(w, h, 60, frames, out)
+        }
         _ => {
             eprintln!(
                 "Pharos host (Windows)\n\
@@ -131,7 +144,8 @@ fn main() -> anyhow::Result<()> {
                  pharos-host stream   [bind=0.0.0.0:4435] [output_idx=0] [fps=60] [qsv|nvenc|amf] [dda|wgc|wgc-zc]\n  \
                  pharos-host wgc-test [monitor_idx=0] [frames=120] [out.bgra]\n  \
                  pharos-host pad-test [seconds=10]\n  \
-                 pharos-host nvenc-test [w=1920] [h=1080] [frames=120] [out.hevc]"
+                 pharos-host nvenc-test [w=1920] [h=1080] [frames=120] [out.hevc]\n  \
+                 pharos-host nvenc-test-hdr [w=1920] [h=1080] [frames=120] [out.hevc]"
             );
             Ok(())
         }
@@ -306,6 +320,7 @@ fn build_status(
     client_pubkey: Option<String>,
     frames_sent: u64,
     coded: (u32, u32),
+    hdr_active: Option<String>,
     gpu_health: control_ipc::GpuHealth,
 ) -> control_ipc::HostStatus {
     let clients = if connected {
@@ -347,9 +362,9 @@ fn build_status(
         gpu_health,
         // Single-client only — no mirror fan-out on the Windows path.
         stream_mode: control_ipc::StreamMode::Single,
-        // Windows host HDR capture+encode is the deferred game-HDR path; until
-        // it lands the Windows host always streams SDR.
-        hdr_active: None,
+        // Some("HEVC Main10 BT.2020/PQ") when the wgc-zc pipeline runs its
+        // HDR10 session (issue #4); the ffmpeg paths stream SDR and pass None.
+        hdr_active,
     }
 }
 
@@ -425,6 +440,9 @@ fn run_stream(
     // carries the truth; the supervisor loop re-latches on every pipeline
     // (re)build. `coded` mirrors the value into HostStatus for the panel.
     let coded = Arc::new(AtomicU64::new(0));
+    // Some(label) while a generation streams HDR10 (wgc-zc only); mirrored
+    // into HostStatus so the panel's badge follows the live session.
+    let hdr_label: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     if let Some((w, h)) = capture_size(capture, output_idx) {
         streamer.set_geometry(w, h);
         coded.store(pack_wh(w, h), Ordering::Relaxed);
@@ -554,18 +572,20 @@ fn run_stream(
         streamer.connected_pubkey(),
         0,
         unpack_wh(coded.load(Ordering::Relaxed)),
+        None,
         control_ipc::GpuHealth::Healthy,
     )));
     {
         // Refresh the published status ~4 Hz from the live streamer + frame
         // counter (the Windows analogue of the Linux render loop's status push).
-        let (status_r, streamer_r, frames_r, hostname_r, health_r, coded_r) = (
+        let (status_r, streamer_r, frames_r, hostname_r, health_r, coded_r, hdr_r) = (
             status.clone(),
             streamer.clone(),
             frames.clone(),
             hostname.clone(),
             gpu_health.clone(),
             coded.clone(),
+            hdr_label.clone(),
         );
         std::thread::Builder::new()
             .name("control-status".into())
@@ -580,6 +600,7 @@ fn run_stream(
                     streamer_r.connected_pubkey(),
                     frames_r.load(Ordering::Relaxed),
                     unpack_wh(coded_r.load(Ordering::Relaxed)),
+                    hdr_r.lock().ok().and_then(|g| g.clone()),
                     health_r.lock().map(|g| g.clone()).unwrap_or_default(),
                 );
                 if let Ok(mut g) = status_r.lock() {
@@ -633,39 +654,47 @@ fn run_stream(
         // pump typed AUs, ordered teardown, breaker/backoff bookkeeping. Kept
         // as its own branch so the ffmpeg path stays byte-identical.
         if matches!(capture, CaptureBackend::WgcZc) {
-            let pipeline = match zerocopy::ZcPipeline::start(output_idx as usize, fps) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!("pipeline build failed (gen {generation}): {e:#}");
-                    if breaker.record_and_check() {
+            // HDR is a session-level property (NVENC format is fixed at
+            // create): sampled from the connected client's wants_hdr at each
+            // generation build, so a preference change applies on the next
+            // respawn (the Linux host's HDR-flip-is-a-relaunch rule).
+            let pipeline =
+                match zerocopy::ZcPipeline::start(output_idx as usize, fps, streamer.wants_hdr()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("pipeline build failed (gen {generation}): {e:#}");
+                        if breaker.record_and_check() {
+                            set_health(
+                                &gpu_health,
+                                control_ipc::GpuHealth::Faulted {
+                                    reason: format!(
+                                        "encoder build failed after {} tries: {e}",
+                                        breaker.max
+                                    ),
+                                    last_xid: None,
+                                },
+                            );
+                            break 'supervisor;
+                        }
                         set_health(
                             &gpu_health,
-                            control_ipc::GpuHealth::Faulted {
-                                reason: format!(
-                                    "encoder build failed after {} tries: {e}",
-                                    breaker.max
-                                ),
-                                last_xid: None,
+                            control_ipc::GpuHealth::Degraded {
+                                reason: format!("encoder restarting: {e}"),
+                                throttle: None,
                             },
                         );
-                        break 'supervisor;
+                        std::thread::sleep(backoff);
+                        backoff = (backoff * 2).min(backoff_cap);
+                        generation += 1;
+                        continue 'supervisor;
                     }
-                    set_health(
-                        &gpu_health,
-                        control_ipc::GpuHealth::Degraded {
-                            reason: format!("encoder restarting: {e}"),
-                            throttle: None,
-                        },
-                    );
-                    std::thread::sleep(backoff);
-                    backoff = (backoff * 2).min(backoff_cap);
-                    generation += 1;
-                    continue 'supervisor;
-                }
-            };
+                };
             let (w, h) = pipeline.size;
             streamer.set_geometry(w, h);
             coded.store(pack_wh(w, h), Ordering::Relaxed);
+            if let Ok(mut g) = hdr_label.lock() {
+                *g = pipeline.hdr.then(|| "HEVC Main10 BT.2020/PQ".to_string());
+            }
 
             let gen_start = Instant::now();
             set_health(&gpu_health, control_ipc::GpuHealth::Healthy);
@@ -1458,6 +1487,7 @@ mod tests {
             Some("ab12cd".into()),
             4096,
             (3840, 2160),
+            Some("HEVC Main10 BT.2020/PQ".into()),
             control_ipc::GpuHealth::Healthy,
         );
         assert_eq!(s.hostname, "winrig");
@@ -1473,6 +1503,8 @@ mod tests {
         assert_eq!(c.pubkey.as_deref(), Some("ab12cd"));
         // Issue #1: the captured monitor's size reaches the panel.
         assert_eq!((c.coded_w, c.coded_h), (3840, 2160));
+        // Issue #4: the HDR badge follows the live session label.
+        assert_eq!(s.hdr_active.as_deref(), Some("HEVC Main10 BT.2020/PQ"));
     }
 
     #[test]
@@ -1494,9 +1526,11 @@ mod tests {
             None,
             0,
             (0, 0),
+            None,
             control_ipc::GpuHealth::Healthy,
         );
         assert!(!s.streaming);
+        assert!(s.hdr_active.is_none());
         assert!(s.clients.is_empty());
         // Even idle, the host advertises its codec so the panel's Video tab can
         // light up the active encoder before a client connects.
@@ -1515,6 +1549,7 @@ mod tests {
             None,
             0,
             (1920, 1080),
+            None,
             control_ipc::GpuHealth::Faulted {
                 reason: "device removed".into(),
                 last_xid: None,

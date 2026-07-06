@@ -9,9 +9,14 @@
 //! multi-monitor rigs.
 
 use anyhow::{anyhow, Context, Result};
-use windows::core::PCWSTR;
-use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, DXGI_OUTPUT_DESC};
-use windows::Win32::Graphics::Gdi::{EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS};
+use windows::core::{ComInterface, PCWSTR};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput6, DXGI_OUTPUT_DESC,
+};
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS, HMONITOR,
+};
 
 /// Pixel size of DXGI output `output_idx` on adapter 0: the monitor ffmpeg's
 /// `ddagrab` captures, and therefore the encoded stream size (the ddagrab
@@ -56,4 +61,34 @@ pub fn dda_output_size(output_idx: u32) -> Result<(u32, u32)> {
         ));
     }
     Ok((w, h))
+}
+
+/// Is Windows HDR active on the output that owns `hmon`? Walks every DXGI
+/// adapter's outputs to find the matching monitor and asks `IDXGIOutput6::
+/// GetDesc1`: HDR-on shows as the RGB_FULL_G2084_NONE_P2020 (PQ/BT.2020)
+/// color space. `Ok(false)` for SDR outputs; `Err` if the monitor cannot be
+/// resolved (the caller should treat that as SDR and say why).
+pub fn monitor_hdr_active(hmon: HMONITOR) -> Result<bool> {
+    let factory = unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }.context("CreateDXGIFactory1")?;
+    for a in 0.. {
+        let adapter = match unsafe { factory.EnumAdapters1(a) } {
+            Ok(ad) => ad,
+            Err(_) => break,
+        };
+        for o in 0.. {
+            let output = match unsafe { adapter.EnumOutputs(o) } {
+                Ok(out) => out,
+                Err(_) => break,
+            };
+            let mut desc = DXGI_OUTPUT_DESC::default();
+            if unsafe { output.GetDesc(&mut desc) }.is_err() || desc.Monitor != hmon {
+                continue;
+            }
+            let out6: IDXGIOutput6 = output.cast().context("IDXGIOutput6 (needs Win10 1703+)")?;
+            let mut d1 = Default::default();
+            unsafe { out6.GetDesc1(&mut d1) }.context("GetDesc1")?;
+            return Ok(d1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+        }
+    }
+    Err(anyhow!("monitor not found among DXGI outputs"))
 }

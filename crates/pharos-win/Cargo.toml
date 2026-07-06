@@ -49,6 +49,8 @@ windows = { version = "0.52", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    # HLSL compilation at runtime (D3DCompile) for the HDR scRGB->PQ pass.
+    "Win32_Graphics_Direct3D_Fxc",
     "Win32_UI_HiDpi",
     "Win32_System_WinRT_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
