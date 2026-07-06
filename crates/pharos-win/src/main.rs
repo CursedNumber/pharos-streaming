@@ -651,7 +651,9 @@ fn run_stream(
     // (the ~4 Hz refresh above preserves that field). This is what makes the
     // panel's Pair button work on Windows instead of the raw `pharos-host pair`
     // CLI. Its listener is opened on demand by StartPairing, off any render loop.
-    let pairing = host_core::pairing::PairingManager::new(status.clone());
+    // announce_mdns = false: this host advertises process-wide below (`_mdns`);
+    // a second registration would conflict-rename to "… (2)" on clients.
+    let pairing = host_core::pairing::PairingManager::new(status.clone(), false);
     let ctrl_addr = std::net::SocketAddr::from(([0, 0, 0, 0], core_proto::ports::CONTROL));
     match control_ipc::tcp_bind(ctrl_addr) {
         Ok(listener) => {
