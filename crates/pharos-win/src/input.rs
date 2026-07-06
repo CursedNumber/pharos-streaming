@@ -32,6 +32,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 pub struct Injector {
     held_keys: std::collections::HashSet<u32>,
     held_buttons: std::collections::HashSet<u8>,
+    pads: PadBank,
 }
 
 impl Injector {
@@ -39,6 +40,7 @@ impl Injector {
         Injector {
             held_keys: std::collections::HashSet::new(),
             held_buttons: std::collections::HashSet::new(),
+            pads: PadBank::new(),
         }
     }
 
@@ -65,22 +67,30 @@ impl Injector {
                 mouse_button(button, pressed);
             }
             InputEvent::Scroll { dx, dy } => scroll(dx, dy),
-            // Gamepad input isn't injected on the Windows host yet (would need a
-            // ViGEm virtual pad); ignore for now so the protocol stays shared.
-            InputEvent::GamepadButton { .. }
-            | InputEvent::GamepadAxis { .. }
-            | InputEvent::GamepadConnect { .. }
-            | InputEvent::GamepadDisconnect { .. }
-            | InputEvent::GamepadMotion { .. }
-            | InputEvent::ControllerTuning { .. } => {}
+            // Gamepad → a ViGEm virtual Xbox 360 pad per slot (issue #2).
+            InputEvent::GamepadConnect {
+                slot,
+                vendor,
+                product,
+            } => self.pads.connect(slot, vendor, product),
+            InputEvent::GamepadDisconnect { slot } => self.pads.disconnect(slot),
+            InputEvent::GamepadButton {
+                slot,
+                button,
+                pressed,
+            } => self.pads.button(slot, button, pressed),
+            InputEvent::GamepadAxis { slot, axis, value } => self.pads.axis(slot, axis, value),
+            // Gyro→mouse aim on the Windows host is a future refinement (the
+            // Linux compositor's path-2); raw motion has no XUSB representation.
+            InputEvent::GamepadMotion { .. } | InputEvent::ControllerTuning { .. } => {}
         }
     }
 
-    /// Release every key and button the remote still holds. Called when the
-    /// client disconnects or a new client preempts the session; the departing
-    /// client can never send its key-ups after that point, and replaying a
-    /// half-open hold into the next session (or the console user's lap) is
-    /// always wrong.
+    /// Release every key and button the remote still holds, and center every
+    /// virtual pad. Called when the client disconnects or a new client
+    /// preempts the session; the departing client can never send its key-ups
+    /// after that point, and replaying a half-open hold into the next session
+    /// (or the console user's lap) is always wrong.
     pub fn release_all(&mut self) {
         let n = self.held_keys.len() + self.held_buttons.len();
         for k in std::mem::take(&mut self.held_keys) {
@@ -92,6 +102,143 @@ impl Injector {
         if n > 0 {
             tracing::info!("input: released {n} held keys/buttons on client change");
         }
+        self.pads.neutral_all();
+    }
+}
+
+// ── Virtual Xbox 360 pads (ViGEmBus) ─────────────────────────────────────────
+
+/// Lazily-connected ViGEmBus client + one virtual Xbox 360 pad per wire slot.
+/// Missing driver degrades to a warn-once no-op: streaming continues exactly
+/// as before issue #2, just without pads.
+struct PadBank {
+    client: BusSlot,
+    pads: std::collections::HashMap<u8, LivePad>,
+}
+
+enum BusSlot {
+    Untried,
+    Dead,
+    Live(std::sync::Arc<vigem_client::Client>),
+}
+
+struct LivePad {
+    target: vigem_client::Xbox360Wired<std::sync::Arc<vigem_client::Client>>,
+    state: crate::pads::PadState,
+}
+
+impl PadBank {
+    fn new() -> Self {
+        PadBank {
+            client: BusSlot::Untried,
+            pads: std::collections::HashMap::new(),
+        }
+    }
+
+    fn bus(&mut self) -> Option<std::sync::Arc<vigem_client::Client>> {
+        if let BusSlot::Untried = self.client {
+            self.client = match vigem_client::Client::connect() {
+                Ok(c) => BusSlot::Live(std::sync::Arc::new(c)),
+                Err(e) => {
+                    tracing::warn!(
+                        "ViGEmBus unavailable: {e} — gamepad events are ignored. Install the \
+                         ViGEmBus driver (github.com/nefarius/ViGEmBus/releases) for controllers."
+                    );
+                    BusSlot::Dead
+                }
+            };
+        }
+        match &self.client {
+            BusSlot::Live(c) => Some(c.clone()),
+            _ => None,
+        }
+    }
+
+    /// The pad for `slot`, plugging a fresh virtual pad on first use (so pads
+    /// work even if a client skips GamepadConnect).
+    fn pad(&mut self, slot: u8) -> Option<&mut LivePad> {
+        if !self.pads.contains_key(&slot) {
+            let bus = self.bus()?;
+            let mut target =
+                vigem_client::Xbox360Wired::new(bus, vigem_client::TargetId::XBOX360_WIRED);
+            if let Err(e) = target.plugin().and_then(|()| target.wait_ready()) {
+                tracing::warn!("virtual pad plugin failed (slot {slot}): {e}");
+                return None;
+            }
+            tracing::info!("virtual Xbox 360 pad plugged for slot {slot}");
+            self.pads.insert(
+                slot,
+                LivePad {
+                    target,
+                    state: crate::pads::PadState::default(),
+                },
+            );
+        }
+        self.pads.get_mut(&slot)
+    }
+
+    fn connect(&mut self, slot: u8, vendor: u16, product: u16) {
+        if self.pad(slot).is_some() {
+            tracing::info!(
+                "client controller {vendor:04x}:{product:04x} → virtual pad slot {slot}"
+            );
+        }
+    }
+
+    fn disconnect(&mut self, slot: u8) {
+        // Dropping the target unplugs the virtual pad.
+        if self.pads.remove(&slot).is_some() {
+            tracing::info!("virtual pad slot {slot} unplugged (client controller went away)");
+        }
+    }
+
+    fn button(&mut self, slot: u8, button: u8, pressed: bool) {
+        if let Some(pad) = self.pad(slot) {
+            if !pad.state.apply_button(button, pressed) {
+                tracing::debug!("unmapped gamepad button index {button}");
+                return;
+            }
+            push(pad);
+        }
+    }
+
+    fn axis(&mut self, slot: u8, axis: u8, value: f32) {
+        if let Some(pad) = self.pad(slot) {
+            pad.state.apply_axis(axis, value);
+            push(pad);
+        }
+    }
+
+    /// Center sticks/triggers and release buttons on every pad (client change:
+    /// a departed client must not leave a stick deflected in a game). Pads stay
+    /// plugged; the next client's GamepadConnect reuses or replaces them.
+    fn neutral_all(&mut self) {
+        for (slot, pad) in &mut self.pads {
+            if pad.state != crate::pads::PadState::default() {
+                pad.state.neutral();
+                push(pad);
+                tracing::info!("virtual pad slot {slot} centered on client change");
+            }
+        }
+    }
+}
+
+/// Send the shadow report to the driver. Failures are logged, not fatal: a
+/// TDR-style bus hiccup shouldn't kill the input thread.
+fn push(pad: &mut LivePad) {
+    let report = vigem_client::XGamepad {
+        buttons: vigem_client::XButtons {
+            raw: pad.state.buttons,
+        },
+        left_trigger: pad.state.left_trigger,
+        right_trigger: pad.state.right_trigger,
+        thumb_lx: pad.state.thumb_lx,
+        thumb_ly: pad.state.thumb_ly,
+        thumb_rx: pad.state.thumb_rx,
+        thumb_ry: pad.state.thumb_ry,
+    };
+    if let Err(e) = pad.target.update(&report) {
+        tracing::warn!("virtual pad update failed: {e}");
     }
 }
 

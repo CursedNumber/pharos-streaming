@@ -21,6 +21,10 @@ mod display;
 mod encode;
 #[cfg(windows)]
 mod input;
+// Pure XUSB report mapping — also compiled under `test` so its unit tests run
+// on the Linux dev box (the ViGEm plumbing in `input` stays Windows-only).
+#[cfg(any(windows, test))]
+mod pads;
 #[cfg(windows)]
 mod wgc;
 
@@ -93,13 +97,20 @@ fn main() -> anyhow::Result<()> {
             let out = args.get(4).map(String::as_str).unwrap_or("wgc-frame.bgra");
             run_wgc_test(idx, frames, out)
         }
+        // `pharos-host pad-test [seconds]` — plug a ViGEm virtual Xbox 360 pad
+        // and drive a visible pattern (validates issue #2 with no client).
+        Some("pad-test") => {
+            let secs: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
+            run_pad_test(secs)
+        }
         _ => {
             eprintln!(
                 "Pharos host (Windows)\n\
                  usage:\n  \
                  pharos-host pair     [addr=0.0.0.0:4432]\n  \
                  pharos-host stream   [bind=0.0.0.0:4435] [output_idx=0] [fps=60] [qsv|nvenc|amf] [dda|wgc]\n  \
-                 pharos-host wgc-test [monitor_idx=0] [frames=120] [out.bgra]"
+                 pharos-host wgc-test [monitor_idx=0] [frames=120] [out.bgra]\n  \
+                 pharos-host pad-test [seconds=10]"
             );
             Ok(())
         }
@@ -1203,6 +1214,55 @@ fn run_wgc_test(monitor_idx: usize, frames: u32, out: &str) -> anyhow::Result<()
         "captured {n} frames in {secs:.2}s ({:.1} fps); wrote last → {out} (wrote={wrote})",
         n as f64 / secs
     );
+    Ok(())
+}
+
+/// Plug a virtual Xbox 360 pad via ViGEmBus and drive a visible pattern (left
+/// stick circles, right trigger pulses, A toggles once a second) so joy.cpl or
+/// Device Manager shows the pad working with no streaming client attached —
+/// the issue #2 bring-up check, sibling to `wgc-test`.
+#[cfg(windows)]
+fn run_pad_test(secs: u64) -> anyhow::Result<()> {
+    use core_proto::gamepad as g;
+    use core_proto::InputEvent;
+    use std::time::{Duration, Instant};
+    use tracing::info;
+
+    let mut inj = input::Injector::new();
+    inj.dispatch(&InputEvent::GamepadConnect {
+        slot: 0,
+        vendor: 0x045e,
+        product: 0x028e,
+    });
+    info!("driving the pad for {secs}s: check joy.cpl → \"Xbox 360 Controller\"…");
+    let t0 = Instant::now();
+    let mut t = 0f32;
+    while t0.elapsed() < Duration::from_secs(secs) {
+        t += 0.016;
+        inj.dispatch(&InputEvent::GamepadAxis {
+            slot: 0,
+            axis: g::AXIS_LEFT_X,
+            value: t.sin(),
+        });
+        inj.dispatch(&InputEvent::GamepadAxis {
+            slot: 0,
+            axis: g::AXIS_LEFT_Y,
+            value: t.cos(),
+        });
+        inj.dispatch(&InputEvent::GamepadAxis {
+            slot: 0,
+            axis: g::AXIS_RTRIGGER,
+            value: t.sin() * 0.5 + 0.5,
+        });
+        inj.dispatch(&InputEvent::GamepadButton {
+            slot: 0,
+            button: g::BTN_A,
+            pressed: (t as u64).is_multiple_of(2),
+        });
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    inj.dispatch(&InputEvent::GamepadDisconnect { slot: 0 });
+    info!("pad-test done; pad unplugged");
     Ok(())
 }
 

@@ -27,6 +27,9 @@ integration-mqtt = { path = "../integration-mqtt" }
 # Win32 input injection (SendInput) + virtual-screen metrics. Reuses the
 # `windows` 0.52 already in the lockfile (pulled by winit/wgpu on the client).
 [target.'cfg(windows)'.dependencies]
+# Virtual Xbox 360 pads through the ViGEmBus driver (issue #2). Client-only:
+# without the driver installed, connect fails and gamepad events no-op.
+vigem-client = "0.1"
 windows = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_UI_Input_KeyboardAndMouse",
