@@ -173,6 +173,16 @@ pub fn launch(entry: &AppEntry, ctx: &LaunchContext) -> anyhow::Result<Option<Ch
         return Ok(None);
     }
 
+    // Perf overlay on Windows = RTSS. It hooks new processes system-wide once
+    // its service is running, so starting it BEFORE the app is the whole
+    // integration — and unlike the env-scoped MangoHud path below, it also
+    // covers Steam handoffs (Steam re-spawns the game, but RTSS hooks it all
+    // the same). What the OSD shows is configured in RTSS itself.
+    #[cfg(windows)]
+    if entry.perf_overlay {
+        ensure_rtss_running();
+    }
+
     // Warm-Steam guard: a launch that hands off to the Steam client (a `steam://`
     // URI or the `steam` binary) must NOT cold-start Steam concurrently with the
     // live NVENC encode — that triggers the documented `libnvcuvid` SIGSEGV that
@@ -321,6 +331,89 @@ pub fn mangohud_available() -> bool {
         .any(|p| std::path::Path::new(p).is_file());
         on_path || layer
     })
+}
+
+/// Whether a perf-overlay backend exists on THIS system — MangoHud on Linux,
+/// RTSS (RivaTuner Statistics Server) on Windows. Gates the panel's
+/// perf-overlay control so it isn't offered where it would no-op; the panel
+/// picks its per-OS wording off `cfg!(windows)` to match.
+pub fn perf_overlay_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        mangohud_available()
+    }
+    #[cfg(windows)]
+    {
+        static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *AVAILABLE.get_or_init(|| rtss_exe().is_some())
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        false
+    }
+}
+
+/// Resolve RTSS.exe: the Unwinder registry key first (`InstallPath` is the
+/// full exe path, `InstallDir` its folder — both observed live on RTSS 7.3.7),
+/// then the Program Files defaults. `None` when not installed.
+#[cfg(windows)]
+fn rtss_exe() -> Option<std::path::PathBuf> {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+
+    if let Ok(key) =
+        RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey("SOFTWARE\\WOW6432Node\\Unwinder\\RTSS")
+    {
+        if let Ok(p) = key.get_value::<String, _>("InstallPath") {
+            let p = std::path::PathBuf::from(p);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        if let Ok(d) = key.get_value::<String, _>("InstallDir") {
+            let p = std::path::PathBuf::from(d).join("RTSS.exe");
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    for var in ["ProgramFiles(x86)", "ProgramFiles"] {
+        if let Ok(base) = std::env::var(var) {
+            let p = std::path::PathBuf::from(base)
+                .join("RivaTuner Statistics Server")
+                .join("RTSS.exe");
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// Make sure RTSS is running so it hooks the app we're about to launch and
+/// draws its OSD into the frames the stream captures. Best-effort and
+/// idempotent: no-op when RTSS isn't installed or already runs, and a spawn
+/// failure only logs — the app launch itself must never be blocked on an
+/// overlay. (No reaper needed: Windows has no zombie semantics, dropping the
+/// child handle is fine.)
+#[cfg(windows)]
+fn ensure_rtss_running() {
+    let Some(exe) = rtss_exe() else {
+        tracing::debug!("perf_overlay set but RTSS not installed; launching without overlay");
+        return;
+    };
+    let running = std::process::Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq RTSS.exe", "/NH"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("RTSS.exe"))
+        .unwrap_or(false);
+    if running {
+        return;
+    }
+    match std::process::Command::new(&exe).spawn() {
+        Ok(_) => tracing::info!("started RTSS for the perf overlay ({})", exe.display()),
+        Err(e) => tracing::warn!("start RTSS ({}): {e}", exe.display()),
+    }
 }
 
 /// Owned snapshot of everything `spawn_steam_url` needs to build and spawn the

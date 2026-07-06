@@ -482,34 +482,50 @@ fn form_fields(ui: &mut egui::Ui, draft: &mut AppEntry) {
                 .describe(tr("apps.field.gyro_desc"));
             ui.end_row();
 
-            // FPS cap + perf overlay both ride MangoHud, so gate them on its
-            // presence — the env still no-ops harmlessly without it, but we don't
-            // want to offer a dead knob. (Checked on the panel's box; normally the
-            // host box too. The Windows RTSS/Afterburner equivalent isn't wired yet,
-            // so these stay disabled there.)
-            let mango = app_launcher::launch::mangohud_available();
+            // Perf-overlay backend on this box: MangoHud (Linux) or RTSS
+            // (Windows). Gate the control on presence — we don't offer a dead
+            // knob — and pick the wording per OS. (Checked on the panel's box;
+            // normally the host box too.)
+            let overlay_ok = app_launcher::launch::perf_overlay_available();
+            let on_windows = cfg!(windows);
 
             // FPS cap: off / auto (match the virtual output's refresh) / fixed.
-            // Realised as a MangoHud frame limiter on launch — pure efficiency
-            // for a stream whose output is a fixed refresh.
-            ui.label(tr("apps.field.fps_cap"));
-            ui.add_enabled_ui(mango, |ui| fps_cap_picker(ui, draft));
-            ui.end_row();
+            // Realised as a MangoHud frame limiter on launch, so the row is
+            // Linux-only — fully hidden on Windows, where a framerate limit is
+            // the user's own global RTSS setting, not a per-app knob of ours.
+            if !on_windows {
+                ui.label(tr("apps.field.fps_cap"));
+                ui.add_enabled_ui(overlay_ok, |ui| fps_cap_picker(ui, draft));
+                ui.end_row();
+            }
 
-            // Perf overlay: burn MangoHud's HUD into the stream so it's readable on
-            // the client (the productivity/monitoring case). Flips no_display=0.
+            // Perf overlay: burn a perf HUD into the stream so it's readable on
+            // the client. Linux: MangoHud with no_display=0. Windows: start
+            // RTSS alongside the app (it hooks and draws its OSD system-wide).
             ui.label(tr("apps.field.perf_overlay"));
             ui.vertical(|ui| {
-                ui.add_enabled_ui(mango, |ui| {
-                    ui.checkbox(&mut draft.perf_overlay, tr("apps.field.perf_overlay_on"))
-                        .describe(tr("apps.field.perf_overlay_desc"));
+                ui.add_enabled_ui(overlay_ok, |ui| {
+                    let (on_label, desc) = if on_windows {
+                        (
+                            tr("apps.field.perf_overlay_on_rtss"),
+                            tr("apps.field.perf_overlay_desc_rtss"),
+                        )
+                    } else {
+                        (
+                            tr("apps.field.perf_overlay_on"),
+                            tr("apps.field.perf_overlay_desc"),
+                        )
+                    };
+                    ui.checkbox(&mut draft.perf_overlay, on_label)
+                        .describe(desc);
                 });
-                if !mango {
-                    ui.label(
-                        egui::RichText::new(tr("apps.field.mangohud_absent"))
-                            .small()
-                            .weak(),
-                    );
+                if !overlay_ok {
+                    let hint = if on_windows {
+                        tr("apps.field.rtss_absent")
+                    } else {
+                        tr("apps.field.mangohud_absent")
+                    };
+                    ui.label(egui::RichText::new(hint).small().weak());
                 }
             });
             ui.end_row();

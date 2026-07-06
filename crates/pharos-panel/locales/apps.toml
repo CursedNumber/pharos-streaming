@@ -194,6 +194,18 @@ nb = "Brenn MangoHuds ytelsesoverlegg (fps, bildetid, GPU/CPU) inn i programmets
 en = "MangoHud not detected on the host — install it to enable the overlay and FPS cap."
 nb = "MangoHud ikke funnet på verten — installer det for å aktivere overlegg og FPS-tak."
 
+["apps.field.perf_overlay_on_rtss"]
+en = "Show RTSS overlay"
+nb = "Vis RTSS-overlegg"
+
+["apps.field.perf_overlay_desc_rtss"]
+en = "Start RivaTuner Statistics Server with this app so its on-screen display (fps, frametime) is burned into the stream. RTSS hooks apps system-wide, so this also works for Steam games; what the OSD shows is configured in RTSS itself."
+nb = "Start RivaTuner Statistics Server sammen med dette programmet slik at skjermvisningen (fps, bildetid) brennes inn i strømmen. RTSS hekter seg på programmer systemvidt, så dette virker også for Steam-spill; hva OSD-en viser konfigureres i RTSS selv."
+
+["apps.field.rtss_absent"]
+en = "RTSS (RivaTuner Statistics Server) not detected — install it to enable the overlay."
+nb = "RTSS (RivaTuner Statistics Server) ikke funnet — installer det for å aktivere overlegget."
+
 ["apps.field.command"]
 en = "Launch command"
 nb = "Startkommando"

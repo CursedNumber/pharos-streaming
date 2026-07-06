@@ -137,12 +137,15 @@ pub fn detect_steam() -> SteamInstall {
             Some(h) => h,
             None => return SteamInstall::None,
         };
-        // Native first (the common, fastest path).
+        // Native first (the common, fastest path). The `.steam/root` symlink
+        // tracks the real install dir, so non-standard paths are covered.
+        // The last entry is the macOS data dir (harmless to probe elsewhere).
         for rel in [
             ".local/share/Steam",
             ".steam/steam",
             ".steam/root",
             ".steam/debian-installation",
+            "Library/Application Support/Steam",
         ] {
             let root = home.join(rel);
             if root.join("steamapps").is_dir() {
@@ -163,7 +166,29 @@ pub fn detect_steam() -> SteamInstall {
 
 #[cfg(windows)]
 fn windows_steam_candidates() -> Vec<PathBuf> {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::RegKey;
+
     let mut v = Vec::new();
+    // Registry first: Steam records its actual install dir, so non-standard
+    // paths (C:\Steam, another drive) are found where the Program Files
+    // guesses below would miss. Same sources as `steam::resolve_steam_exe`.
+    // SteamPath comes back forward-slashed ("c:/steam") — PathBuf is fine
+    // with that, but normalize so joins/logs read natively.
+    if let Some(p) = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey("Software\\Valve\\Steam")
+        .ok()
+        .and_then(|k| k.get_value::<String, _>("SteamPath").ok())
+    {
+        v.push(PathBuf::from(p.replace('/', "\\")));
+    }
+    if let Some(p) = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey("Software\\WOW6432Node\\Valve\\Steam")
+        .ok()
+        .and_then(|k| k.get_value::<String, _>("InstallPath").ok())
+    {
+        v.push(PathBuf::from(p));
+    }
     for var in ["ProgramFiles(x86)", "ProgramFiles", "ProgramW6432"] {
         if let Ok(base) = std::env::var(var) {
             v.push(PathBuf::from(base).join("Steam"));
@@ -227,6 +252,18 @@ mod tests {
         let (line, shell) = install.launch_command(&LaunchKind::SteamGame { appid: 9 });
         assert!(shell, "Windows URI hand-off needs the shell");
         assert!(line.contains("steam://rungameid/9"));
+    }
+
+    /// Live probe of THIS machine's Steam install — run explicitly:
+    /// `cargo test -p app-launcher live_detect_steam -- --ignored --nocapture`.
+    /// Not asserted (machine-dependent); prints what detection resolves so a
+    /// "no games in easy mode" report is diagnosable in one command.
+    #[test]
+    #[ignore = "live probe of the local machine, run explicitly"]
+    fn live_detect_steam() {
+        let install = detect_steam();
+        println!("detect_steam() -> {install:?}");
+        println!("scan_steam() -> {} games", crate::scan::scan_steam().len());
     }
 
     #[test]
