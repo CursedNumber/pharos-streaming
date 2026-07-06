@@ -252,6 +252,7 @@ mod state_tests {
             gpu_health: gpu,
             stream_mode: control_ipc::StreamMode::Single,
             hdr_active: None,
+            primary_pubkey: None,
         }
     }
 
