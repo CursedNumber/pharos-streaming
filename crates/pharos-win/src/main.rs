@@ -27,6 +27,8 @@ mod input;
 mod pads;
 #[cfg(windows)]
 mod wgc;
+#[cfg(windows)]
+mod zerocopy;
 
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {
@@ -85,8 +87,16 @@ fn main() -> anyhow::Result<()> {
             // AMD rig where ddagrab can't reach the virtual display's adapter).
             let capture = match args.get(6).map(String::as_str) {
                 Some("wgc") => CaptureBackend::Wgc,
+                Some("wgc-zc") => CaptureBackend::WgcZc,
                 _ => CaptureBackend::Dda,
             };
+            // The zero-copy path IS the NVENC SDK; the qsv/amf ffmpeg encoders
+            // have no in-process equivalent here.
+            if matches!(capture, CaptureBackend::WgcZc)
+                && !matches!(encoder, encode::Encoder::Nvenc)
+            {
+                anyhow::bail!("wgc-zc requires the nvenc encoder");
+            }
             run_stream(bind, output_idx, fps, encoder, capture)
         }
         // `pharos-host wgc-test [monitor_idx] [frames] [out.bgra]` — capture via
@@ -103,14 +113,25 @@ fn main() -> anyhow::Result<()> {
             let secs: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
             run_pad_test(secs)
         }
+        // `pharos-host nvenc-test [w] [h] [frames] [out.hevc]` — encode a test
+        // pattern through the in-process D3D11 NVENC session (issue #12
+        // bring-up: driver loading, session open, texture registration).
+        Some("nvenc-test") => {
+            let w: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1920);
+            let h: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1080);
+            let frames: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(120);
+            let out = args.get(5).map(String::as_str).unwrap_or("nvenc-test.hevc");
+            zerocopy::encode_test_pattern(w, h, 60, frames, out)
+        }
         _ => {
             eprintln!(
                 "Pharos host (Windows)\n\
                  usage:\n  \
                  pharos-host pair     [addr=0.0.0.0:4432]\n  \
-                 pharos-host stream   [bind=0.0.0.0:4435] [output_idx=0] [fps=60] [qsv|nvenc|amf] [dda|wgc]\n  \
+                 pharos-host stream   [bind=0.0.0.0:4435] [output_idx=0] [fps=60] [qsv|nvenc|amf] [dda|wgc|wgc-zc]\n  \
                  pharos-host wgc-test [monitor_idx=0] [frames=120] [out.bgra]\n  \
-                 pharos-host pad-test [seconds=10]"
+                 pharos-host pad-test [seconds=10]\n  \
+                 pharos-host nvenc-test [w=1920] [h=1080] [frames=120] [out.hevc]"
             );
             Ok(())
         }
@@ -127,6 +148,9 @@ enum CaptureBackend {
     /// Windows.Graphics.Capture in-process — captures by `HMONITOR` (any adapter,
     /// incl. IddCx virtual displays); change-driven, so the host paces it.
     Wgc,
+    /// WGC capture + in-process NVENC on the same D3D11 device (issue #12):
+    /// no ffmpeg subprocess, no CPU frame copies. nvenc-only.
+    WgcZc,
 }
 
 /// Accept either a bare `host:port` or a `quic://host:port` bind string (the
@@ -192,6 +216,7 @@ fn start_mqtt(
     let cap_s = match capture {
         CaptureBackend::Dda => "ddagrab",
         CaptureBackend::Wgc => "wgc",
+        CaptureBackend::WgcZc => "wgc-zc",
     };
     let announce = |s: EntitySpec| {
         if let Err(e) = mqtt.announce(&s) {
@@ -603,6 +628,85 @@ fn run_stream(
     let mut generation: u64 = 0;
 
     'supervisor: loop {
+        // ── In-process WGC→NVENC generation (issue #12) ───────────────────
+        // Same ladder as the ffmpeg path below, minus the subprocess: build,
+        // pump typed AUs, ordered teardown, breaker/backoff bookkeeping. Kept
+        // as its own branch so the ffmpeg path stays byte-identical.
+        if matches!(capture, CaptureBackend::WgcZc) {
+            let pipeline = match zerocopy::ZcPipeline::start(output_idx as usize, fps) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("pipeline build failed (gen {generation}): {e:#}");
+                    if breaker.record_and_check() {
+                        set_health(
+                            &gpu_health,
+                            control_ipc::GpuHealth::Faulted {
+                                reason: format!(
+                                    "encoder build failed after {} tries: {e}",
+                                    breaker.max
+                                ),
+                                last_xid: None,
+                            },
+                        );
+                        break 'supervisor;
+                    }
+                    set_health(
+                        &gpu_health,
+                        control_ipc::GpuHealth::Degraded {
+                            reason: format!("encoder restarting: {e}"),
+                            throttle: None,
+                        },
+                    );
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(backoff_cap);
+                    generation += 1;
+                    continue 'supervisor;
+                }
+            };
+            let (w, h) = pipeline.size;
+            streamer.set_geometry(w, h);
+            coded.store(pack_wh(w, h), Ordering::Relaxed);
+
+            let gen_start = Instant::now();
+            set_health(&gpu_health, control_ipc::GpuHealth::Healthy);
+            if let Some(m) = &mqtt {
+                m.publish_state("state", "streaming");
+            }
+
+            let reason = inner_pump_zc(&pipeline, &frames, &streamer, inject.as_ref(), generation);
+            pipeline.stop();
+
+            if gen_start.elapsed() >= Duration::from_secs(3) {
+                backoff = Duration::from_millis(500); // clean stream window → reset
+            }
+            let rmsg = reason.describe();
+            warn!("encoder pipeline ended (gen {generation}): {rmsg} — recovering");
+            if breaker.record_and_check() {
+                set_health(
+                    &gpu_health,
+                    control_ipc::GpuHealth::Faulted {
+                        reason: format!(
+                            "GPU/encoder unrecoverable after {} restarts: {rmsg}",
+                            breaker.max
+                        ),
+                        last_xid: None,
+                    },
+                );
+                break 'supervisor;
+            }
+            set_health(
+                &gpu_health,
+                control_ipc::GpuHealth::Degraded {
+                    reason: format!("encoder restart: {rmsg}"),
+                    throttle: None,
+                },
+            );
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(backoff_cap);
+            generation += 1;
+            continue 'supervisor;
+        }
+
         let pacer_stop = Arc::new(AtomicBool::new(false));
         let (enc, stdout, stderr, pacer, size) =
             match build_pipeline(capture, output_idx, fps, encoder, &pacer_stop) {
@@ -950,7 +1054,7 @@ fn capture_size(capture: CaptureBackend, output_idx: u32) -> Option<(u32, u32)> 
                 None
             }
         },
-        CaptureBackend::Wgc => wgc::list_monitors()
+        CaptureBackend::Wgc | CaptureBackend::WgcZc => wgc::list_monitors()
             .get(output_idx as usize)
             .copied()
             .filter(|&(w, h)| w > 0 && h > 0),
@@ -991,6 +1095,9 @@ fn build_pipeline(
                 .ok_or_else(|| anyhow::anyhow!("ffmpeg produced no stderr pipe"))?;
             Ok((e, stdout, stderr, None, size))
         }
+        // The zero-copy path never reaches build_pipeline: the supervisor
+        // branches to ZcPipeline::start before calling it.
+        CaptureBackend::WgcZc => unreachable!("wgc-zc has its own supervisor branch"),
         CaptureBackend::Wgc => {
             // Fresh WgcCapturer per generation: re-reads the monitor size and gets
             // a fresh D3D11 device (a TDR likely killed the old one).
@@ -1069,6 +1176,56 @@ fn inner_pump(
             Err(RecvTimeoutError::Disconnected) => {
                 warn!("ffmpeg stdout closed — encoder exited");
                 return FaultReason::Eof;
+            }
+        }
+    }
+}
+
+/// Pump the in-process pipeline's AUs onto the stream until a fault: the
+/// zero-copy analogue of [`inner_pump`]. No splitter (one NVENC lock = one
+/// AU), typed fault reasons instead of stderr scraping, and keyframe flags
+/// via `send_frame` so IDRs get the transport queue's keyframe reserve. The
+/// fault-inject seam counts encoded AUs exactly like the ffmpeg path, so the
+/// P6 test timings hold.
+#[cfg(windows)]
+fn inner_pump_zc(
+    pipeline: &zerocopy::ZcPipeline,
+    frames: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    streamer: &std::sync::Arc<transport::QuicStreamer>,
+    inject: Option<&InjectSpec>,
+    generation: u64,
+) -> FaultReason {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    use tracing::info;
+
+    let mut gen_frames: u64 = 0;
+    let mut last_log = Instant::now();
+    loop {
+        match pipeline.recv_timeout(Duration::from_millis(200)) {
+            zerocopy::ZcRecv::Au(au) => {
+                frames.fetch_add(1, Ordering::Relaxed);
+                gen_frames += 1;
+                streamer.send_frame(au.bytes, au.keyframe);
+                if let Some(spec) = inject {
+                    if spec.should_fire(generation, gen_frames) {
+                        return FaultReason::FaultInjected(spec.label());
+                    }
+                }
+                if last_log.elapsed() >= Duration::from_secs(2) {
+                    info!(
+                        "encode: {} access units sent",
+                        frames.load(Ordering::Relaxed)
+                    );
+                    last_log = Instant::now();
+                }
+            }
+            zerocopy::ZcRecv::Empty => continue,
+            zerocopy::ZcRecv::Dead => {
+                let reason = pipeline
+                    .fault_reason()
+                    .unwrap_or_else(|| "encoder thread exited".to_string());
+                return FaultReason::DeviceLoss(reason);
             }
         }
     }

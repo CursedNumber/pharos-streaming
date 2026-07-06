@@ -266,7 +266,7 @@ fn capture_loop(
     }
 }
 
-fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
+pub(crate) fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     let mut device = None;
     let mut context = None;
     unsafe {
@@ -288,19 +288,19 @@ fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     ))
 }
 
-fn create_rt_device(device: &ID3D11Device) -> Result<IDirect3DDevice> {
+pub(crate) fn create_rt_device(device: &ID3D11Device) -> Result<IDirect3DDevice> {
     let dxgi: IDXGIDevice = device.cast()?;
     let inspectable = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi)? };
     Ok(inspectable.cast()?)
 }
 
-fn create_item_for_monitor(hmon: HMONITOR) -> Result<GraphicsCaptureItem> {
+pub(crate) fn create_item_for_monitor(hmon: HMONITOR) -> Result<GraphicsCaptureItem> {
     let interop: IGraphicsCaptureItemInterop =
         windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
     Ok(unsafe { interop.CreateForMonitor(hmon)? })
 }
 
-fn monitor_by_index(idx: usize) -> Result<HMONITOR> {
+pub(crate) fn monitor_by_index(idx: usize) -> Result<HMONITOR> {
     let mons = enum_monitors();
     mons.get(idx)
         .copied()

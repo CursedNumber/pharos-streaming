@@ -3924,6 +3924,7 @@ version = "0.4.0"
 dependencies = [
  "cudarc",
  "lazy_static",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -4535,6 +4536,7 @@ dependencies = [
  "host-info",
  "integration-mqtt",
  "media-audio",
+ "nvidia-video-codec-sdk",
  "tracing",
  "tracing-subscriber",
  "transport",
