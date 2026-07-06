@@ -64,7 +64,8 @@ fn main() -> anyhow::Result<()> {
             };
             host_core::pair::run(addr)
         }
-        // `pharos-host stream [bind] [output_idx] [fps] [qsv|nvenc|amf] [dda|wgc]`
+        // `pharos-host stream [bind] [output_idx] [fps] [qsv|nvenc|amf] [dda|wgc|wgc-zc]`
+        // Encoder defaults to GPU-vendor auto-detection when not given.
         Some("stream") => {
             let bind = match args.get(2) {
                 Some(s) => parse_bind(s)?,
@@ -79,7 +80,8 @@ fn main() -> anyhow::Result<()> {
             let encoder = match args.get(5).map(String::as_str) {
                 Some("nvenc") => encode::Encoder::Nvenc,
                 Some("amf") => encode::Encoder::Amf,
-                _ => encode::Encoder::Qsv,
+                Some("qsv") => encode::Encoder::Qsv,
+                _ => detect_default_encoder(),
             };
             // Capture backend: ddagrab (DXGI Desktop Duplication, self-pacing) by
             // default; `wgc` uses Windows.Graphics.Capture (captures IddCx virtual
@@ -174,6 +176,22 @@ fn parse_bind(s: &str) -> anyhow::Result<std::net::SocketAddr> {
     let s = s.strip_prefix("quic://").unwrap_or(s);
     s.parse()
         .map_err(|e| anyhow::anyhow!("bad bind address {s:?}: {e}"))
+}
+
+/// Encoder default when the CLI doesn't name one: match the machine's GPU
+/// vendor instead of assuming Quick Sync. The old hard Qsv default
+/// black-screened NVIDIA-only rigs — no MFX means the encoder faults five
+/// times and parks, while audio/input keep working — and the panel launches
+/// `pharos-host stream` bare, so it hit exactly that. Explicit args still win.
+fn detect_default_encoder() -> encode::Encoder {
+    let (enc, why) = match display::preferred_encoder_vendor() {
+        Some(display::VENDOR_NVIDIA) => (encode::Encoder::Nvenc, "NVIDIA adapter"),
+        Some(display::VENDOR_AMD) => (encode::Encoder::Amf, "AMD adapter"),
+        Some(display::VENDOR_INTEL) => (encode::Encoder::Qsv, "Intel adapter"),
+        _ => (encode::Encoder::Qsv, "no known GPU vendor; falling back"),
+    };
+    tracing::info!("encoder auto-detect: {enc:?} ({why})");
+    enc
 }
 
 /// Start the optional MQTT/Home-Assistant integration **only if enabled in

@@ -662,10 +662,18 @@ mod win {
                 Ok(o) if o.status.success() => {
                     tracing::debug!("detached vhci port {port} ({busid})")
                 }
-                Ok(o) => tracing::warn!(
-                    "usbip detach -p {port} failed: {}",
-                    String::from_utf8_lossy(&o.stderr).trim()
-                ),
+                Ok(o) => {
+                    let err = String::from_utf8_lossy(&o.stderr);
+                    let err = err.trim();
+                    // Benign race, live-verified: when the exporter drops, the
+                    // driver notices its dead TCP connection and detaches the
+                    // port itself before this best-effort pass runs.
+                    if err.contains("not connected") {
+                        tracing::debug!("vhci port {port} ({busid}) already self-detached");
+                    } else {
+                        tracing::warn!("usbip detach -p {port} failed: {err}");
+                    }
+                }
                 Err(e) => tracing::warn!("usbip detach: {e}"),
             }
         })

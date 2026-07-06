@@ -12,7 +12,7 @@ use anyhow::{anyhow, Context, Result};
 use windows::core::{ComInterface, PCWSTR};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput6, DXGI_OUTPUT_DESC,
+    CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput6, DXGI_ADAPTER_DESC1, DXGI_OUTPUT_DESC,
 };
 use windows::Win32::Graphics::Gdi::{
     EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS, HMONITOR,
@@ -61,6 +61,44 @@ pub fn dda_output_size(output_idx: u32) -> Result<(u32, u32)> {
         ));
     }
     Ok((w, h))
+}
+
+/// PCI vendor ids as DXGI adapter descriptors report them.
+pub const VENDOR_NVIDIA: u32 = 0x10DE;
+pub const VENDOR_AMD: u32 = 0x1002;
+pub const VENDOR_INTEL: u32 = 0x8086;
+
+/// The GPU vendor whose hardware encoder this machine should default to:
+/// walk every DXGI adapter and prefer NVIDIA (NVENC) over AMD (AMF) over
+/// Intel (Quick Sync), so a discrete GPU beats the iGPU regardless of
+/// adapter enumeration order. Software adapters (WARP) are skipped. `None`
+/// when no known hardware vendor is present.
+pub fn preferred_encoder_vendor() -> Option<u32> {
+    const DXGI_ADAPTER_FLAG_SOFTWARE: u32 = 2;
+    let rank = |v: u32| match v {
+        VENDOR_NVIDIA => 3,
+        VENDOR_AMD => 2,
+        VENDOR_INTEL => 1,
+        _ => 0,
+    };
+    let factory = unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }.ok()?;
+    let mut best: Option<u32> = None;
+    for a in 0.. {
+        let Ok(adapter) = (unsafe { factory.EnumAdapters1(a) }) else {
+            break;
+        };
+        let mut desc = DXGI_ADAPTER_DESC1::default();
+        if unsafe { adapter.GetDesc1(&mut desc) }.is_err() {
+            continue;
+        }
+        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE != 0 {
+            continue;
+        }
+        if rank(desc.VendorId) > best.map_or(0, rank) {
+            best = Some(desc.VendorId);
+        }
+    }
+    best.filter(|&v| rank(v) > 0)
 }
 
 /// Is Windows HDR active on the output that owns `hmon`? Walks every DXGI
