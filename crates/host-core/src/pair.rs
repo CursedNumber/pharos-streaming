@@ -34,6 +34,13 @@ pub const MDNS_SERVICE_TYPE: &str = "_pharos._udp.local.";
 /// clients may connect to me?".
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PeerRegistry {
+    /// Hex pubkey of the PRIMARY client (issue #19), if one is set: while it is
+    /// connected, the host refuses other clients instead of pre-empting.
+    /// Declared BEFORE `peers` so the TOML serializer emits the scalar before
+    /// the `[[peer]]` array-of-tables (values-after-tables is invalid TOML).
+    /// `#[serde(default)]` keeps pre-#19 files loading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_pubkey: Option<String>,
     #[serde(default, rename = "peer")]
     pub peers: Vec<Peer>,
 }
@@ -83,7 +90,9 @@ pub fn peers_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("peers.toml"))
 }
 
-fn load_peers(path: &Path) -> Result<PeerRegistry> {
+/// Read the peer registry at `path` (missing file → empty registry). Public so
+/// the control handlers and tests share ONE parse of `peers.toml`.
+pub fn load_registry(path: &Path) -> Result<PeerRegistry> {
     if !path.exists() {
         return Ok(PeerRegistry::default());
     }
@@ -91,7 +100,9 @@ fn load_peers(path: &Path) -> Result<PeerRegistry> {
     toml::from_str(&text).with_context(|| format!("parse {}", path.display()))
 }
 
-fn save_peers(path: &Path, reg: &PeerRegistry) -> Result<()> {
+/// Atomically rewrite the peer registry at `path` (tmp-write + rename), the
+/// same way each successful pairing persists it.
+pub fn save_registry(path: &Path, reg: &PeerRegistry) -> Result<()> {
     if let Some(p) = path.parent() {
         std::fs::create_dir_all(p)?;
     }
@@ -100,6 +111,119 @@ fn save_peers(path: &Path, reg: &PeerRegistry) -> Result<()> {
     std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Parse a 64-char hex Ed25519 pubkey (case-insensitive) into its 32 bytes;
+/// `None` if it isn't exactly 32 bytes of hex. Shared by both hosts' control
+/// handlers (the compositor keeps its own copy for older call sites).
+pub fn parse_pubkey_hex(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// What [`forget_peer`] did, so the control handler can build an honest reply.
+#[derive(Debug, Clone, Copy)]
+pub struct ForgetOutcome {
+    /// A registry entry was removed (false = the pubkey wasn't paired).
+    pub removed: bool,
+    /// The forgotten peer was the primary (its `primary_pubkey` was cleared).
+    pub was_primary: bool,
+    /// Live QUIC sessions closed by the forget (0 = it wasn't connected).
+    pub sessions_closed: usize,
+}
+
+/// Forget (unpair) `pubkey_hex` — the issue #19 panel action, end to end:
+/// rewrite `peers.toml` without the peer (clearing `primary_pubkey` if it named
+/// it), re-sync the transport's live primary, and close any live QUIC session
+/// the peer holds. Future connects need nothing else invalidated: the pairing
+/// authorizer re-reads `peers.toml` on every connection.
+pub fn forget_peer(pubkey_hex: &str) -> Result<ForgetOutcome> {
+    let path = peers_path()?;
+    let mut out = forget_peer_at(&path, pubkey_hex)?;
+    // Kick any live session even if the registry had no entry (a hand-edited
+    // file can leave an authorized session outliving its registry row) — the
+    // operator's intent is "this key must not stream".
+    if let Some(pk) = parse_pubkey_hex(pubkey_hex) {
+        out.sessions_closed = transport::disconnect_peer(pk);
+    }
+    sync_primary_to_transport();
+    Ok(out)
+}
+
+/// The file half of [`forget_peer`], against an explicit path and with no
+/// process-global side effects — used by tests, which can't rely on the
+/// platform config dir (and must not touch the transport globals in parallel).
+pub fn forget_peer_at(path: &Path, pubkey_hex: &str) -> Result<ForgetOutcome> {
+    let mut reg = load_registry(path)?;
+    let before = reg.peers.len();
+    reg.peers
+        .retain(|p| !p.pubkey.eq_ignore_ascii_case(pubkey_hex));
+    let removed = reg.peers.len() < before;
+    let was_primary = reg
+        .primary_pubkey
+        .as_deref()
+        .is_some_and(|p| p.eq_ignore_ascii_case(pubkey_hex));
+    if was_primary {
+        reg.primary_pubkey = None;
+    }
+    if removed || was_primary {
+        save_registry(path, &reg)?;
+    }
+    Ok(ForgetOutcome {
+        removed,
+        was_primary,
+        sessions_closed: 0,
+    })
+}
+
+/// Set (or, with `None`, clear) the persisted PRIMARY client and apply it live
+/// to the transport's pre-emption policy. `Some(pubkey)` must name a paired
+/// peer — refusing unknown keys keeps a typo from silently reserving the host
+/// for nobody.
+pub fn set_primary_peer(pubkey_hex: Option<&str>) -> Result<()> {
+    let path = peers_path()?;
+    set_primary_peer_at(&path, pubkey_hex)?;
+    sync_primary_to_transport();
+    Ok(())
+}
+
+/// The file half of [`set_primary_peer`] — explicit path, no global effects.
+pub fn set_primary_peer_at(path: &Path, pubkey_hex: Option<&str>) -> Result<()> {
+    let mut reg = load_registry(path)?;
+    match pubkey_hex {
+        Some(pk) => {
+            let canon = reg
+                .peers
+                .iter()
+                .find(|p| p.pubkey.eq_ignore_ascii_case(pk))
+                .map(|p| p.pubkey.clone())
+                .ok_or_else(|| anyhow::anyhow!("not a paired peer: {pk}"))?;
+            reg.primary_pubkey = Some(canon);
+        }
+        None => reg.primary_pubkey = None,
+    }
+    save_registry(path, &reg)
+}
+
+/// The persisted primary's hex pubkey from `peers.toml`, if any (best-effort).
+pub fn primary_pubkey() -> Option<String> {
+    let path = peers_path().ok()?;
+    load_registry(&path).ok()?.primary_pubkey
+}
+
+/// Push the persisted `primary_pubkey` into the transport's live pre-emption
+/// policy. Host binaries call this once at startup (after the identity load);
+/// [`set_primary_peer`] / [`forget_peer`] re-call it after each rewrite so the
+/// file and the running policy can't drift.
+pub fn sync_primary_to_transport() {
+    let pk = primary_pubkey().and_then(|hex| parse_pubkey_hex(&hex));
+    transport::set_primary_peer(pk);
 }
 
 /// A fresh random six-digit pairing PIN. Public so the compositor's
@@ -151,7 +275,7 @@ pub fn peers_authorizer_at(path: std::path::PathBuf) -> transport::ClientAuthori
             return false; // anonymous — no identity to match
         };
         let hexk = hex::encode(pk);
-        match load_peers(&path) {
+        match load_registry(&path) {
             Ok(reg) => reg
                 .peers
                 .iter()
@@ -355,9 +479,9 @@ async fn run_loop(
         match handshake {
             Ok(Ok((peer_pub_hex, alias))) => {
                 info!("paired with {peer_pub_hex} ({alias:?})");
-                let mut reg = load_peers(&peers_path).unwrap_or_default();
+                let mut reg = load_registry(&peers_path).unwrap_or_default();
                 reg.upsert(peer_pub_hex.clone(), alias.clone());
-                if let Err(e) = save_peers(&peers_path, &reg) {
+                if let Err(e) = save_registry(&peers_path, &reg) {
                     warn!("save peers: {e:?}");
                 } else {
                     info!("peers persisted to {}", peers_path.display());
@@ -622,5 +746,137 @@ fn sanitize_label(name: &str) -> String {
         "pharos".into()
     } else {
         cleaned.chars().take(63).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! File-level tests for the peer-registry helpers (issue #19). They use the
+    //! explicit-path `_at` variants against a unique temp file per test, so they
+    //! run in parallel with no config-dir or transport-global coupling.
+
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+
+    fn temp_registry(peers: &[(&str, Option<&str>)], primary: Option<&str>) -> PathBuf {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("pharos-peers-test-{}-{n}.toml", std::process::id()));
+        let reg = PeerRegistry {
+            primary_pubkey: primary.map(str::to_string),
+            peers: peers
+                .iter()
+                .map(|(pk, alias)| Peer {
+                    pubkey: pk.to_string(),
+                    alias: alias.map(str::to_string),
+                    paired_at: None,
+                })
+                .collect(),
+        };
+        save_registry(&path, &reg).unwrap();
+        path
+    }
+
+    fn key(byte: u8) -> String {
+        hex::encode([byte; 32])
+    }
+
+    #[test]
+    fn forget_removes_peer_and_clears_primary() {
+        let (a, b) = (key(0xaa), key(0xbb));
+        let path = temp_registry(
+            &[(a.as_str(), Some("phone")), (b.as_str(), None)],
+            Some(a.as_str()),
+        );
+        let out = forget_peer_at(&path, &a).unwrap();
+        assert!(out.removed);
+        assert!(out.was_primary);
+        let reg = load_registry(&path).unwrap();
+        assert_eq!(reg.peers.len(), 1);
+        assert_eq!(reg.peers[0].pubkey, b);
+        assert!(reg.primary_pubkey.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn forget_unknown_peer_is_a_clean_no() {
+        let a = key(0xaa);
+        let path = temp_registry(&[(a.as_str(), None)], None);
+        let out = forget_peer_at(&path, &key(0xcc)).unwrap();
+        assert!(!out.removed);
+        assert!(!out.was_primary);
+        assert_eq!(load_registry(&path).unwrap().peers.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn forget_matches_case_insensitively() {
+        // Hand-edited files can carry uppercase hex; the request side emits
+        // lowercase — the same eq_ignore_ascii_case rule the authorizer uses.
+        let upper = hex::encode([0xab; 32]).to_uppercase();
+        let path = temp_registry(&[(upper.as_str(), None)], None);
+        let out = forget_peer_at(&path, &hex::encode([0xab; 32])).unwrap();
+        assert!(out.removed);
+        assert!(load_registry(&path).unwrap().peers.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn set_primary_requires_a_paired_peer_and_clears() {
+        let (a, b) = (key(0x11), key(0x22));
+        let path = temp_registry(&[(a.as_str(), None)], None);
+        // Unknown key → refused, file untouched.
+        assert!(set_primary_peer_at(&path, Some(&b)).is_err());
+        assert!(load_registry(&path).unwrap().primary_pubkey.is_none());
+        // Paired key → persisted (round-trips through the TOML layout — the
+        // scalar-before-tables ordering this guards is a serializer error
+        // otherwise).
+        set_primary_peer_at(&path, Some(&a)).unwrap();
+        assert_eq!(
+            load_registry(&path).unwrap().primary_pubkey.as_deref(),
+            Some(a.as_str())
+        );
+        // None → cleared.
+        set_primary_peer_at(&path, None).unwrap();
+        assert!(load_registry(&path).unwrap().primary_pubkey.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pre_issue19_registry_still_loads() {
+        // A registry written before `primary_pubkey` existed (peers only).
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("pharos-peers-old-{}-{n}.toml", std::process::id()));
+        std::fs::write(&path, "[[peer]]\npubkey = \"abcd\"\nalias = \"tv\"\n").unwrap();
+        let reg = load_registry(&path).unwrap();
+        assert_eq!(reg.peers.len(), 1);
+        assert!(reg.primary_pubkey.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parse_pubkey_hex_shapes() {
+        let hex64 = "ab".repeat(32);
+        assert_eq!(parse_pubkey_hex(&hex64), Some([0xab; 32]));
+        assert_eq!(parse_pubkey_hex(&hex64.to_uppercase()), Some([0xab; 32]));
+        assert!(parse_pubkey_hex("abcd").is_none());
+        assert!(parse_pubkey_hex(&"zz".repeat(32)).is_none());
+    }
+
+    #[test]
+    fn authorizer_rejects_after_forget() {
+        // The live half of the forget contract: the authorizer re-reads
+        // peers.toml per connection, so a forget needs no cache invalidation.
+        let pk = [0x5e; 32];
+        let hexk = hex::encode(pk);
+        let path = temp_registry(&[(hexk.as_str(), None)], None);
+        let auth = peers_authorizer_at(path.clone());
+        assert!(auth(Some(pk)), "paired peer must be admitted");
+        forget_peer_at(&path, &hexk).unwrap();
+        assert!(!auth(Some(pk)), "forgotten peer must be denied");
+        let _ = std::fs::remove_file(&path);
     }
 }

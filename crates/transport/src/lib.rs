@@ -36,6 +36,31 @@ const RESERVED_PORTS: &[u16] = &[4432, 4434];
 /// bytes are advisory.
 pub const PREEMPT_CLOSE_CODE: u32 = 0x9;
 
+/// QUIC application close code the host sends to a *newcomer* it refuses
+/// because the persisted PRIMARY client currently holds the single streaming
+/// slot (issue #19). Distinct from [`PREEMPT_CLOSE_CODE`] — here nobody was
+/// pre-empted; the challenger was turned away — so the client can show honest
+/// copy ("host reserved by primary client") and back off instead of hammering
+/// redials that will keep being refused. 0xA/0xB are taken (mirror capacity /
+/// mode switch).
+pub const RESERVED_CLOSE_CODE: u32 = 0xC;
+
+/// QUIC application close code the host sends when the operator FORGETS
+/// (unpairs) the connected peer from the panel (issue #19). Every future
+/// connect will fail authorization anyway, so the client should stop
+/// auto-redialing entirely and tell the user to re-pair.
+pub const UNPAIRED_CLOSE_CODE: u32 = 0xD;
+
+/// Stable error text `run_video_client*` fails with when the host refused the
+/// connection with [`RESERVED_CLOSE_CODE`]. Exported so a client frontend can
+/// match it (the error is `anyhow`, not typed) and render honest UI copy.
+pub const RESERVED_BY_PRIMARY_MSG: &str = "host reserved by primary client";
+
+/// Stable error text `run_video_client*` fails with when the host closed the
+/// session with [`UNPAIRED_CLOSE_CODE`] (the operator forgot this device).
+/// Exported so a client frontend can match it and stop redialing.
+pub const UNPAIRED_MSG: &str = "unpaired by host; pair again to reconnect";
+
 /// Scan upward from `base`+1 for a free UDP port to host a QUIC server on,
 /// skipping [`RESERVED_PORTS`]. Last-resort when the configured port is durably
 /// taken by another service — better than failing the output or hanging forever.
@@ -1517,6 +1542,106 @@ fn input_allowed(pubkey: Option<[u8; 32]>) -> bool {
     }
 }
 
+/// The host's PRIMARY client (issue #19), or `None` when no primary is set. A
+/// process-global for the same reason as [`INPUT_DISABLED`]: the host is one
+/// process, and the control handler (panel `SetPrimaryPeer`) must reach the
+/// streaming loop's pre-emption policy without re-plumbing every streamer.
+/// Host binaries seed it from the persisted registry at startup
+/// (`host-core::pair::sync_primary_to_transport`) and update it live.
+static PRIMARY_PEER: std::sync::LazyLock<std::sync::Mutex<Option<[u8; 32]>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// Set (or clear) the primary client. While the primary holds the single
+/// streaming slot, a different client's connect is refused with
+/// [`RESERVED_CLOSE_CODE`] instead of pre-empting; every other pairing of
+/// incumbent/challenger keeps the validated newest-wins pre-empt.
+pub fn set_primary_peer(pubkey: Option<[u8; 32]>) {
+    if let Ok(mut g) = PRIMARY_PEER.lock() {
+        *g = pubkey;
+    }
+}
+
+/// The current primary client's pubkey, if one is set.
+pub fn primary_peer() -> Option<[u8; 32]> {
+    PRIMARY_PEER.lock().ok().and_then(|g| *g)
+}
+
+/// The current primary client's pubkey as lowercase hex (the `peers.toml` /
+/// `ClientStatus` shape), for the hosts' status publishers.
+pub fn primary_peer_hex() -> Option<String> {
+    primary_peer().map(|pk| pk.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// One tracked live session: the peer's verified pubkey + its connection.
+type LiveSession = ([u8; 32], quinn::Connection);
+
+/// Registry of live, authorized streaming sessions by verified pubkey, so the
+/// control plane can close a specific peer's session (panel `ForgetPeer`)
+/// without a handle on the streamer that owns it. Entries are added once a
+/// session is admitted (single-client and mirror paths both) and removed on
+/// session end; [`disconnect_peer`] also prunes already-closed stragglers.
+/// Anonymous sessions (no pubkey) aren't tracked — there's nothing to address.
+static LIVE_SESSIONS: std::sync::LazyLock<std::sync::Mutex<Vec<LiveSession>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// Track an admitted session so [`disconnect_peer`] can reach it. No-op for
+/// anonymous clients.
+fn register_session(pubkey: Option<[u8; 32]>, conn: &quinn::Connection) {
+    let Some(pk) = pubkey else { return };
+    if let Ok(mut s) = LIVE_SESSIONS.lock() {
+        // Prune corpses while we're here so the vec can't grow unboundedly
+        // across many reconnects even if an unregister was ever missed.
+        s.retain(|(_, c)| c.close_reason().is_none());
+        s.push((pk, conn.clone()));
+    }
+}
+
+/// Drop a session from the registry (by the exact connection, so a peer's
+/// *newer* session is never evicted by its older one's teardown).
+fn unregister_session(conn: &quinn::Connection) {
+    if let Ok(mut s) = LIVE_SESSIONS.lock() {
+        s.retain(|(_, c)| c.stable_id() != conn.stable_id());
+    }
+}
+
+/// Client side: map a deliberate application close from the host (preempt /
+/// reserved-by-primary / unpaired) to its stable, matchable error. `None` for
+/// an ordinary drop, an idle timeout, or any other code — those take the
+/// caller's normal reconnect path.
+fn app_close_error(conn: &quinn::Connection) -> Option<anyhow::Error> {
+    let quinn::ConnectionError::ApplicationClosed(ac) = conn.close_reason()? else {
+        return None;
+    };
+    match u64::from(ac.error_code) {
+        x if x == PREEMPT_CLOSE_CODE as u64 => Some(anyhow::anyhow!("preempted by another client")),
+        x if x == RESERVED_CLOSE_CODE as u64 => Some(anyhow::anyhow!(RESERVED_BY_PRIMARY_MSG)),
+        x if x == UNPAIRED_CLOSE_CODE as u64 => Some(anyhow::anyhow!(UNPAIRED_MSG)),
+        _ => None,
+    }
+}
+
+/// Close every live streaming session belonging to `pubkey` with
+/// [`UNPAIRED_CLOSE_CODE`] — the "forget peer" teardown. Returns how many live
+/// sessions were closed (0 = the peer wasn't connected). The streaming loop
+/// observes the close like any peer drop and frees the slot.
+pub fn disconnect_peer(pubkey: [u8; 32]) -> usize {
+    let Ok(mut s) = LIVE_SESSIONS.lock() else {
+        return 0;
+    };
+    let mut closed = 0;
+    s.retain(|(pk, c)| {
+        if *pk == pubkey {
+            if c.close_reason().is_none() {
+                c.close(UNPAIRED_CLOSE_CODE.into(), b"unpaired");
+                closed += 1;
+            }
+            return false;
+        }
+        c.close_reason().is_none()
+    });
+    closed
+}
+
 /// Removes a mirrored client's registry slot on ANY actor exit (closed / send
 /// error / panic), so a dead client can't wedge a slot or hold the connected
 /// gate. Clears `connected`/`wants_gyro` when the last client leaves.
@@ -1526,9 +1651,13 @@ struct SlotGuard {
     wants_gyro: Arc<AtomicBool>,
     wants_hdr: Arc<AtomicBool>,
     id: u64,
+    /// This client's connection, so the drop also clears its LIVE_SESSIONS
+    /// entry (the ForgetPeer reach — see [`register_session`]).
+    conn: quinn::Connection,
 }
 impl Drop for SlotGuard {
     fn drop(&mut self) {
+        unregister_session(&self.conn);
         if let Ok(mut slots) = self.clients.lock() {
             let before = slots.len();
             slots.retain(|s| s.id != self.id);
@@ -1797,6 +1926,9 @@ fn admit_mirror_client(
         }
         tracing::info!("mirror: admitted {addr} (id={id}, total={})", slots.len());
     }
+    // Reachable by the control plane's ForgetPeer teardown (issue #19); the
+    // actor's SlotGuard unregisters it on any exit path.
+    register_session(client_id, &conn);
 
     // Per-connection ACTOR: drains the bounded queue onto a uni stream.
     let clients_actor = clients.clone();
@@ -1813,6 +1945,7 @@ fn admit_mirror_client(
             wants_gyro: wants_gyro_actor,
             wants_hdr: wants_hdr_actor,
             id,
+            conn: conn_actor.clone(),
         };
         let mut send = match conn_actor.open_uni().await {
             Ok(s) => s,
@@ -1921,6 +2054,70 @@ fn admit_mirror_client(
                     }
                 }
             });
+        }
+    });
+}
+
+/// Pre-emption guard (issue #19): `Some(primary)` iff the single-client slot
+/// is currently held by the persisted PRIMARY client — the one case where a
+/// newcomer must NOT pre-empt. Mirror mode keeps its own admit path (newcomers
+/// join rather than steal), and a non-primary incumbent keeps the validated
+/// newest-wins pre-empt, so both return `None`.
+fn incumbent_is_primary(mirror: &Arc<AtomicBool>, client_id: Option<[u8; 32]>) -> Option<[u8; 32]> {
+    if mirror.load(Ordering::Acquire) {
+        return None;
+    }
+    let primary = primary_peer()?;
+    (client_id == Some(primary)).then_some(primary)
+}
+
+/// Vet a challenger while the PRIMARY holds the single slot (issue #19), on
+/// its own task so a slow (or hostile) handshake can never stall the primary's
+/// video. The challenger runs the normal mutual auth + authorization, then:
+///   * a different (or anonymous) client is refused with
+///     [`RESERVED_CLOSE_CODE`] — nobody is pre-empted, the primary streams on;
+///   * the primary ITSELF redialing (its previous session crashed or stalled
+///     and the corpse still holds the slot) frees the slot: the stale
+///     incumbent is closed with [`PREEMPT_CLOSE_CODE`] and the challenger is
+///     closed plain (code 0) so its ordinary fast-reconnect lands on the freed
+///     slot — without this, the primary would be locked out of its own host
+///     for the ~20s idle timeout.
+fn spawn_challenger_vet(
+    incoming: quinn::Incoming,
+    identity: Arc<core_crypto::Identity>,
+    authorizer: ClientAuthorizer,
+    primary: [u8; 32],
+    incumbent: quinn::Connection,
+) {
+    tokio::spawn(async move {
+        let conn = match incoming.await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!("challenger connect failed: {e:?}");
+                return;
+            }
+        };
+        // `authenticate` self-bounds at 5s, so this task can't linger.
+        let client_id = match authenticate(&conn, &identity).await {
+            Ok((id, ..)) => id,
+            Err(e) => {
+                tracing::warn!("challenger auth failed: {e:?}");
+                conn.close(0u32.into(), b"auth");
+                return;
+            }
+        };
+        if !authorizer(client_id) {
+            tracing::warn!("challenger rejected; not in paired peers");
+            conn.close(0u32.into(), b"unauthorized");
+            return;
+        }
+        if client_id == Some(primary) {
+            tracing::info!("primary redialed over its stale session; freeing the slot");
+            incumbent.close(PREEMPT_CLOSE_CODE.into(), b"preempted");
+            conn.close(0u32.into(), b"slot freeing; redial");
+        } else {
+            tracing::info!("refusing new client: host reserved by primary client");
+            conn.close(RESERVED_CLOSE_CODE.into(), b"reserved by primary");
         }
     });
 }
@@ -2154,6 +2351,8 @@ async fn serve_stream(
         if let Ok(mut g) = peer_addr.lock() {
             *g = Some(conn.remote_address());
         }
+        // Reachable by the control plane's ForgetPeer teardown (issue #19).
+        register_session(client_id, &conn);
         connected.store(true, Ordering::Release);
         tracing::info!(
             "streaming to client (wants_gyro={}, wants_hdr={})",
@@ -2450,7 +2649,7 @@ async fn serve_stream(
         let mut last_drops = drops.load(Ordering::Relaxed);
 
         let end_reason: LoopEnd;
-        loop {
+        'stream: loop {
             tokio::select! {
                 biased;
                 _ = conn.closed() => {
@@ -2462,8 +2661,23 @@ async fn serve_stream(
                 // Stash its raw Incoming, drop the incumbent (instant switch; a dead
                 // client's slot frees without waiting on the 20s idle timer), and
                 // break — the newcomer is authenticated at the loop top.
+                //
+                // EXCEPT while the PRIMARY client holds the slot (issue #19): then
+                // the newcomer is vetted on its own task and refused with
+                // RESERVED_CLOSE_CODE unless it *is* the primary redialing — the
+                // primary's stream is never yanked by an auto-redialing sibling.
                 inc = endpoint.accept() => {
                     if let Some(inc) = inc {
+                        if let Some(primary) = incumbent_is_primary(&mirror, client_id) {
+                            spawn_challenger_vet(
+                                inc,
+                                identity.clone(),
+                                authorizer.clone(),
+                                primary,
+                                conn.clone(),
+                            );
+                            continue; // keep streaming to the primary
+                        }
                         tracing::info!("new client connecting; pre-empting current session");
                         // If mirror just turned on, this incumbent shouldn't yield
                         // forever — close with MODE_SWITCH (a benign redial) so it
@@ -2582,43 +2796,66 @@ async fn serve_stream(
                         send.write_all(&chunk.au).await?;
                         anyhow::Ok(())
                     };
-                    tokio::select! {
-                        biased;
-                        _ = conn.closed() => {
-                            end_reason = LoopEnd::PeerDropped;
-                            break;
-                        }
-                        inc = endpoint.accept() => {
-                            if let Some(inc) = inc {
-                                tracing::info!("new client connecting mid-send; pre-empting current session");
-                                // Mirror-on → MODE_SWITCH so the evicted incumbent
-                                // redials + rejoins; off (default) → PREEMPT 0x9.
-                                let close_code = if mirror.load(Ordering::Acquire) {
-                                    MODE_SWITCH_CLOSE_CODE
-                                } else {
-                                    PREEMPT_CLOSE_CODE
-                                };
-                                conn.close(close_code.into(), b"preempted");
-                                pending_incoming = Some(inc);
-                                end_reason = LoopEnd::Preempted;
-                                break;
+                    // Pinned + re-polled (`&mut send_fut`) so the primary-guard
+                    // arm below can vet a challenger WITHOUT dropping a
+                    // half-written frame — abandoning the length-prefixed write
+                    // mid-AU while keeping the connection would desync the
+                    // client's framing for good. The future is only ever dropped
+                    // on the paths that abandon the whole connection.
+                    tokio::pin!(send_fut);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = conn.closed() => {
+                                end_reason = LoopEnd::PeerDropped;
+                                break 'stream;
                             }
-                        }
-                        r = send_fut => {
-                            if let Err(e) = r {
-                                end_reason = LoopEnd::SendError(e);
-                                break;
+                            inc = endpoint.accept() => {
+                                if let Some(inc) = inc {
+                                    if let Some(primary) = incumbent_is_primary(&mirror, client_id) {
+                                        // Primary holds the slot (issue #19): vet
+                                        // the newcomer off-path and keep driving
+                                        // the pinned send on the next pass.
+                                        spawn_challenger_vet(
+                                            inc,
+                                            identity.clone(),
+                                            authorizer.clone(),
+                                            primary,
+                                            conn.clone(),
+                                        );
+                                    } else {
+                                        tracing::info!("new client connecting mid-send; pre-empting current session");
+                                        // Mirror-on → MODE_SWITCH so the evicted incumbent
+                                        // redials + rejoins; off (default) → PREEMPT 0x9.
+                                        let close_code = if mirror.load(Ordering::Acquire) {
+                                            MODE_SWITCH_CLOSE_CODE
+                                        } else {
+                                            PREEMPT_CLOSE_CODE
+                                        };
+                                        conn.close(close_code.into(), b"preempted");
+                                        pending_incoming = Some(inc);
+                                        end_reason = LoopEnd::Preempted;
+                                        break 'stream;
+                                    }
+                                }
                             }
-                            // Wall-clock guard: a slow (but completed) write surfaces the
-                            // documented PHAROS_STREAM_WINDOW_KB flow-control cap as a named
-                            // log line, with chunk size + window setting for one-grep triage.
-                            let write_ms = write_t0.elapsed().as_millis();
-                            if write_ms > 200 {
-                                let win_kb: String = std::env::var("PHAROS_STREAM_WINDOW_KB")
-                                    .unwrap_or_else(|_| "256(default)".into());
-                                tracing::warn!(
-                                    "quic write_all slow ms={write_ms} stream_window_kb={win_kb} chunk_bytes={chunk_bytes}"
-                                );
+                            r = &mut send_fut => {
+                                if let Err(e) = r {
+                                    end_reason = LoopEnd::SendError(e);
+                                    break 'stream;
+                                }
+                                // Wall-clock guard: a slow (but completed) write surfaces the
+                                // documented PHAROS_STREAM_WINDOW_KB flow-control cap as a named
+                                // log line, with chunk size + window setting for one-grep triage.
+                                let write_ms = write_t0.elapsed().as_millis();
+                                if write_ms > 200 {
+                                    let win_kb: String = std::env::var("PHAROS_STREAM_WINDOW_KB")
+                                        .unwrap_or_else(|_| "256(default)".into());
+                                    tracing::warn!(
+                                        "quic write_all slow ms={write_ms} stream_window_kb={win_kb} chunk_bytes={chunk_bytes}"
+                                    );
+                                }
+                                break;
                             }
                         }
                     }
@@ -2641,6 +2878,7 @@ async fn serve_stream(
         }
 
         connected.store(false, Ordering::Release);
+        unregister_session(&conn);
         if let Ok(mut g) = peer_pubkey.lock() {
             *g = None;
         }
@@ -2796,13 +3034,37 @@ pub fn run_video_client<F: FnMut(Vec<u8>)>(
                 }
             }
         }
-        let mut recv = conn.accept_uni().await?;
+        // Deliberate host closes (preempt / reserved-by-primary / unpaired,
+        // issue #19) land as application close codes — map them to their
+        // stable errors here exactly like `run_video_client_with_input`, both
+        // on the accept (a refusal arrives before any stream opens) and at the
+        // end of the read loop.
+        let mut recv = match conn.accept_uni().await {
+            Ok(r) => r,
+            Err(e) => match app_close_error(&conn) {
+                Some(err) => return Err(err),
+                None => return Err(e.into()),
+            },
+        };
         let mut len_buf = [0u8; 4];
+        let mut mid_frame_err: Option<anyhow::Error> = None;
         while recv.read_exact(&mut len_buf).await.is_ok() {
             let len = u32::from_be_bytes(len_buf) as usize;
             let mut buf = vec![0u8; len];
-            recv.read_exact(&mut buf).await?;
+            // Record (don't `?`) a mid-frame error so a close that lands
+            // between the length prefix and the body still reaches the
+            // close-reason mapping below.
+            if let Err(e) = recv.read_exact(&mut buf).await {
+                mid_frame_err = Some(e.into());
+                break;
+            }
             on_frame(buf);
+        }
+        if let Some(err) = app_close_error(&conn) {
+            return Err(err);
+        }
+        if let Some(err) = mid_frame_err {
+            return Err(err);
         }
         Ok(())
     })
@@ -3011,7 +3273,16 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
         // concurrently on this one task (no spawn → no Send/'static bound on the
         // callbacks); the video stream ending = session over.
         let video = async {
-            let mut recv = conn.accept_uni().await?;
+            // A RESERVED/UNPAIRED refusal (issue #19) lands right after auth,
+            // BEFORE the host ever opens the video stream — so the close-code
+            // mapping must cover the accept itself, not just the read loop's end.
+            let mut recv = match conn.accept_uni().await {
+                Ok(r) => r,
+                Err(e) => match app_close_error(&conn) {
+                    Some(err) => return Err(err),
+                    None => return Err(e.into()),
+                },
+            };
             let mut len_buf = [0u8; 4];
             while recv.read_exact(&mut len_buf).await.is_ok() {
                 let len = u32::from_be_bytes(len_buf) as usize;
@@ -3025,16 +3296,14 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
                 on_frame(buf);
                 recv_count.fetch_add(1, Ordering::Relaxed);
             }
-            // The stream ended. If the host CLOSED us to hand the single slot to a
-            // newly-connected client (PREEMPT_CLOSE_CODE), surface that as a
-            // distinct error so the client YIELDS instead of instantly redialing —
-            // two connected clients would otherwise pre-empt each other forever.
-            // An ordinary drop / idle-timeout leaves close_reason None or a
-            // different code, so the normal fast reconnect path is untouched.
-            if let Some(quinn::ConnectionError::ApplicationClosed(ac)) = conn.close_reason() {
-                if u64::from(ac.error_code) == PREEMPT_CLOSE_CODE as u64 {
-                    anyhow::bail!("preempted by another client");
-                }
+            // The stream ended. If the host CLOSED us with one of its deliberate
+            // application codes (preempt / reserved-by-primary / unpaired),
+            // surface the matching stable error so the client can YIELD, back
+            // off, or stop instead of instantly redialing. An ordinary drop /
+            // idle-timeout leaves close_reason None or a different code, so the
+            // normal fast reconnect path is untouched.
+            if let Some(err) = app_close_error(&conn) {
+                return Err(err);
             }
             anyhow::Ok(())
         };
@@ -4146,6 +4415,272 @@ mod tests {
             admitted,
             "paired client must be admitted and receive a frame"
         );
+    }
+
+    /// Issue #19 primary-client policy, end to end on loopback:
+    ///   1. while the PRIMARY streams, a different paired client is REFUSED
+    ///      with the stable reserved-by-primary error — and the primary's
+    ///      frames keep flowing (its session was never yanked);
+    ///   2. the primary ITSELF redialing (a stale incumbent session) frees the
+    ///      slot: the incumbent is preempted, and the redial lands.
+    #[test]
+    fn primary_client_reserves_the_slot() {
+        use std::net::{SocketAddr, UdpSocket};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let host_id = Arc::new(core_crypto::Identity::generate());
+        // Arc because the primary identity dials three times from three
+        // threads (`Identity` isn't Clone).
+        let primary = Arc::new(core_crypto::Identity::generate());
+        let other = core_crypto::Identity::generate();
+        let p_pub = primary.public_bytes();
+        let o_pub = other.public_bytes();
+
+        let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+
+        // Both clients are paired; only `primary` is the primary. The global
+        // is keyed to this test's unique pubkey, so concurrently-running tests
+        // (whose incumbents hold other keys) never trip the policy.
+        let authorizer: super::ClientAuthorizer =
+            Arc::new(move |c: Option<[u8; 32]>| c == Some(p_pub) || c == Some(o_pub));
+        super::set_primary_peer(Some(p_pub));
+        let streamer = Arc::new(
+            super::QuicStreamer::start_with_authorizer(
+                addr,
+                host_id,
+                authorizer,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap(),
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let pusher = {
+            let s = streamer.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    s.send(vec![1, 2, 3, 4]);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
+
+        // 1. The primary connects and receives frames.
+        let p_frames = Arc::new(AtomicU64::new(0));
+        let p_result = {
+            let p_frames = p_frames.clone();
+            let primary = primary.clone();
+            std::thread::spawn(move || {
+                super::run_video_client(
+                    addr,
+                    None,
+                    Some(primary.as_ref()),
+                    move |_| {
+                        p_frames.fetch_add(1, Ordering::Release);
+                    },
+                    None,
+                    None,
+                    None,
+                )
+            })
+        };
+        let mut connected = false;
+        for _ in 0..500 {
+            if p_frames.load(Ordering::Acquire) > 0 {
+                connected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(connected, "primary must connect and receive frames");
+
+        // 2. A different paired client tries to take the slot → refused with
+        //    the stable reserved-by-primary message, nobody preempted.
+        let res_other = std::thread::spawn(move || {
+            super::run_video_client(addr, None, Some(&other), |_| {}, None, None, None)
+        })
+        .join()
+        .unwrap();
+        let err = format!(
+            "{:#}",
+            res_other.expect_err("non-primary must be refused while primary streams")
+        );
+        assert!(
+            err.contains(super::RESERVED_BY_PRIMARY_MSG),
+            "refusal must carry the stable reserved message, got: {err}"
+        );
+
+        // The primary's stream must have survived the challenge: its frame
+        // count keeps growing after the refusal.
+        let before = p_frames.load(Ordering::Acquire);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            p_frames.load(Ordering::Acquire) > before,
+            "primary's stream must keep flowing after a refused challenger"
+        );
+
+        // 3. The primary redials over its own (still-live) session — the stale
+        //    incumbent is preempted so the device isn't locked out of its own
+        //    host. The redial itself is closed plain ("redial"), and the NEXT
+        //    attempt gets the freed slot.
+        let redial = std::thread::spawn({
+            let primary = primary.clone();
+            move || {
+                super::run_video_client(
+                    addr,
+                    None,
+                    Some(primary.as_ref()),
+                    |_| {},
+                    None,
+                    None,
+                    None,
+                )
+            }
+        });
+        let incumbent_end = p_result.join().unwrap();
+        let inc_err = format!(
+            "{:#}",
+            incumbent_end.expect_err("stale incumbent must be preempted by the primary's redial")
+        );
+        assert!(
+            inc_err.contains("preempted"),
+            "incumbent must end as preempted, got: {inc_err}"
+        );
+        let _ = redial.join().unwrap(); // closed plain → ordinary end, either Ok or Err
+
+        let p2_frames = Arc::new(AtomicU64::new(0));
+        {
+            let p2_frames = p2_frames.clone();
+            std::thread::spawn(move || {
+                let _ = super::run_video_client(
+                    addr,
+                    None,
+                    Some(primary.as_ref()),
+                    move |_| {
+                        p2_frames.fetch_add(1, Ordering::Release);
+                    },
+                    None,
+                    None,
+                    None,
+                );
+            });
+        }
+        let mut reconnected = false;
+        for _ in 0..500 {
+            if p2_frames.load(Ordering::Acquire) > 0 {
+                reconnected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _ = pusher.join();
+        super::set_primary_peer(None);
+        assert!(
+            reconnected,
+            "primary must be able to reclaim the slot after its redial"
+        );
+    }
+
+    /// Issue #19 forget-peer teardown: `disconnect_peer` closes the live
+    /// session with the UNPAIRED close code, which the client surfaces as the
+    /// stable unpaired message (its cue to stop redialing).
+    #[test]
+    fn disconnect_peer_closes_live_session_as_unpaired() {
+        use std::net::{SocketAddr, UdpSocket};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let host_id = Arc::new(core_crypto::Identity::generate());
+        let client = core_crypto::Identity::generate();
+        let c_pub = client.public_bytes();
+
+        let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+
+        let authorizer: super::ClientAuthorizer =
+            Arc::new(move |c: Option<[u8; 32]>| c == Some(c_pub));
+        let streamer = Arc::new(
+            super::QuicStreamer::start_with_authorizer(
+                addr,
+                host_id,
+                authorizer,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap(),
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let pusher = {
+            let s = streamer.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    s.send(vec![9, 9, 9]);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
+
+        let frames = Arc::new(AtomicU64::new(0));
+        let client_res = {
+            let frames = frames.clone();
+            std::thread::spawn(move || {
+                super::run_video_client(
+                    addr,
+                    None,
+                    Some(&client),
+                    move |_| {
+                        frames.fetch_add(1, Ordering::Release);
+                    },
+                    None,
+                    None,
+                    None,
+                )
+            })
+        };
+        let mut connected = false;
+        for _ in 0..500 {
+            if frames.load(Ordering::Acquire) > 0 {
+                connected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(connected, "client must connect and receive frames");
+
+        // The operator forgets the peer → its registered live session closes.
+        assert_eq!(
+            super::disconnect_peer(c_pub),
+            1,
+            "one live session must be closed"
+        );
+        let err = format!(
+            "{:#}",
+            client_res
+                .join()
+                .unwrap()
+                .expect_err("client must see its session end as unpaired")
+        );
+        stop.store(true, Ordering::Relaxed);
+        let _ = pusher.join();
+        assert!(
+            err.contains(super::UNPAIRED_MSG),
+            "close must map to the stable unpaired message, got: {err}"
+        );
+        // An unknown key closes nothing.
+        assert_eq!(super::disconnect_peer([0x42; 32]), 0);
     }
 
     /// Audio rides the same authenticated session as unreliable QUIC datagrams:

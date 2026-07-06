@@ -96,6 +96,31 @@ pub fn set_stream_mode(mirror: bool) {
     handle().send_request(Request::SetStreamMode { mirror });
 }
 
+/// Ask the host to forget (unpair) a peer by hex pubkey (issue #19): it
+/// rewrites `peers.toml`, closes the peer's live session, and denies future
+/// connects (the authorizer re-reads the registry per connection). The
+/// Overview's per-card overflow menu drives this after a confirm step. No-op
+/// on a read-only host or with no live link (the card's menu is gated on both).
+pub fn forget_peer(pubkey: &str) {
+    if host_is_read_only() || pubkey.is_empty() {
+        return;
+    }
+    handle().send_request(Request::ForgetPeer {
+        pubkey: pubkey.to_string(),
+    });
+}
+
+/// Ask the host to set (or, with `None`, clear) its PRIMARY client (issue
+/// #19). Persisted host-side in `peers.toml` and applied live to the
+/// pre-emption policy; the panel sees the result on its next status poll via
+/// `HostStatus.primary_pubkey`. No-op on a read-only host.
+pub fn set_primary_peer(pubkey: Option<String>) {
+    if host_is_read_only() {
+        return;
+    }
+    handle().send_request(Request::SetPrimaryPeer { pubkey });
+}
+
 /// Ask the running host to launch a saved app (by `apps.toml` slug) into the
 /// virtual display. No-op if no host is connected (the request is dropped); the
 /// Apps tab disables the Launch buttons in that case.

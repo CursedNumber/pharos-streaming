@@ -866,6 +866,61 @@ fn handle_request(
                 },
             }
         }
+        Request::ForgetPeer { pubkey } => {
+            // Issue #19: rewrite peers.toml without this peer (shared host-core
+            // helper — atomic, clears primary if it named it) and close any live
+            // session it holds. File + transport globals only, so it's handled
+            // on the serve thread like SetInputEnabled — no render-loop
+            // round-trip. Future connects are denied by the authorizer's
+            // per-connection peers.toml re-read.
+            match host_core::pair::forget_peer(&pubkey) {
+                Ok(out) if out.removed => {
+                    tracing::info!(
+                        "panel: forgot peer {}… (primary={}, live sessions closed={})",
+                        &pubkey[..pubkey.len().min(8)],
+                        out.was_primary,
+                        out.sessions_closed
+                    );
+                    Event::Ack {
+                        ok: true,
+                        msg: Some(if out.sessions_closed > 0 {
+                            "peer forgotten; its live session was closed".into()
+                        } else {
+                            "peer forgotten".into()
+                        }),
+                    }
+                }
+                Ok(_) => Event::Ack {
+                    ok: false,
+                    msg: Some("no such paired peer".into()),
+                },
+                Err(e) => Event::Ack {
+                    ok: false,
+                    msg: Some(format!("forget peer: {e}")),
+                },
+            }
+        }
+        Request::SetPrimaryPeer { pubkey } => {
+            // Issue #19: persist primary_pubkey in peers.toml and apply it to
+            // the live pre-emption policy (the helper re-syncs the transport
+            // global). None clears. Same serve-thread handling as ForgetPeer.
+            match host_core::pair::set_primary_peer(pubkey.as_deref()) {
+                Ok(()) => Event::Ack {
+                    ok: true,
+                    msg: Some(match pubkey.as_deref() {
+                        Some(pk) => format!(
+                            "primary client → {}… (others no longer preempt it)",
+                            &pk[..pk.len().min(8)]
+                        ),
+                        None => "primary client cleared (newest-wins preempt)".into(),
+                    }),
+                },
+                Err(e) => Event::Ack {
+                    ok: false,
+                    msg: Some(format!("set primary: {e}")),
+                },
+            }
+        }
     }
 }
 
@@ -1299,6 +1354,7 @@ pub fn default_status() -> HostStatus {
         gpu_health: control_ipc::GpuHealth::Healthy,
         stream_mode: control_ipc::StreamMode::Single,
         hdr_active: None,
+        primary_pubkey: transport::primary_peer_hex(),
     }
 }
 

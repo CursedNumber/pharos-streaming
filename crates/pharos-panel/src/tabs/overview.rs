@@ -40,9 +40,27 @@ enum HostAction {
     Stop,
 }
 
+/// What a peer card's controls decided this frame (issue #19), applied to
+/// `PanelState` after the grid releases its borrow of `state.peers` — the same
+/// borrow-free pattern as [`HostAction`].
+enum PeerAction {
+    /// Star toggle: make this peer the host's primary client (`make = true`)
+    /// or clear the primary (`make = false`, clicking the already-primary star).
+    SetPrimary { pubkey: String, make: bool },
+    /// Overflow menu → confirmed: forget (unpair) this peer.
+    Forget { pubkey: String },
+}
+
 /// Stable id for the search-filter string we stash in egui temp memory.
 fn filter_id() -> egui::Id {
     egui::Id::new("overview_peer_filter")
+}
+
+/// Temp-memory key holding the pubkey of the card whose forget-confirm is
+/// armed (at most one at a time; cleared on cancel/confirm or when the host
+/// stops being actionable).
+fn confirm_forget_id() -> egui::Id {
+    egui::Id::new("overview_confirm_forget_peer")
 }
 
 pub fn ui(ui: &mut egui::Ui, state: &mut PanelState) {
@@ -163,7 +181,47 @@ fn paired_clients(ui: &mut egui::Ui, state: &mut PanelState) {
         return;
     }
 
-    peer_grid(ui, &visible);
+    // The fleet actions (star / forget) go through the host's control plane,
+    // so they need a live, controllable host — gated on capability, not
+    // platform (the Windows host serves them too since issue #19).
+    let can_act = crate::control::handle().connected()
+        && !crate::control::host_is_read_only()
+        && crate::control::host_supports_v2();
+    if !can_act {
+        // A confirm armed against a host that just went away must not linger —
+        // its Forget would otherwise fire into the void later.
+        ui.data_mut(|d| d.remove::<String>(confirm_forget_id()));
+    }
+    let action = peer_grid(ui, &visible, can_act);
+    if let Some(action) = action {
+        apply_peer_action(state, action);
+    }
+}
+
+/// Apply a [`PeerAction`] chosen by a peer card. The request goes to the host
+/// (which owns `peers.toml` and the live policy); the local state is updated
+/// optimistically and corrected by the next ~1 Hz status poll / manual Refresh.
+fn apply_peer_action(state: &mut PanelState, action: PeerAction) {
+    match action {
+        PeerAction::SetPrimary { pubkey, make } => {
+            crate::control::set_primary_peer(make.then(|| pubkey.clone()));
+            for p in &mut state.peers {
+                p.is_primary = make && p.pubkey == pubkey;
+            }
+            state.last_error = None;
+            state.status = Some(if make {
+                tr("overview.peer.status.primary_set")
+            } else {
+                tr("overview.peer.status.primary_cleared")
+            });
+        }
+        PeerAction::Forget { pubkey } => {
+            crate::control::forget_peer(&pubkey);
+            state.peers.retain(|p| p.pubkey != pubkey);
+            state.last_error = None;
+            state.status = Some(tr("overview.peer.status.forgotten"));
+        }
+    }
 }
 
 /// Re-read the on-disk fleet + host state from disk and report the new peer
@@ -890,7 +948,12 @@ pub(crate) fn apply_live_liveness(state: &mut PanelState) {
         }
     }
 
-    // 3) Liveness + encoder/codec/addr from the live client list.
+    // 3) Liveness + addr/encoder/codec/resolution/fps from the live client
+    //    list, joined by pubkey (issue #19). Live values are assigned
+    //    unconditionally — the host's snapshot is ground truth while this peer
+    //    is connected (a reconnect from a new address must not keep showing
+    //    the old one) — and the geometry backfill above keeps the last-known
+    //    values once it drops offline.
     if !connected {
         return;
     }
@@ -898,6 +961,12 @@ pub(crate) fn apply_live_liveness(state: &mut PanelState) {
         return;
     };
     for peer in &mut state.peers {
+        // The host's enforced primary (issue #19) — live truth over the
+        // peers.toml seed, for every card (connected or not).
+        peer.is_primary = status
+            .primary_pubkey
+            .as_deref()
+            .is_some_and(|pk| pk.eq_ignore_ascii_case(&peer.pubkey));
         if let Some(client) = status
             .clients
             .iter()
@@ -912,16 +981,25 @@ pub(crate) fn apply_live_liveness(state: &mut PanelState) {
             } else {
                 Liveness::Online
             };
-            if peer.addr.is_none() {
+            if client.addr.is_some() {
                 peer.addr = client.addr.clone();
             }
-            if peer.encoder.is_none() && !client.encoder.trim().is_empty() {
+            if !client.encoder.trim().is_empty() {
                 peer.encoder = Some(client.encoder.clone());
             }
             // Codec = what this client is decoding (the closest honest proxy for
             // its decoder, which the host can't observe directly).
-            if peer.codec.is_none() && !client.codec.trim().is_empty() {
+            if !client.codec.trim().is_empty() {
                 peer.codec = Some(client.codec.clone());
+            }
+            // Measured wire rate + CODED stream size straight from the live
+            // ClientStatus — the Windows host publishes no outputs, so without
+            // this its connected client showed "—" for both forever.
+            if client.fps > 0 {
+                peer.fps = Some(client.fps);
+            }
+            if client.coded_w > 0 && client.coded_h > 0 {
+                peer.resolution = Some(format!("{}×{}", client.coded_w, client.coded_h));
             }
         } else {
             // Host is up and this peer is not among its connected clients — we
@@ -944,20 +1022,29 @@ fn record_connected_geom(state: &mut PanelState, status: &control_ipc::HostStatu
     let Some(pubkey) = client.pubkey.as_deref() else {
         return;
     };
-    let Some(out) = status
-        .outputs
-        .iter()
-        .find(|o| o.connected)
-        .or_else(|| status.outputs.first())
-    else {
-        return;
+    // Prefer the client's own CODED stream size (present on both hosts); fall
+    // back to the primary output's mode. The Windows host publishes no
+    // outputs, so the output-only read recorded nothing there — its devices
+    // never got a persisted geometry (issue #19 live-join gap).
+    let (w, h) = if client.coded_w > 0 && client.coded_h > 0 {
+        (client.coded_w, client.coded_h)
+    } else {
+        match status
+            .outputs
+            .iter()
+            .find(|o| o.connected)
+            .or_else(|| status.outputs.first())
+        {
+            Some(out) => (out.w, out.h),
+            None => return,
+        }
     };
-    if client.fps == 0 || out.w == 0 || out.h == 0 {
+    if client.fps == 0 || w == 0 || h == 0 {
         return;
     }
     let geom = crate::model::DeviceGeom {
-        w: out.w,
-        h: out.h,
+        w,
+        h,
         fps: client.fps,
     };
     if state.device_geoms.get(pubkey) != Some(&geom) {
@@ -1030,7 +1117,19 @@ fn columns_for_width(ui: &egui::Ui, width: f32) -> usize {
     cols
 }
 
-fn peer_grid(ui: &mut egui::Ui, peers: &[&PeerInfo]) {
+fn peer_grid(ui: &mut egui::Ui, peers: &[&PeerInfo], can_act: bool) -> Option<PeerAction> {
+    // Alias collisions (issue #19): the same physical device re-paired under a
+    // fresh identity shows twice under one alias — only the fingerprint tells
+    // the entries apart, so it is surfaced prominently on BOTH cards (not
+    // hidden behind hover). Case-insensitive so "Phone"/"phone" still collide.
+    let mut name_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for p in peers {
+        *name_counts
+            .entry(p.display_name().to_lowercase())
+            .or_default() += 1;
+    }
+
     let available = ui.available_width();
     let cols = columns_for_width(ui, available);
     // Tight gutter so the fleet reads as a dense board, not scattered tiles.
@@ -1053,25 +1152,43 @@ fn peer_grid(ui: &mut egui::Ui, peers: &[&PeerInfo]) {
     // paints into an explicit top-down child, so a plain horizontal row no
     // longer flips the card's own contents sideways.
     let mut idx = 0usize;
+    let mut action = None;
     for row in peers.chunks(cols) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = spacing;
             for peer in row {
-                peer_card(ui, peer, idx, card_w, card_h);
+                let dup_alias = name_counts
+                    .get(&peer.display_name().to_lowercase())
+                    .copied()
+                    .unwrap_or(0)
+                    > 1;
+                if let Some(a) = peer_card(ui, peer, idx, card_w, card_h, dup_alias, can_act) {
+                    action = Some(a);
+                }
                 idx += 1;
             }
         });
         ui.add_space(spacing);
     }
+    action
 }
 
-fn peer_card(ui: &mut egui::Ui, peer: &PeerInfo, idx: usize, w: f32, h: f32) {
+fn peer_card(
+    ui: &mut egui::Ui,
+    peer: &PeerInfo,
+    idx: usize,
+    w: f32,
+    h: f32,
+    dup_alias: bool,
+    can_act: bool,
+) -> Option<PeerAction> {
     // Reserve an EXACT w×h cell, then paint into it with an explicit top-down
     // layout. The shared `widgets::card` both inherits the parent's layout
     // (inside a horizontal grid that flipped the card's contents sideways) and
     // lets the frame size to content (so the wrap layout's row tracking drifted
     // into the staggered/overflowing look). This mirrors the Trireme client
     // menu's proven tile layout.
+    let mut action = None;
     let frame = egui::Frame::group(ui.style())
         .rounding(egui::Rounding::same(10.0))
         .inner_margin(egui::Margin::same(12.0))
@@ -1088,11 +1205,77 @@ fn peer_card(ui: &mut egui::Ui, peer: &PeerInfo, idx: usize, w: f32, h: f32) {
             // Tighter inter-row rhythm so the card reads as a compact tile.
             ui.spacing_mut().item_spacing.y = 3.0;
 
-            // Title row: display name + liveness badge on the right.
+            // Title row: display name; on the right (outermost first): the ⋮
+            // overflow menu, the primary star, then the liveness badge.
             ui.horizontal(|ui| {
                 ui.label(RichText::new(peer.display_name()).strong().size(15.0))
                     .describe(tr("overview.peer.name_desc"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // ⋮ overflow menu (forget lives here, behind a confirm).
+                    let menu_resp = ui.menu_button(RichText::new(ph::DOTS_THREE_VERTICAL), |ui| {
+                        if can_act {
+                            if ui
+                                .button(format!(
+                                    "{}  {}",
+                                    ph::TRASH,
+                                    tr("overview.peer.menu.forget")
+                                ))
+                                .describe(tr("overview.peer.menu.forget_desc"))
+                                .clicked()
+                            {
+                                ui.data_mut(|d| {
+                                    d.insert_temp(confirm_forget_id(), peer.pubkey.clone())
+                                });
+                                ui.close_menu();
+                            }
+                        } else {
+                            // Honest gating: no live controllable host → the
+                            // action would just bounce, so say why instead.
+                            ui.add_enabled(
+                                false,
+                                egui::Button::new(format!(
+                                    "{}  {}",
+                                    ph::TRASH,
+                                    tr("overview.peer.menu.forget")
+                                )),
+                            );
+                            ui.label(
+                                RichText::new(tr("overview.peer.menu.disabled_hint"))
+                                    .small()
+                                    .weak(),
+                            );
+                        }
+                    });
+                    menu_resp.response.describe_named(
+                        tr("overview.peer.menu_name"),
+                        tr("overview.peer.menu_desc"),
+                    );
+
+                    // Primary star (issue #19): amber when this peer IS the
+                    // primary; click toggles (set / clear via the host).
+                    let star = if peer.is_primary {
+                        RichText::new(ph::STAR).color(crate::theme::warn())
+                    } else {
+                        RichText::new(ph::STAR).weak()
+                    };
+                    let star_tip = if !can_act {
+                        tr("overview.peer.star_desc_disabled")
+                    } else if peer.is_primary {
+                        tr("overview.peer.star_desc_primary")
+                    } else {
+                        tr("overview.peer.star_desc_make")
+                    };
+                    if ui
+                        .add_enabled(can_act, egui::Button::new(star).frame(false))
+                        .describe_named(tr("overview.peer.star_primary"), star_tip)
+                        .clicked()
+                    {
+                        action = Some(PeerAction::SetPrimary {
+                            pubkey: peer.pubkey.clone(),
+                            make: !peer.is_primary,
+                        });
+                    }
+
                     let badge_resp = ui.scope(|ui| {
                         crate::widgets::status_badge(ui, peer.liveness);
                     });
@@ -1103,20 +1286,77 @@ fn peer_card(ui: &mut egui::Ui, peer: &PeerInfo, idx: usize, w: f32, h: f32) {
             });
 
             // Full pubkey fingerprint (monospace) with the full key on hover.
-            ui.label(
-                RichText::new(crate::model::fingerprint(&peer.pubkey))
-                    .monospace()
-                    .small()
-                    .weak(),
-            )
-            .describe(format!(
+            // On an alias collision it turns prominent (strong + amber): the
+            // fingerprint is then the ONLY thing telling two cards apart.
+            let fp = RichText::new(crate::model::fingerprint(&peer.pubkey))
+                .monospace()
+                .small();
+            let fp = if dup_alias {
+                fp.strong().color(crate::theme::warn())
+            } else {
+                fp.weak()
+            };
+            let mut fp_desc = format!(
                 "{}\n{}\n{}",
                 tr("overview.peer.fingerprint_desc"),
                 tr("overview.peer.fingerprint_full_label"),
                 peer.pubkey
-            ));
+            );
+            if dup_alias {
+                fp_desc = format!("{}\n{fp_desc}", tr("overview.peer.dup_alias_desc"));
+            }
+            ui.label(fp).describe(fp_desc);
 
             ui.add_space(5.0);
+
+            // Armed forget-confirm replaces the data rows: the card is a fixed
+            // tile, and a decision this destructive deserves the full body
+            // (warning + explicit Forget/Cancel) rather than a cramped popup.
+            let armed: Option<String> = ui.data(|d| d.get_temp(confirm_forget_id()));
+            if armed.as_deref() == Some(peer.pubkey.as_str()) {
+                ui.label(
+                    RichText::new(format!(
+                        "{}  {}",
+                        ph::WARNING,
+                        tr("overview.peer.confirm.title")
+                    ))
+                    .small()
+                    .color(crate::theme::warn()),
+                );
+                ui.label(
+                    RichText::new(tr("overview.peer.confirm.body"))
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(
+                            RichText::new(format!(
+                                "{}  {}",
+                                ph::TRASH,
+                                tr("overview.peer.confirm.forget")
+                            ))
+                            .color(crate::theme::error()),
+                        )
+                        .describe(tr("overview.peer.menu.forget_desc"))
+                        .clicked()
+                    {
+                        ui.data_mut(|d| d.remove::<String>(confirm_forget_id()));
+                        action = Some(PeerAction::Forget {
+                            pubkey: peer.pubkey.clone(),
+                        });
+                    }
+                    if ui
+                        .button(tr("overview.peer.confirm.cancel"))
+                        .describe(tr("overview.peer.confirm.cancel_desc"))
+                        .clicked()
+                    {
+                        ui.data_mut(|d| d.remove::<String>(confirm_forget_id()));
+                    }
+                });
+                return;
+            }
 
             // The data that actually matters at a glance — what the client
             // decodes, at what resolution and frame rate, and where it connects
@@ -1151,6 +1391,7 @@ fn peer_card(ui: &mut egui::Ui, peer: &PeerInfo, idx: usize, w: f32, h: f32) {
             );
         });
     });
+    action
 }
 
 /// A "label: value" row. When `value` is `None`, render a subtle "—" with the

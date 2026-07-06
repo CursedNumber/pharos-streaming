@@ -1381,6 +1381,11 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
     );
     info!("Pharos identity {}", identity.public_hex());
 
+    // Seed the live pre-emption policy from the persisted primary_pubkey
+    // (issue #19) before any streamer accepts a client; SetPrimaryPeer /
+    // ForgetPeer keep it in sync from here on.
+    crate::pair::sync_primary_to_transport();
+
     // Apply each output's configured input gate up front, reviving the previously
     // dead `[[output]] input_enabled`. This makes the CONFIG authoritative at
     // startup (a controller that should work isn't silently gated off waiting for
@@ -4100,6 +4105,11 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                 st.outputs = outputs;
                 st.clients = clients;
                 st.video_codec = Some(cfg.video_codec.label().into());
+                // The live primary-client policy (issue #19), so the panel's
+                // star reflects what the host is actually enforcing. Read from
+                // the transport global (set at startup + on SetPrimaryPeer) —
+                // no file I/O on the status path.
+                st.primary_pubkey = transport::primary_peer_hex();
                 // HDR label when the session is emitting a 10-bit Main10 stream.
                 // The panel/tray surface this; None on an SDR session.
                 st.hdr_active = if hdr { Some("HDR10".into()) } else { None };

@@ -388,6 +388,10 @@ fn build_status(
         // Some("HEVC Main10 BT.2020/PQ") when the wgc-zc pipeline runs its
         // HDR10 session (issue #4); the ffmpeg paths stream SDR and pass None.
         hdr_active,
+        // The live primary-client policy (issue #19): read from the transport
+        // global (seeded at startup, updated by SetPrimaryPeer/ForgetPeer) so
+        // the panel's star reflects what this host is actually enforcing.
+        primary_pubkey: transport::primary_peer_hex(),
     }
 }
 
@@ -442,6 +446,11 @@ fn run_stream(
         identity.public_hex(),
         id_path.display()
     );
+
+    // Seed the live pre-emption policy from the persisted primary_pubkey
+    // (issue #19) before the streamer accepts a client; the serve_control
+    // handlers (SetPrimaryPeer / ForgetPeer) keep it in sync from here on.
+    host_core::pair::sync_primary_to_transport();
 
     // Enforce pairing by default, exactly like the Linux compositor: only
     // clients whose verified Ed25519 pubkey is in `peers.toml` may stream
@@ -667,6 +676,57 @@ fn run_stream(
                         control_ipc::Event::Ack {
                             ok: true,
                             msg: None,
+                        }
+                    }
+                    // Issue #19 peer-fleet controls — the same shared host-core
+                    // helpers the Linux compositor dispatches to (the issue's
+                    // parity note: every new Request handled on BOTH hosts).
+                    // File + transport globals only, so they run fine on this
+                    // serve thread with no render loop.
+                    control_ipc::Request::ForgetPeer { pubkey } => {
+                        match host_core::pair::forget_peer(&pubkey) {
+                            Ok(out) if out.removed => {
+                                info!(
+                                    "panel: forgot peer {}… (primary={}, live sessions closed={})",
+                                    &pubkey[..pubkey.len().min(8)],
+                                    out.was_primary,
+                                    out.sessions_closed
+                                );
+                                control_ipc::Event::Ack {
+                                    ok: true,
+                                    msg: Some(if out.sessions_closed > 0 {
+                                        "peer forgotten; its live session was closed".into()
+                                    } else {
+                                        "peer forgotten".into()
+                                    }),
+                                }
+                            }
+                            Ok(_) => control_ipc::Event::Ack {
+                                ok: false,
+                                msg: Some("no such paired peer".into()),
+                            },
+                            Err(e) => control_ipc::Event::Ack {
+                                ok: false,
+                                msg: Some(format!("forget peer: {e}")),
+                            },
+                        }
+                    }
+                    control_ipc::Request::SetPrimaryPeer { pubkey } => {
+                        match host_core::pair::set_primary_peer(pubkey.as_deref()) {
+                            Ok(()) => control_ipc::Event::Ack {
+                                ok: true,
+                                msg: Some(match pubkey.as_deref() {
+                                    Some(pk) => format!(
+                                        "primary client → {}… (others no longer preempt it)",
+                                        &pk[..pk.len().min(8)]
+                                    ),
+                                    None => "primary client cleared (newest-wins preempt)".into(),
+                                }),
+                            },
+                            Err(e) => control_ipc::Event::Ack {
+                                ok: false,
+                                msg: Some(format!("set primary: {e}")),
+                            },
                         }
                     }
                     other => control_ipc::Event::Error {

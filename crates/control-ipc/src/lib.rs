@@ -43,6 +43,11 @@ pub mod client;
 /// reader, and [`Event::FrameTimings`] is a new event variant a panel only
 /// receives when it asked. No existing wire shape changed, so the same
 /// "additive-only" rule the controller liveness vector follows applies.
+///
+/// The issue #19 peer-fleet surface ([`Request::ForgetPeer`],
+/// [`Request::SetPrimaryPeer`], [`HostStatus::primary_pubkey`]) is additive the
+/// same way: old hosts answer the new requests with [`Event::Error`] via the
+/// lenient reader, and the new status field is `#[serde(default)]`.
 pub const PROTOCOL_VERSION: u32 = 4;
 
 // ---------------------------------------------------------------------------
@@ -198,6 +203,24 @@ pub enum Request {
     /// app-declared HDR surface; this is the panel/operator override. Additive (no
     /// `PROTOCOL_VERSION` bump) — old hosts answer [`Event::Error`].
     SetHdrMode { enabled: bool },
+    /// Forget (unpair) a peer by its hex pubkey (issue #19): the host removes it
+    /// from `peers.toml` (atomic rewrite via the shared host-core helper), clears
+    /// it as primary if it was, and closes any live QUIC session it holds — the
+    /// pairing authorizer re-reads `peers.toml` per connection, so future
+    /// connects are denied with nothing else to invalidate. Replied to with an
+    /// [`Event::Ack`] (`ok=false` + reason for an unknown pubkey). Served by BOTH
+    /// hosts (compositor control server + pharos-win `serve_control`). Additive
+    /// (no `PROTOCOL_VERSION` bump) — old hosts answer [`Event::Error`] and the
+    /// link stays up.
+    ForgetPeer { pubkey: String },
+    /// Set (or, with `pubkey = None`, clear) the host's PRIMARY client (issue
+    /// #19). Persisted in `peers.toml` (`primary_pubkey`) and applied live:
+    /// while the primary is connected, a different client's connect is refused
+    /// with a distinct QUIC close code instead of pre-empting; non-primary vs
+    /// non-primary keeps newest-wins. The pubkey must be a paired peer. Replied
+    /// to with an [`Event::Ack`]. Served by BOTH hosts. Additive (no
+    /// `PROTOCOL_VERSION` bump) — old hosts answer [`Event::Error`].
+    SetPrimaryPeer { pubkey: Option<String> },
 }
 
 /// Compositor → panel. Tagged on `"kind"`; the data-bearing variants wrap a
@@ -364,6 +387,14 @@ pub struct HostStatus {
     /// keeps an older host's status decodable; additive, no `PROTOCOL_VERSION` bump.
     #[serde(default)]
     pub hdr_active: Option<String>,
+    /// The hex pubkey of the host's PRIMARY client (issue #19), or `None` when
+    /// no primary is set. What the host is *enforcing right now* (its transport
+    /// pre-emption policy), so the panel's star toggle reflects live truth
+    /// rather than a possibly-stale `peers.toml` read. `#[serde(default)]`
+    /// keeps an older host's status decodable; additive, no `PROTOCOL_VERSION`
+    /// bump.
+    #[serde(default)]
+    pub primary_pubkey: Option<String>,
 }
 
 /// How the host fans the encoded stream out to connected clients.
@@ -1116,6 +1147,7 @@ mod tests {
             gpu_health: GpuHealth::default(),
             stream_mode: StreamMode::default(),
             hdr_active: None,
+            primary_pubkey: None,
         }
     }
 
@@ -1341,6 +1373,7 @@ mod tests {
                 }),
             },
             hdr_active: Some("HEVC Main10 BT.2020/PQ".into()),
+            primary_pubkey: Some("abcd".into()),
         });
         let json = serde_json::to_string(&ev).unwrap();
         let back: Event = serde_json::from_str(&json).unwrap();
@@ -1420,6 +1453,36 @@ mod tests {
         let json = serde_json::to_string(&ev).unwrap();
         let back: Event = serde_json::from_str(&json).unwrap();
         assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    /// The issue #19 peer-fleet requests round-trip through JSON, including the
+    /// `SetPrimaryPeer { pubkey: None }` clear form. Guards the additive-only
+    /// promise for the new variants.
+    #[test]
+    fn peer_fleet_requests_roundtrip() {
+        for req in [
+            Request::ForgetPeer {
+                pubkey: "ab".repeat(32),
+            },
+            Request::SetPrimaryPeer {
+                pubkey: Some("cd".repeat(32)),
+            },
+            Request::SetPrimaryPeer { pubkey: None },
+        ] {
+            let json = serde_json::to_string(&req).unwrap();
+            let back: Request = serde_json::from_str(&json).unwrap();
+            assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        }
+    }
+
+    /// A status without `primary_pubkey` (an older host) must still decode —
+    /// `#[serde(default)]` fills `None`. Guards the no-version-bump claim.
+    #[test]
+    fn status_without_primary_pubkey_still_decodes() {
+        let old =
+            r#"{"hostname":"pharos","streaming":false,"clients":[],"outputs":[],"media":null}"#;
+        let s: HostStatus = serde_json::from_str(old).unwrap();
+        assert!(s.primary_pubkey.is_none());
     }
 
     /// A v4 `SetControllerAlias` request round-trips through JSON (and the
