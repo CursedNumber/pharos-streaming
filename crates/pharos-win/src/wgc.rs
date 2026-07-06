@@ -196,6 +196,18 @@ fn capture_loop(
                 tracing::info!("WGC: first frame retrieved");
                 got_first = true;
             }
+            // WGC does NOT fault on a display-mode change: it keeps delivering
+            // frames at the stale pool size, silently cropping the new desktop
+            // to the top-left corner. Make it a fault (thread exit → channel
+            // Dead → pacer stops → supervisor respawns at the new size).
+            let cs = frame.ContentSize()?;
+            let (cw, ch) = (cs.Width.max(0) as u32, cs.Height.max(0) as u32);
+            if (cw, ch) != (w, h) {
+                let _ = frame.Close();
+                return Err(anyhow!(
+                    "capture size changed {w}x{h} → {cw}x{ch} (display mode change)"
+                ));
+            }
             let surface = frame.Surface()?;
             let access: IDirect3DDxgiInterfaceAccess = surface.cast()?;
             let texture: ID3D11Texture2D = unsafe { access.GetInterface()? };

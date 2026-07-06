@@ -552,6 +552,20 @@ fn zc_loop(
                 Err(e) if e.code().is_ok() => break, // empty — change-driven idle
                 Err(e) => return Err(anyhow!("TryGetNextFrame: {e:?} (capture session dead)")),
             };
+            // WGC does NOT fault on a display-mode change (unlike DDA): it
+            // keeps delivering frames at the stale pool size, silently
+            // cropping the new desktop to the top-left corner (found live: a
+            // 1080p session kept streaming the top-left quarter of the
+            // rewoken 4K desktop). Detect the change and make it a typed
+            // fault; the P6 respawn rebuilds everything at the new size.
+            let cs = frame.ContentSize()?;
+            let (cw, ch) = (cs.Width.max(0) as u32, cs.Height.max(0) as u32);
+            if (cw, ch) != (w, h) {
+                let _ = frame.Close();
+                return Err(anyhow!(
+                    "capture size changed {w}x{h} → {cw}x{ch} (display mode change); respawning"
+                ));
+            }
             let surface = frame.Surface()?;
             let access: IDirect3DDxgiInterfaceAccess = surface.cast()?;
             let texture: ID3D11Texture2D = unsafe { access.GetInterface()? };
