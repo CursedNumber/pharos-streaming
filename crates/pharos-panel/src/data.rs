@@ -90,6 +90,10 @@ pub fn host_info() -> HostInfo {
 
 #[derive(Debug, Default, Deserialize)]
 struct PeerRegistryToml {
+    /// Hex pubkey of the host's PRIMARY client (issue #19), if one is set.
+    /// Written by the host (`SetPrimaryPeer`); the panel only reads it.
+    #[serde(default)]
+    primary_pubkey: Option<String>,
     #[serde(default, rename = "peer")]
     peers: Vec<PeerToml>,
 }
@@ -104,7 +108,10 @@ struct PeerToml {
 }
 
 /// Read `peers.toml`. Missing/garbled file → empty list (never panics). Live
-/// telemetry fields default to `None`/`Unknown` (no probe wired yet).
+/// telemetry fields default to `None`/`Unknown`; the per-frame live join
+/// (`tabs::overview::apply_live_liveness`) fills them from `HostStatus` while
+/// a host is up. `is_primary` reflects the persisted `primary_pubkey`; the
+/// live join overrides it with the host's enforced value when connected.
 pub fn load_peers() -> Vec<PeerInfo> {
     let p = path("peers.toml");
     let text = match std::fs::read_to_string(&p) {
@@ -118,9 +125,13 @@ pub fn load_peers() -> Vec<PeerInfo> {
             return Vec::new();
         }
     };
+    let primary = reg.primary_pubkey;
     reg.peers
         .into_iter()
         .map(|p| PeerInfo {
+            is_primary: primary
+                .as_deref()
+                .is_some_and(|pk| pk.eq_ignore_ascii_case(&p.pubkey)),
             alias: p.alias,
             pubkey: p.pubkey,
             paired_at: p.paired_at,

@@ -285,6 +285,79 @@ nb = "Sist sett"
 en = "Last successful connection (telemetry — not yet reported to the panel)."
 nb = "Siste vellykkede tilkobling (telemetri — ikke rapportert til panelet ennå)."
 
+# --- Peer card actions: primary star + forget (issue #19) ------------------
+["overview.peer.star_primary"]
+en = "Primary client"
+nb = "Primærklient"
+
+["overview.peer.star_desc_primary"]
+en = "This is the primary client: while it is connected, other devices are refused instead of taking over the stream. Click to clear."
+nb = "Dette er primærklienten: mens den er tilkoblet, avvises andre enheter i stedet for å overta strømmen. Klikk for å fjerne."
+
+["overview.peer.star_desc_make"]
+en = "Make this device the primary client: while it is connected, other devices can no longer take over the stream."
+nb = "Gjør denne enheten til primærklient: mens den er tilkoblet, kan andre enheter ikke lenger overta strømmen."
+
+["overview.peer.star_desc_disabled"]
+en = "Choosing a primary client needs a running, controllable host."
+nb = "Å velge primærklient krever en kjørende, styrbar vert."
+
+["overview.peer.menu_name"]
+en = "Device actions"
+nb = "Enhetshandlinger"
+
+["overview.peer.menu_desc"]
+en = "More actions for this paired device."
+nb = "Flere handlinger for denne parede enheten."
+
+["overview.peer.menu.forget"]
+en = "Forget this device…"
+nb = "Glem denne enheten…"
+
+["overview.peer.menu.forget_desc"]
+en = "Remove this device's pairing. Its live session is closed and it cannot reconnect until you pair it again."
+nb = "Fjern paringen for denne enheten. Den aktive økten lukkes, og enheten kan ikke koble til igjen før du parer den på nytt."
+
+["overview.peer.menu.disabled_hint"]
+en = "Needs a running, controllable host."
+nb = "Krever en kjørende, styrbar vert."
+
+["overview.peer.confirm.title"]
+en = "Forget this device?"
+nb = "Glemme denne enheten?"
+
+["overview.peer.confirm.body"]
+en = "It will be disconnected and cannot reconnect until paired again. Check the fingerprint above if two entries share a name."
+nb = "Den kobles fra og kan ikke koble til igjen før den pares på nytt. Sjekk fingeravtrykket over hvis to oppføringer deler navn."
+
+["overview.peer.confirm.forget"]
+en = "Forget"
+nb = "Glem"
+
+["overview.peer.confirm.cancel"]
+en = "Cancel"
+nb = "Avbryt"
+
+["overview.peer.confirm.cancel_desc"]
+en = "Keep this device paired."
+nb = "Behold paringen for denne enheten."
+
+["overview.peer.dup_alias_desc"]
+en = "Another entry shares this name — only the fingerprint tells them apart (e.g. the same device paired again under a fresh identity)."
+nb = "En annen oppføring deler dette navnet — bare fingeravtrykket skiller dem (f.eks. samme enhet paret på nytt med ny identitet)."
+
+["overview.peer.status.forgotten"]
+en = "Device forgotten; the host closed its session."
+nb = "Enheten er glemt; verten lukket økten dens."
+
+["overview.peer.status.primary_set"]
+en = "Primary client set — other devices no longer preempt it."
+nb = "Primærklient valgt — andre enheter overtar den ikke lenger."
+
+["overview.peer.status.primary_cleared"]
+en = "Primary client cleared — newest device wins again."
+nb = "Primærklient fjernet — nyeste enhet vinner igjen."
+
 # --- Liveness badge tooltips ----------------------------------------------
 ["overview.liveness.online"]
 en = "Reachable / connected but idle."

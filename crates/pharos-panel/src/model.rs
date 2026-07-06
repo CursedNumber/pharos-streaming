@@ -218,6 +218,12 @@ pub struct PeerInfo {
     pub fps: Option<u32>,
     /// ISO-8601 hint of the last successful connection (telemetry).
     pub last_connected: Option<String>,
+    /// True when this peer is the host's PRIMARY client (issue #19): while it
+    /// is connected, other clients are refused instead of pre-empting it.
+    /// Seeded from `peers.toml` (`primary_pubkey`); overridden by the live
+    /// `HostStatus.primary_pubkey` while a host is connected.
+    #[serde(default)]
+    pub is_primary: bool,
 }
 
 impl PeerInfo {
