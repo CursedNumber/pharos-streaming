@@ -1020,11 +1020,33 @@ impl Source {
 /// to hammer a host that's mid-reboot / NIC-flap, short enough to feel transient.
 const RECONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// Backoff for a host that REFUSED us because its primary client holds the
+/// slot (issue #19). Much longer than [`RECONNECT_BACKOFF`]: every retry will
+/// keep being refused until the primary leaves, so redialing at blip speed is
+/// just noise — but do keep retrying, so this client picks the slot back up
+/// within ~15s of the primary disconnecting.
+const RESERVED_BACKOFF: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Why a host deliberately refused this client (issue #19) — mapped from the
+/// stable transport error messages, with distinct retry policies.
+#[derive(Debug, Clone, Copy)]
+enum StreamRefusal {
+    /// The host's primary client holds the slot; retry on [`RESERVED_BACKOFF`].
+    ReservedByPrimary,
+    /// The host unpaired (forgot) this device; retrying is pointless until the
+    /// user pairs it again, so reconnection stops.
+    Unpaired,
+}
+
 #[derive(Debug)]
 #[allow(dead_code)] // index isn't read today; kept for per-source trace logs.
 enum UserEvent {
     FrameReady(usize),
     StreamEnded(usize),
+    /// The host deliberately refused this source (issue #19) — unlike
+    /// [`UserEvent::StreamEnded`] this must NOT take the ordinary fast
+    /// reconnect: reserved-by-primary retries slowly, unpaired stops.
+    StreamRefused(usize, StreamRefusal),
     /// Time to (re)connect source `usize` — fired after a backoff once a stream
     /// drops, so the player rotates to the next address and comes back.
     Reconnect(usize),
@@ -1304,6 +1326,41 @@ impl ApplicationHandler<UserEvent> for App {
                     std::thread::sleep(RECONNECT_BACKOFF);
                     let _ = proxy.send_event(UserEvent::Reconnect(i));
                 });
+            }
+            UserEvent::StreamRefused(i, refusal) => {
+                // The host said no ON PURPOSE (issue #19) — honest copy + the
+                // right retry policy instead of the ordinary blip reconnect.
+                if let Some(s) = self.sources.get_mut(i) {
+                    s.input_tx = None; // back-channel is dead either way
+                }
+                let name = self
+                    .sources
+                    .get(i)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default();
+                match refusal {
+                    StreamRefusal::ReservedByPrimary => {
+                        // Same address on purpose: the host is healthy, just
+                        // reserved — rotating NICs wouldn't change the answer.
+                        tracing::warn!(
+                            "source[{i}] ({name}) refused: host reserved by its primary \
+                             client; retrying in {RESERVED_BACKOFF:?}"
+                        );
+                        let proxy = self.proxy.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(RESERVED_BACKOFF);
+                            let _ = proxy.send_event(UserEvent::Reconnect(i));
+                        });
+                    }
+                    StreamRefusal::Unpaired => {
+                        // Every future connect fails authorization too — stop
+                        // redialing instead of hammering a host that forgot us.
+                        tracing::error!(
+                            "source[{i}] ({name}) unpaired by the host — pair this device \
+                             again to reconnect (auto-retry stopped)"
+                        );
+                    }
+                }
             }
             UserEvent::Reconnect(i) => {
                 // Re-spawn the source pipeline on its current address. Snapshot the
@@ -2213,6 +2270,22 @@ fn spawn_decode(
             drop(stdin);
             if let Err(e) = res {
                 tracing::error!("source[{idx}] video client: {e:?}");
+                // Deliberate host refusals (issue #19) carry stable messages —
+                // route them to their own retry policy instead of the ordinary
+                // fast reconnect (which would hammer a host that meant "no").
+                let msg = format!("{e:#}");
+                if msg.contains(transport::UNPAIRED_MSG) {
+                    let _ =
+                        proxy_n.send_event(UserEvent::StreamRefused(idx, StreamRefusal::Unpaired));
+                    return;
+                }
+                if msg.contains(transport::RESERVED_BY_PRIMARY_MSG) {
+                    let _ = proxy_n.send_event(UserEvent::StreamRefused(
+                        idx,
+                        StreamRefusal::ReservedByPrimary,
+                    ));
+                    return;
+                }
             }
             let _ = proxy_n.send_event(UserEvent::StreamEnded(idx));
         })?;
