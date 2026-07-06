@@ -183,6 +183,7 @@ fn parse_bind(s: &str) -> anyhow::Result<std::net::SocketAddr> {
 /// black-screened NVIDIA-only rigs — no MFX means the encoder faults five
 /// times and parks, while audio/input keep working — and the panel launches
 /// `pharos-host stream` bare, so it hit exactly that. Explicit args still win.
+#[cfg(windows)]
 fn detect_default_encoder() -> encode::Encoder {
     let (enc, why) = match display::preferred_encoder_vendor() {
         Some(display::VENDOR_NVIDIA) => (encode::Encoder::Nvenc, "NVIDIA adapter"),
@@ -371,9 +372,13 @@ fn build_status(
         pairing: None,
         controllers: Vec::new(),
         video_codec: Some(codec_label.to_string()),
-        // serve_status answers only Hello/GetStatus; every mutating control
-        // request gets Event::Error. Tell the panel so it disables them.
-        read_only: true,
+        // The Windows host now serves pairing (StartPairing/CancelPairing) via
+        // control_ipc::serve_control, so it is no longer strictly read-only — the
+        // panel's Pair button gates on this flag (panel control.rs start_pairing).
+        // Render-loop mutations (app launch, resolution ladder) remain unsupported
+        // and still reply Event::Error; a per-capability flag so those specific
+        // buttons stay disabled is the follow-up (issue #17 P2).
+        read_only: false,
         // P6: the run_stream supervisor loop drives this (Healthy while streaming,
         // Degraded during a respawn/backoff, Faulted when the breaker trips).
         // throttle + last_xid are always None on Windows (no NVML/Xid plane).
@@ -444,7 +449,8 @@ fn run_stream(
     // authorizer — the one place the M2 auth work wasn't yet applied on Windows.
     let streamer = Arc::new(transport::QuicStreamer::start_with_authorizer(
         bind,
-        identity,
+        // Clone the Arc: `identity` is reused below for the mDNS advertise.
+        identity.clone(),
         host_core::pair::client_authorizer(),
         // The Windows host is single-client only — a never-set mirror flag.
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -608,7 +614,7 @@ fn run_stream(
         std::thread::Builder::new()
             .name("control-status".into())
             .spawn(move || loop {
-                let s = build_status(
+                let mut s = build_status(
                     &hostname_r,
                     encoder_label,
                     codec_label,
@@ -622,19 +628,74 @@ fn run_stream(
                     health_r.lock().map(|g| g.clone()).unwrap_or_default(),
                 );
                 if let Ok(mut g) = status_r.lock() {
+                    // Preserve the pairing field: the PairingManager is its sole
+                    // writer, and this ~4 Hz rebuild (build_status sets it None)
+                    // would otherwise clobber the live PIN every 250ms.
+                    s.pairing = g.pairing.take();
                     *g = s;
                 }
                 std::thread::sleep(Duration::from_millis(250));
             })?;
     }
+    // Pairing driven from the panel (issue #17): the same shared PairingManager
+    // the Linux compositor uses, mirroring the live PIN/outcome into `status`
+    // (the ~4 Hz refresh above preserves that field). This is what makes the
+    // panel's Pair button work on Windows instead of the raw `pharos-host pair`
+    // CLI. Its listener is opened on demand by StartPairing, off any render loop.
+    let pairing = host_core::pairing::PairingManager::new(status.clone());
     let ctrl_addr = std::net::SocketAddr::from(([0, 0, 0, 0], core_proto::ports::CONTROL));
     match control_ipc::tcp_bind(ctrl_addr) {
         Ok(listener) => {
-            info!("control plane on tcp {ctrl_addr} — panel can poll status");
-            control_ipc::serve_status(listener, hostname.clone(), status.clone());
+            info!("control plane on tcp {ctrl_addr} — panel can poll status + pair");
+            let status_ctrl = status.clone();
+            control_ipc::serve_control(listener, hostname.clone(), status.clone(), move |req| {
+                match req {
+                    control_ipc::Request::StartPairing { addr } => match pairing.start(addr) {
+                        // Reply with a fresh snapshot so the panel's pairing card
+                        // shows the PIN at once (mirrors the Linux host's reply).
+                        Ok(()) => {
+                            let snap = status_ctrl
+                                .lock()
+                                .map(|s| s.clone())
+                                .unwrap_or_else(|e| e.into_inner().clone());
+                            control_ipc::Event::Status(snap)
+                        }
+                        Err(e) => control_ipc::Event::Error { msg: e },
+                    },
+                    control_ipc::Request::CancelPairing => {
+                        pairing.cancel();
+                        control_ipc::Event::Ack {
+                            ok: true,
+                            msg: None,
+                        }
+                    }
+                    other => control_ipc::Event::Error {
+                        msg: format!("Windows host does not support {other:?}"),
+                    },
+                }
+            });
         }
         Err(e) => warn!("control plane bind {ctrl_addr} failed: {e} (status unavailable to panel)"),
     }
+
+    // Advertise over mDNS so a fresh Trireme lists this host with no typed IP
+    // (issue #17). The service is the pairing port; the `stream` TXT carries this
+    // host's *actual* stream port (`bind`, i.e. WIN_STREAM by default) so the
+    // client self-configures rather than assuming the Linux 15777. Held for the
+    // process lifetime — dropping `_mdns` withdraws the broadcast.
+    let _mdns = {
+        let pair_addr = std::net::SocketAddr::from(([0, 0, 0, 0], core_proto::ports::PAIR));
+        match host_core::pair::advertise(pair_addr, &identity, bind.port()) {
+            Ok(d) => {
+                info!("mDNS advertising this host (stream port {})", bind.port());
+                Some(d)
+            }
+            Err(e) => {
+                warn!("mDNS advertise failed: {e:#} (LAN discovery off; add host by IP)");
+                None
+            }
+        }
+    };
 
     // Gate the encoder on a connected client so the first access unit is the
     // session's opening IDR — a clean live start with no backlog (same rationale

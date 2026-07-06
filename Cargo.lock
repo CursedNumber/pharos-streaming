@@ -2906,6 +2906,7 @@ name = "host-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "control-ipc",
  "core-crypto",
  "core-proto",
  "dirs 5.0.1",

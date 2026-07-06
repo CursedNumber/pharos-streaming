@@ -286,7 +286,7 @@ async fn run_loop(
     // Announce ourselves over mDNS so Trireme's menu picks us up as a tile
     // without the user having to type host/port. _Held_ for the lifetime of
     // the listener; dropping it withdraws the broadcast.
-    let _mdns = match announce_mdns(addr, &identity) {
+    let _mdns = match announce_mdns(addr, &identity, core_proto::ports::STREAM) {
         Ok(d) => Some(d),
         Err(e) => {
             warn!("mDNS announce failed: {e:?} (LAN discovery off; pair manually)");
@@ -523,9 +523,25 @@ fn hostname_or_default() -> String {
     "pharos".into()
 }
 
+/// Register the host's mDNS advertisement (`_pharos._udp.local.`) for LAN
+/// auto-discovery. Advertises the pairing `addr` as the service, the host's
+/// pubkey, and the `stream_port` clients should connect to. Hold the returned
+/// [`ServiceDaemon`] for as long as the host should be discoverable; dropping it
+/// withdraws the broadcast.
+///
+/// Standalone so a *running* host (not only an open pairing window) stays
+/// discoverable: the Windows host and any always-on publisher call this at
+/// startup. The pairing listener also calls it for its own lifetime.
+pub fn advertise(addr: SocketAddr, identity: &Identity, stream_port: u16) -> Result<ServiceDaemon> {
+    announce_mdns(addr, identity, stream_port)
+}
+
 /// Build + register the mDNS announcement. Returns the `ServiceDaemon` so
-/// the caller can keep it alive (drop = withdraw).
-fn announce_mdns(addr: SocketAddr, identity: &Identity) -> Result<ServiceDaemon> {
+/// the caller can keep it alive (drop = withdraw). `stream_port` is published in
+/// the `stream` TXT so the client learns where to stream (it differs by host OS:
+/// the Linux host streams on [`core_proto::ports::STREAM`], the Windows host on
+/// its own bind).
+fn announce_mdns(addr: SocketAddr, identity: &Identity, stream_port: u16) -> Result<ServiceDaemon> {
     let daemon = ServiceDaemon::new().context("ServiceDaemon::new")?;
 
     // mDNS hostnames must end with `.local.`. Sanitize: replace dots in the
@@ -558,7 +574,7 @@ fn announce_mdns(addr: SocketAddr, identity: &Identity) -> Result<ServiceDaemon>
         // self-configuring — the client learns IP:stream-port + pubkey + name
         // and never has to be told the stream port. Clients fall back to the
         // well-known default if this record is absent (older hosts).
-        ("stream".into(), core_proto::ports::STREAM.to_string()),
+        ("stream".into(), stream_port.to_string()),
     ];
     if let Some(alias) = hostname_alias() {
         props.push(("alias".into(), alias));
