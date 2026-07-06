@@ -14,3 +14,4 @@
 pub mod config;
 pub mod controller_profiles;
 pub mod pair;
+pub mod pairing;

@@ -17,6 +17,10 @@ serde = { workspace = true }
 transport = { path = "../transport" }
 core-crypto = { path = "../core-crypto" }
 core-proto = { path = "../core-proto" }
+# HostStatus/PairingState/PairOutcome — the shared status the PairingManager
+# mirrors into for the panel. control-ipc does not depend on host-core, so this
+# stays acyclic.
+control-ipc = { path = "../control-ipc" }
 # Peer/identity persistence + config dir.
 toml = "0.8"
 dirs = "5"
