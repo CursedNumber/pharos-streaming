@@ -183,6 +183,7 @@ fn parse_bind(s: &str) -> anyhow::Result<std::net::SocketAddr> {
 /// black-screened NVIDIA-only rigs — no MFX means the encoder faults five
 /// times and parks, while audio/input keep working — and the panel launches
 /// `pharos-host stream` bare, so it hit exactly that. Explicit args still win.
+#[cfg(windows)]
 fn detect_default_encoder() -> encode::Encoder {
     let (enc, why) = match display::preferred_encoder_vendor() {
         Some(display::VENDOR_NVIDIA) => (encode::Encoder::Nvenc, "NVIDIA adapter"),
