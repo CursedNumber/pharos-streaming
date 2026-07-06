@@ -1,9 +1,15 @@
 # Vendored copy of nvidia-video-codec-sdk 0.4.0 (MIT, by Viliam Vadocz),
-# patched via [patch.crates-io] in the workspace root to add a single safe
-# `Session::reconfigure_bitrate` method (the published crate seals the encoder
-# handle and ships no reconfigure wrapper — see src/safe/session.rs). Manifest
-# trimmed to lib-only: dev-dependencies (vulkano/libc), examples and tests are
-# dropped since we only build the library. Original at Cargo.toml.orig.
+# patched via [patch.crates-io] in the workspace root:
+# - safe `Session::reconfigure_bitrate`/`reconfigure_resolution` (the published
+#   crate seals the encoder handle and ships no reconfigure wrapper — see
+#   src/safe/session.rs);
+# - Windows support without the SDK installed: build.rs skips import-library
+#   linking and safe/api.rs loads the two bootstrap symbols from the driver's
+#   nvEncodeAPI64.dll at runtime (the ffmpeg/nv-codec-headers approach), and
+#   `Encoder::initialize_with_directx` opens D3D11-device sessions for the
+#   Windows host's zero-copy WGC capture (issue #12).
+# Manifest trimmed to lib-only: dev-dependencies (vulkano/libc), examples and
+# tests are dropped since we only build the library. Original at Cargo.toml.orig.
 [package]
 edition = "2021"
 rust-version = "1.70"
@@ -38,9 +44,23 @@ path = "src/lib.rs"
 name = "drc_spike"
 path = "examples/drc_spike.rs"
 
-[dependencies.cudarc]
+# cudarc feature split: unix probes the build system's CUDA as before; Windows
+# has no CUDA toolkit requirement (default features include dynamic-loading,
+# whose build script picks a header version itself and defers nvcuda.dll to
+# first use, which the D3D11 session path never triggers). Do NOT add a
+# cuda-NNNNN version feature on Windows: the build script EMITS its own
+# version cfg under dynamic-loading, and a manifest-level version feature
+# alongside it double-defines every versioned item in cudarc's sys modules.
+[target.'cfg(not(windows))'.dependencies.cudarc]
 version = "0.16.4"
 features = ["cuda-version-from-build-system"]
+
+[target.'cfg(windows)'.dependencies.cudarc]
+version = "0.16.4"
+
+# Runtime loading of nvEncodeAPI64.dll's two bootstrap symbols (safe/api.rs).
+[target.'cfg(windows)'.dependencies.libloading]
+version = "0.8"
 
 [dependencies.lazy_static]
 version = "1.5.0"

@@ -61,6 +61,15 @@ fn main() {
     }
     rerun_if_changed();
 
+    // Windows needs no import libraries: safe/api.rs loads the two NvEncodeAPI
+    // bootstrap symbols from the driver's nvEncodeAPI64.dll at runtime, and
+    // nothing in this workspace uses NVDEC on Windows. This keeps the build
+    // free of the CUDA-toolkit/Video-Codec-SDK install the .lib files would
+    // otherwise require.
+    if cfg!(windows) {
+        return;
+    }
+
     // Link to libraries.
     println!("cargo:rustc-link-lib={}", NVENC_LIB.0);
     println!("cargo:rustc-link-lib={}", NVDEC_LIB.0);

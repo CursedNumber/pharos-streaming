@@ -198,7 +198,12 @@ impl Session {
         pitch: u32,
         mapped_buffer: MappedBuffer,
     ) -> Result<RegisteredResource<'_, MappedBuffer>, EncodeError> {
-        let stream = self.encoder.ctx.default_stream();
+        let stream = self
+            .encoder
+            .ctx
+            .as_ref()
+            .expect("register_cuda_resource requires a session opened with initialize_with_cuda")
+            .default_stream();
         let (device_ptr, _) = mapped_buffer.device_ptr(&stream);
         self.register_generic_resource(
             mapped_buffer,

@@ -48,8 +48,10 @@ use crate::sys::nvEncodeAPI::{
 #[derive(Debug)]
 pub struct Encoder {
     pub(crate) ptr: *mut c_void,
-    // Used to fetch the device pointer for an externally allocated buffer
-    pub(crate) ctx: Arc<CudaContext>,
+    // Used to fetch the device pointer for an externally allocated buffer.
+    // None for non-CUDA sessions (DirectX), where register_cuda_resource is
+    // unavailable and registration goes through register_generic_resource.
+    pub(crate) ctx: Option<Arc<CudaContext>>,
 }
 
 /// The client must flush the encoder before freeing any resources.
@@ -111,13 +113,55 @@ impl Encoder {
 
         Ok(Self {
             ptr: encoder,
-            ctx: cuda_ctx,
+            ctx: Some(cuda_ctx),
+        })
+    }
+
+    /// Create an [`Encoder`] with a Direct3D 11 device as the encode device
+    /// (Windows). Input frames are D3D11 textures registered through
+    /// [`Session::register_generic_resource`](crate::safe::session::Session)
+    /// with `NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX`;
+    /// `register_cuda_resource` is unavailable on such sessions.
+    ///
+    /// See [NVIDIA docs](https://docs.nvidia.com/video-technologies/video-codec-sdk/12.0/nvenc-video-encoder-api-prog-guide/index.html#directx).
+    ///
+    /// # Safety
+    ///
+    /// `d3d11_device` must be a valid `ID3D11Device*` and must outlive the
+    /// returned [`Encoder`] (and every [`Session`](crate::safe::session::Session)
+    /// created from it).
+    ///
+    /// # Errors
+    ///
+    /// Could error if there was no encode capable device detected
+    /// or if the encode device was invalid.
+    pub unsafe fn initialize_with_directx(d3d11_device: *mut c_void) -> Result<Self, EncodeError> {
+        let mut encoder = ptr::null_mut();
+        let mut session_params = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
+            version: NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
+            deviceType: NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_DIRECTX,
+            apiVersion: NVENCAPI_VERSION,
+            device: d3d11_device,
+            ..Default::default()
+        };
+
+        if let err @ Err(_) =
+            unsafe { (ENCODE_API.open_encode_session_ex)(&mut session_params, &mut encoder) }
+                .result_without_string()
+        {
+            // We are required to destroy the encoder if there was an error.
+            unsafe { (ENCODE_API.destroy_encoder)(encoder) }.result_without_string()?;
+            err?;
+        }
+
+        Ok(Self {
+            ptr: encoder,
+            ctx: None,
         })
     }
 
     // TODO:
     // - Make Encoder generic in Device.
-    // - Add functions to create Encoder from other encode devices.
 
     /// Get the encode GUIDs which the encoder supports.
     ///

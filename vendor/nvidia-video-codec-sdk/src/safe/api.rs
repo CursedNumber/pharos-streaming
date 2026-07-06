@@ -2,9 +2,9 @@
 
 use core::ffi::{c_int, c_void};
 
+#[cfg(not(windows))]
+use crate::sys::nvEncodeAPI::{NvEncodeAPICreateInstance, NvEncodeAPIGetMaxSupportedVersion};
 use crate::sys::nvEncodeAPI::{
-    NvEncodeAPICreateInstance,
-    NvEncodeAPIGetMaxSupportedVersion,
     GUID,
     NVENCAPI_MAJOR_VERSION,
     NVENCAPI_MINOR_VERSION,
@@ -228,14 +228,52 @@ fn assert_versions_match(max_supported_version: u32) {
     );
 }
 
+// The two bootstrap entry points everything else flows through (the whole
+// remaining API arrives via the NV_ENCODE_API_FUNCTION_LIST they populate).
+type GetMaxSupportedVersionFn = unsafe extern "C" fn(*mut u32) -> NVENCSTATUS;
+type CreateInstanceFn = unsafe extern "C" fn(*mut NV_ENCODE_API_FUNCTION_LIST) -> NVENCSTATUS;
+
+/// On unix the bootstrap symbols are linked against libnvidia-encode.so
+/// (build.rs emits the link directives).
+#[cfg(not(windows))]
+fn entry_points() -> (GetMaxSupportedVersionFn, CreateInstanceFn) {
+    (NvEncodeAPIGetMaxSupportedVersion, NvEncodeAPICreateInstance)
+}
+
+/// On Windows the bootstrap symbols are loaded at runtime from the driver's
+/// nvEncodeAPI64.dll (the ffmpeg/nv-codec-headers approach): no import
+/// library and no SDK install are needed to build, and the DLL ships with
+/// every NVIDIA driver. The library handle is leaked intentionally — the
+/// resulting `ENCODE_API` is a process-lifetime static, so the DLL must stay
+/// mapped for as long as the process lives anyway.
+#[cfg(windows)]
+fn entry_points() -> (GetMaxSupportedVersionFn, CreateInstanceFn) {
+    let lib = unsafe { libloading::Library::new("nvEncodeAPI64.dll") }.expect(
+        "nvEncodeAPI64.dll should load — it ships with the NVIDIA driver; is one installed?",
+    );
+    unsafe {
+        let get_version: libloading::Symbol<GetMaxSupportedVersionFn> = lib
+            .get(b"NvEncodeAPIGetMaxSupportedVersion\0")
+            .expect("NvEncodeAPIGetMaxSupportedVersion should exist in nvEncodeAPI64.dll");
+        let create_instance: libloading::Symbol<CreateInstanceFn> = lib
+            .get(b"NvEncodeAPICreateInstance\0")
+            .expect("NvEncodeAPICreateInstance should exist in nvEncodeAPI64.dll");
+        let entry = (*get_version, *create_instance);
+        std::mem::forget(lib);
+        entry
+    }
+}
+
 impl EncodeAPI {
     fn new() -> Self {
         const MSG: &str = "The API instance should populate the whole function list.";
 
+        let (get_max_supported_version, create_instance) = entry_points();
+
         // Check that the driver max supported version matches the version
         // from the header files. If they do not match, the bindings should be updated.
         let mut version = 0;
-        unsafe { NvEncodeAPIGetMaxSupportedVersion(&mut version) }
+        unsafe { get_max_supported_version(&mut version) }
             .result_without_string()
             .expect("The pointer to the version should be valid.");
         assert_versions_match(version);
@@ -246,7 +284,7 @@ impl EncodeAPI {
             ..Default::default()
         };
         // Create Encode API Instance (populate function buffer).
-        unsafe { NvEncodeAPICreateInstance(&mut function_list) }
+        unsafe { create_instance(&mut function_list) }
             .result_without_string()
             .expect("The pointer to the function list should be valid.");
 
