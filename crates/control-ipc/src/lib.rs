@@ -974,16 +974,44 @@ pub fn serve_status(
     host_name: String,
     status: std::sync::Arc<std::sync::Mutex<HostStatus>>,
 ) {
-    let _ = std::thread::Builder::new()
-        .name("pharos-control".into())
-        .spawn(move || status_accept_loop(listener, host_name, status));
+    // No actionable handler: every request past Hello/GetStatus is rejected,
+    // preserving the original status-only contract.
+    serve_control(listener, host_name, status, |_req| Event::Error {
+        msg: "this host's control plane only supports Hello/GetStatus".into(),
+    });
 }
 
-fn status_accept_loop(
+/// Like [`serve_status`], but requests other than `Hello`/`GetStatus` are
+/// dispatched to `handler` instead of rejected. `handler` runs on the
+/// per-connection serve thread and returns the [`Event`] to reply with.
+///
+/// This is how the render-loop-free host drives *actionable* control (pairing,
+/// etc.) without giving up the transport-generic accept loop. The handler is
+/// injected rather than referenced directly because the real dispatch target —
+/// `host_core::pairing::PairingManager` — lives in `host-core`, which depends on
+/// this crate; taking a closure keeps `control-ipc` free of that back-edge.
+pub fn serve_control<H>(
     listener: std::net::TcpListener,
     host_name: String,
     status: std::sync::Arc<std::sync::Mutex<HostStatus>>,
-) {
+    handler: H,
+) where
+    H: Fn(Request) -> Event + Send + Sync + 'static,
+{
+    let handler = std::sync::Arc::new(handler);
+    let _ = std::thread::Builder::new()
+        .name("pharos-control".into())
+        .spawn(move || status_accept_loop(listener, host_name, status, handler));
+}
+
+fn status_accept_loop<H>(
+    listener: std::net::TcpListener,
+    host_name: String,
+    status: std::sync::Arc<std::sync::Mutex<HostStatus>>,
+    handler: std::sync::Arc<H>,
+) where
+    H: Fn(Request) -> Event + Send + Sync + 'static,
+{
     use std::sync::atomic::{AtomicUsize, Ordering};
     let active = std::sync::Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
@@ -996,27 +1024,32 @@ fn status_accept_loop(
         let guard = ConnGuard(active.clone());
         let host_name = host_name.clone();
         let status = status.clone();
+        let handler = handler.clone();
         let _ = std::thread::Builder::new()
             .name("pharos-control-conn".into())
             .spawn(move || {
                 let _guard = guard;
-                let _ = serve_status_conn(stream, &host_name, &status);
+                let _ = serve_status_conn(stream, &host_name, &status, &*handler);
             });
     }
 }
 
-fn serve_status_conn(
+fn serve_status_conn<H>(
     stream: std::net::TcpStream,
     host_name: &str,
     status: &std::sync::Mutex<HostStatus>,
-) -> std::io::Result<()> {
+    handler: &H,
+) -> std::io::Result<()>
+where
+    H: Fn(Request) -> Event,
+{
     stream.set_write_timeout(Some(STATUS_WRITE_TIMEOUT)).ok();
     let mut reader = std::io::BufReader::new(stream.try_clone()?);
     let mut writer = stream;
     loop {
         let ev = match read_request_lenient(&mut reader)? {
             None => return Ok(()), // EOF — peer closed cleanly
-            Some(Ok(req)) => handle_status_request(req, host_name, status),
+            Some(Ok(req)) => handle_status_request(req, host_name, status, handler),
             Some(Err(msg)) => Event::Error {
                 msg: format!("malformed request: {msg}"),
             },
@@ -1025,11 +1058,15 @@ fn serve_status_conn(
     }
 }
 
-fn handle_status_request(
+fn handle_status_request<H>(
     req: Request,
     host_name: &str,
     status: &std::sync::Mutex<HostStatus>,
-) -> Event {
+    handler: &H,
+) -> Event
+where
+    H: Fn(Request) -> Event,
+{
     match req {
         Request::Hello { .. } => Event::Hello {
             version: PROTOCOL_VERSION,
@@ -1040,9 +1077,9 @@ fn handle_status_request(
         Request::GetStatus => {
             Event::Status(status.lock().unwrap_or_else(|e| e.into_inner()).clone())
         }
-        _ => Event::Error {
-            msg: "this host's control plane only supports Hello/GetStatus".into(),
-        },
+        // Actionable requests go to the injected handler (a no-op rejecter for
+        // plain serve_status; the real pairing dispatch on the Windows host).
+        other => handler(other),
     }
 }
 
@@ -1178,6 +1215,64 @@ mod tests {
             read_event(&mut reader).unwrap(),
             Some(Event::Error { .. })
         ));
+    }
+
+    #[test]
+    fn serve_control_dispatches_actionable_to_handler() {
+        use std::io::BufReader;
+        use std::sync::{Arc, Mutex};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Handler that only the Windows host would install: it fields the
+        // actionable request (here StartPairing) and never sees Hello/GetStatus,
+        // which serve_control answers centrally.
+        serve_control(
+            listener,
+            "winrig".into(),
+            Arc::new(Mutex::new(sample_status("winrig"))),
+            |req| match req {
+                Request::StartPairing { addr } => Event::Ack {
+                    ok: true,
+                    msg: Some(format!("pairing:{}", addr.unwrap_or_default())),
+                },
+                other => Event::Error {
+                    msg: format!("unhandled {other:?}"),
+                },
+            },
+        );
+
+        let stream = tcp_connect(addr).unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+
+        // Hello/GetStatus are still answered centrally, not by the handler.
+        write_request(
+            &mut writer,
+            &Request::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            read_event(&mut reader).unwrap(),
+            Some(Event::Hello { .. })
+        ));
+
+        // The actionable request reaches the handler and its Event is returned.
+        write_request(
+            &mut writer,
+            &Request::StartPairing {
+                addr: Some("0.0.0.0:4432".into()),
+            },
+        )
+        .unwrap();
+        match read_event(&mut reader).unwrap() {
+            Some(Event::Ack { ok, msg }) => {
+                assert!(ok);
+                assert_eq!(msg.as_deref(), Some("pairing:0.0.0.0:4432"));
+            }
+            other => panic!("expected handler Ack, got {other:?}"),
+        }
     }
 
     #[test]
