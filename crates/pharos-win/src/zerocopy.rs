@@ -190,14 +190,22 @@ fn is_transient(msg: &str) -> bool {
     msg.contains("NeedMoreInput") || msg.contains("EncoderBusy") || msg.contains("LockBusy")
 }
 
-/// CBR bitrate for the session, kbps. Matches the ffmpeg path's `-rc cbr`
-/// spirit with an explicit budget: 20 Mbps default (comfortable 4K60 on a
-/// LAN), `PHAROS_BITRATE_KBPS` to tune without a rebuild.
-fn bitrate_kbps() -> u32 {
-    std::env::var("PHAROS_BITRATE_KBPS")
+/// CBR bitrate for the session, kbps: `PHAROS_BITRATE_KBPS` if set, else a
+/// pixel-rate + depth aware default (LAN-tuned), clamped to 15..60 Mbps.
+/// A flat 20 Mbps starves 4K60 Main10 badly enough that the 1s IDR refresh
+/// pulses visibly (the quality snap between the keyframe and the starved
+/// P-frames); 45 Mbps eliminated it in live verification on the Bravia, and
+/// the 0.13/0.09 bits-per-pixel targets bracket that data point.
+fn bitrate_kbps(w: u32, h: u32, fps: u32, hdr: bool) -> u32 {
+    if let Some(v) = std::env::var("PHAROS_BITRATE_KBPS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(20_000)
+    {
+        return v;
+    }
+    let pixel_rate = u64::from(w) * u64::from(h) * u64::from(fps.max(1));
+    let bpp_x100: u64 = if hdr { 13 } else { 9 };
+    (pixel_rate * bpp_x100 / 100_000).clamp(15_000, 60_000) as u32
 }
 
 /// Static HDR10 metadata SEI payloads, byte-for-byte the Linux host's
@@ -458,7 +466,7 @@ fn zc_loop(
     unsafe {
         cfg.encodeCodecConfig.hevcConfig.set_repeatSPSPPS(1);
     }
-    let kbps = bitrate_kbps();
+    let kbps = bitrate_kbps(w, h, fps, hdr);
     cfg.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
     cfg.rcParams.averageBitRate = kbps.saturating_mul(1000);
     cfg.rcParams.maxBitRate = kbps.saturating_mul(1000);
