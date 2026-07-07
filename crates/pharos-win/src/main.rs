@@ -372,13 +372,21 @@ fn build_status(
         pairing: None,
         controllers: Vec::new(),
         video_codec: Some(codec_label.to_string()),
-        // The Windows host now serves pairing (StartPairing/CancelPairing) via
-        // control_ipc::serve_control, so it is no longer strictly read-only — the
-        // panel's Pair button gates on this flag (panel control.rs start_pairing).
-        // Render-loop mutations (app launch, resolution ladder) remain unsupported
-        // and still reply Event::Error; a per-capability flag so those specific
-        // buttons stay disabled is the follow-up (issue #17 P2).
+        // The Windows host serves pairing via control_ipc::serve_control, so it
+        // is not read-only; kept false for panels that predate the caps set.
         read_only: false,
+        // The per-verb capability set (issue #22): exactly what this host's
+        // serve_control closure handles — pairing (#17), the peer-fleet verbs
+        // (#19), and app launch (#22). Everything else (preview, relaunch,
+        // stream-mode, input gating, controller/frame-timings planes) still
+        // replies Event::Error, and the panel now disables those controls with
+        // an honest reason instead of offering a click that bounces.
+        caps: control_ipc::HostCaps {
+            pairing: true,
+            peers: true,
+            launch_app: true,
+            ..control_ipc::HostCaps::none()
+        },
         // P6: the run_stream supervisor loop drives this (Healthy while streaming,
         // Degraded during a respawn/backoff, Faulted when the breaker trips).
         // throttle + last_xid are always None on Windows (no NVML/Xid plane).
@@ -728,6 +736,39 @@ fn run_stream(
                             Err(e) => control_ipc::Event::Ack {
                                 ok: false,
                                 msg: Some(format!("set primary: {e}")),
+                            },
+                        }
+                    }
+                    // Panel/client app launch (issue #22): the same catalog +
+                    // launcher path the Linux compositor dispatches to. The
+                    // Windows context has no compositor socket — the captured
+                    // desktop IS the streamed output, so a plain spawn lands on
+                    // it — and carries the stream fps so an entry's
+                    // FpsCap::Auto resolves to the stream rate. Runs on the
+                    // serve thread: the Steam path detaches to its own worker
+                    // inside launch(), and a direct spawn is quick, so the
+                    // capture/encode loop is never blocked. The Child handle is
+                    // dropped (no zombie semantics on Windows); Steam handoffs
+                    // return no child anyway.
+                    control_ipc::Request::LaunchApp { slug } => {
+                        let ctx = app_launcher::LaunchContext::default().with_output_fps(fps);
+                        match app_launcher::launch_slug(&slug, &ctx) {
+                            Ok(child) => {
+                                info!(
+                                    "panel: launched app `{slug}`{}",
+                                    match &child {
+                                        Some(c) => format!(" (pid {})", c.id()),
+                                        None => " (handed off / already running)".into(),
+                                    }
+                                );
+                                control_ipc::Event::Ack {
+                                    ok: true,
+                                    msg: None,
+                                }
+                            }
+                            Err(e) => control_ipc::Event::Ack {
+                                ok: false,
+                                msg: Some(format!("{e:#}")),
                             },
                         }
                     }
@@ -1646,6 +1687,39 @@ mod tests {
         assert_eq!((c.coded_w, c.coded_h), (3840, 2160));
         // Issue #4: the HDR badge follows the live session label.
         assert_eq!(s.hdr_active.as_deref(), Some("HEVC Main10 BT.2020/PQ"));
+    }
+
+    /// Issue #22: the published status advertises exactly the verbs this host's
+    /// serve_control closure handles — pairing, peers, launch_app — and nothing
+    /// it would bounce with Event::Error. The panel's per-control gating rides
+    /// on this being truthful.
+    #[test]
+    fn status_advertises_exactly_the_served_caps() {
+        let s = build_status(
+            "winrig",
+            "NVENC HEVC",
+            "HEVC",
+            60,
+            false,
+            None,
+            None,
+            0,
+            (0, 0),
+            None,
+            control_ipc::GpuHealth::Healthy,
+        );
+        assert!(!s.read_only, "pairing works, so not status-only");
+        assert!(s.caps.pairing && s.caps.peers && s.caps.launch_app);
+        assert!(
+            !s.caps.relaunch
+                && !s.caps.preview
+                && !s.caps.stream_mode
+                && !s.caps.input_toggle
+                && !s.caps.controllers
+                && !s.caps.frame_timings,
+            "unserved verbs must not be advertised: {:?}",
+            s.caps
+        );
     }
 
     #[test]

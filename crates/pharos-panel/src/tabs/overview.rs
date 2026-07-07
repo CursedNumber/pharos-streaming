@@ -182,10 +182,10 @@ fn paired_clients(ui: &mut egui::Ui, state: &mut PanelState) {
     }
 
     // The fleet actions (star / forget) go through the host's control plane,
-    // so they need a live, controllable host — gated on capability, not
-    // platform (the Windows host serves them too since issue #19).
+    // so they need a live host advertising the peers capability — gated on
+    // capability, not platform (the Windows host serves them too since #19).
     let can_act = crate::control::handle().connected()
-        && !crate::control::host_is_read_only()
+        && crate::control::host_caps().peers
         && crate::control::host_supports_v2();
     if !can_act {
         // A confirm armed against a host that just went away must not linger —
@@ -495,8 +495,11 @@ fn host_control_button(ui: &mut egui::Ui) -> Option<HostAction> {
         ui.data_mut(|d| d.insert_temp(confirm_id, false));
     }
     let confirming = ui.data(|d| d.get_temp::<bool>(confirm_id)).unwrap_or(false);
-    // A status-only host (the Windows host) can't be relaunched/controlled.
-    let read_only = crate::control::host_is_read_only();
+    // Whether the host serves Request::Relaunch (issue #22): the Windows host
+    // doesn't (its supervisor loop has no re-exec), so its Relaunch button is
+    // disabled with the reason — Stop stays available (it's a local process
+    // kill, not a control-plane verb).
+    let can_relaunch = crate::control::host_caps().relaunch;
 
     // Launch debounce: remember when Launch was clicked; while the spawned host
     // is still binding (connected == false) and within the window, disable the
@@ -561,16 +564,6 @@ fn host_control_button(ui: &mut egui::Ui) -> Option<HostAction> {
                 .color(crate::theme::warn()),
         )
         .describe(tr("overview.host.too_old_hint"));
-    } else if read_only {
-        // Status-only host (the Windows host's serve_status): it answers status
-        // but no control requests, so be honest rather than show a button that
-        // would no-op. (Pairing below is gated the same way.)
-        ui.label(
-            RichText::new(format!("{}  {}", ph::INFO, tr("control.read_only")))
-                .small()
-                .color(crate::theme::warn()),
-        )
-        .describe(tr("control.read_only"));
     } else if confirming {
         // Confirm prompt. We're in a right_to_left layout, so add Cancel, then
         // Relaunch, then the warning — they then *read* "⚠ … [Relaunch] [Cancel]".
@@ -596,14 +589,19 @@ fn host_control_button(ui: &mut egui::Ui) -> Option<HostAction> {
             .color(crate::theme::warn()),
         );
     } else {
-        // Host up: relaunch (arms a confirm if a stream is live), with a Stop
-        // button beside it.
+        // Host up: relaunch (arms a confirm if a stream is live) — disabled
+        // with an honest reason when the host doesn't serve the verb (issue
+        // #22) — with a Stop button beside it.
         if ui
-            .button(format!(
-                "{}  {}",
-                ph::ARROWS_CLOCKWISE,
-                tr("overview.host.relaunch")
-            ))
+            .add_enabled(
+                can_relaunch,
+                egui::Button::new(format!(
+                    "{}  {}",
+                    ph::ARROWS_CLOCKWISE,
+                    tr("overview.host.relaunch")
+                )),
+            )
+            .on_disabled_hover_text(tr("control.no_cap.relaunch"))
             .describe(tr("overview.host.relaunch_desc"))
             .clicked()
         {
@@ -685,15 +683,16 @@ fn pairing_card(ui: &mut egui::Ui, state: &mut PanelState) {
             return;
         }
 
-        if crate::control::host_is_read_only() {
-            // Status-only host (the Windows host): pairing is done via the host's
-            // own CLI, not the panel, so don't offer a button that would no-op.
+        if !crate::control::host_caps().pairing {
+            // This host doesn't serve panel-driven pairing (issue #22): both
+            // real hosts do today, so this is an older/status-only host — say
+            // so honestly rather than offer a button that would no-op.
             ui.horizontal_wrapped(|ui| {
                 crate::widgets::status_badge(
                     ui,
-                    (tr("control.read_only_short").as_str(), crate::theme::warn()),
+                    (tr("control.no_cap_short").as_str(), crate::theme::warn()),
                 );
-                ui.label(RichText::new(tr("control.read_only")).small().weak());
+                ui.label(RichText::new(tr("control.no_cap.pairing")).small().weak());
             });
             return;
         }

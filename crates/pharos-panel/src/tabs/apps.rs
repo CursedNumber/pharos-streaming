@@ -172,15 +172,16 @@ fn card(
                 ui.label(egui::RichText::new(kind_label(app.kind)).small().weak());
 
                 ui.add_space(4.0);
-                // A status-only host (Windows) can't launch apps — disable.
-                let read_only = crate::control::host_is_read_only();
+                // Gate on the host's advertised launch capability (issue #22),
+                // not the platform — the Windows host serves LaunchApp too now.
+                let can_launch = crate::control::host_caps().launch_app;
                 let launch = ui
                     .add_enabled(
-                        connected && !read_only,
+                        connected && can_launch,
                         egui::Button::new(format!("{}  {}", ph::PLAY, tr("apps.card.launch"))),
                     )
-                    .on_disabled_hover_text(if read_only {
-                        tr("control.read_only")
+                    .on_disabled_hover_text(if connected && !can_launch {
+                        tr("control.no_cap.launch_app")
                     } else {
                         crate::control::unavailable_reason()
                     })

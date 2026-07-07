@@ -18,21 +18,28 @@
 //! exotic targets fall back to the no-op handle.
 
 pub use control_ipc::client::{handle, host_supports_v2};
-use control_ipc::Request;
+use control_ipc::{HostCaps, Request};
 
-/// True when the connected host's control plane is **status-only** — the Windows
-/// host's `serve_status`, which answers Hello/GetStatus but `Event::Error`s every
-/// mutating request. Tabs gray out their action controls when this is true (so a
-/// click can't just bounce); the verb wrappers below also no-op as a backstop.
-/// False when no host is connected or the host is fully controllable (the Linux
-/// compositor).
-pub fn host_is_read_only() -> bool {
-    handle().status().map(|s| s.read_only).unwrap_or(false)
+/// The connected host's advertised per-verb capability set (issue #22) — what
+/// its control plane actually serves, so each control gates on the specific
+/// capability it drives instead of the old all-or-nothing `read_only` flag.
+///
+/// With no live status (nothing connected yet), this returns [`HostCaps::all`]:
+/// the UI's `connected` gates already disable everything then, and the verb
+/// wrappers below should keep their old "send and let the transport drop it"
+/// behaviour rather than inventing a second reason. A pre-caps host's status
+/// decodes as [`HostCaps::legacy`] (pairing + peers only) via the serde default.
+pub fn host_caps() -> HostCaps {
+    handle()
+        .status()
+        .map(|s| s.caps)
+        .unwrap_or_else(HostCaps::all)
 }
 
 // ---------------------------------------------------------------------------
 // Host control verbs — thin wrappers: UI -> shared client -> host. Each no-ops
-// against a read-only host so a stray call can't draw an Error reply.
+// when the host doesn't advertise the matching capability, as a backstop for
+// the per-control UI gating, so a stray call can't draw an Error reply.
 // ---------------------------------------------------------------------------
 
 /// Open the host's pairing window (mint a PIN, start the SPAKE2 listener).
@@ -40,7 +47,7 @@ pub fn host_is_read_only() -> bool {
 /// no host is connected (the request is dropped) — the UI reflects that via
 /// [`Handle::connected`].
 pub fn start_pairing(addr: Option<String>) {
-    if host_is_read_only() {
+    if !host_caps().pairing {
         return;
     }
     handle().send_request(Request::StartPairing { addr });
@@ -48,7 +55,7 @@ pub fn start_pairing(addr: Option<String>) {
 
 /// Close the host's pairing window.
 pub fn cancel_pairing() {
-    if host_is_read_only() {
+    if !host_caps().pairing {
         return;
     }
     handle().send_request(Request::CancelPairing);
@@ -57,7 +64,7 @@ pub fn cancel_pairing() {
 /// Ask the running host to restart itself in place (re-exec). The socket drops
 /// and the worker reconnects on its own once the host is back.
 pub fn relaunch_host() {
-    if host_is_read_only() {
+    if !host_caps().relaunch {
         return;
     }
     handle().send_request(Request::Relaunch);
@@ -66,7 +73,7 @@ pub fn relaunch_host() {
 /// Enable/disable the host's live preview (it writes a JPEG ~2fps, auto-stopping
 /// after 20s, so the panel re-sends `true` to keep it going).
 pub fn set_preview(enabled: bool) {
-    if host_is_read_only() {
+    if !host_caps().preview {
         return;
     }
     handle().send_request(Request::SetPreview { enabled });
@@ -74,9 +81,10 @@ pub fn set_preview(enabled: bool) {
 
 /// Enable/disable INPUT forwarding for one device (by hex pubkey), live on the
 /// running host (the compositor canvas's green per-device toggle). No-op on a
-/// read-only host or for a device with no pinned pubkey (nothing to address).
+/// host without the capability or for a device with no pinned pubkey (nothing
+/// to address).
 pub fn set_input_enabled(pubkey: &str, enabled: bool) {
-    if host_is_read_only() || pubkey.is_empty() {
+    if !host_caps().input_toggle || pubkey.is_empty() {
         return;
     }
     handle().send_request(Request::SetInputEnabled {
@@ -88,9 +96,9 @@ pub fn set_input_enabled(pubkey: &str, enabled: bool) {
 /// Switch the host's stream fan-out mode. `mirror = true` shares one encode
 /// across all clients (clamped to the weakest); `false` is single-client. The
 /// host echoes the resulting mode via `HostStatus.stream_mode` on its next poll.
-/// No-op on a read-only (status-only) host.
+/// No-op on a host that doesn't advertise the capability.
 pub fn set_stream_mode(mirror: bool) {
-    if host_is_read_only() {
+    if !host_caps().stream_mode {
         return;
     }
     handle().send_request(Request::SetStreamMode { mirror });
@@ -100,9 +108,10 @@ pub fn set_stream_mode(mirror: bool) {
 /// rewrites `peers.toml`, closes the peer's live session, and denies future
 /// connects (the authorizer re-reads the registry per connection). The
 /// Overview's per-card overflow menu drives this after a confirm step. No-op
-/// on a read-only host or with no live link (the card's menu is gated on both).
+/// on a host without the peers capability or with no live link (the card's
+/// menu is gated on both).
 pub fn forget_peer(pubkey: &str) {
-    if host_is_read_only() || pubkey.is_empty() {
+    if !host_caps().peers || pubkey.is_empty() {
         return;
     }
     handle().send_request(Request::ForgetPeer {
@@ -113,19 +122,20 @@ pub fn forget_peer(pubkey: &str) {
 /// Ask the host to set (or, with `None`, clear) its PRIMARY client (issue
 /// #19). Persisted host-side in `peers.toml` and applied live to the
 /// pre-emption policy; the panel sees the result on its next status poll via
-/// `HostStatus.primary_pubkey`. No-op on a read-only host.
+/// `HostStatus.primary_pubkey`. No-op on a host without the peers capability.
 pub fn set_primary_peer(pubkey: Option<String>) {
-    if host_is_read_only() {
+    if !host_caps().peers {
         return;
     }
     handle().send_request(Request::SetPrimaryPeer { pubkey });
 }
 
 /// Ask the running host to launch a saved app (by `apps.toml` slug) into the
-/// virtual display. No-op if no host is connected (the request is dropped); the
-/// Apps tab disables the Launch buttons in that case.
+/// streamed output. No-op if no host is connected (the request is dropped); the
+/// Apps tab disables the Launch buttons in that case, and gates on the host's
+/// launch_app capability (issue #22).
 pub fn launch_app(slug: impl Into<String>) {
-    if host_is_read_only() {
+    if !host_caps().launch_app {
         return;
     }
     handle().send_request(Request::LaunchApp { slug: slug.into() });
@@ -136,7 +146,7 @@ pub fn launch_app(slug: impl Into<String>) {
 /// every panel sees the update on its next `GetStatus` poll (~1 Hz). No-op if no
 /// host is connected (the request is dropped).
 pub fn set_controller_alias(vendor: u16, product: u16, alias: Option<String>) {
-    if host_is_read_only() {
+    if !host_caps().controllers {
         return;
     }
     handle().send_request(Request::SetControllerAlias {
@@ -153,7 +163,7 @@ pub fn set_controller_alias(vendor: u16, product: u16, alias: Option<String>) {
 /// mirrored into [`Handle::frame_timings`] / [`Handle::frame_history`]. No-op if
 /// no host is connected.
 pub fn request_frame_timings() {
-    if host_is_read_only() {
+    if !host_caps().frame_timings {
         return;
     }
     handle().send_request(Request::GetFrameTimings);
@@ -165,7 +175,7 @@ pub fn request_frame_timings() {
 /// vector ~1 Hz; once the gate goes stale the host skips the (expensive) rebuild
 /// entirely. No-op if no host is connected.
 pub fn subscribe_controllers(ttl_ms: u32) {
-    if host_is_read_only() {
+    if !host_caps().controllers {
         return;
     }
     handle().send_request(Request::SubscribeControllers { ttl_ms });

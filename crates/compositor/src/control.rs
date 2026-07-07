@@ -1351,6 +1351,9 @@ pub fn default_status() -> HostStatus {
         // The full compositor is controllable; only the Windows status-only host
         // sets this true.
         read_only: false,
+        // The full compositor serves every control verb (issue #22): the panel
+        // gates each button on the specific capability, so advertise them all.
+        caps: control_ipc::HostCaps::all(),
         // Healthy until the encode classifier / watchdog says otherwise (P3+).
         gpu_health: control_ipc::GpuHealth::Healthy,
         stream_mode: control_ipc::StreamMode::Single,

@@ -130,14 +130,25 @@ pub fn launch(entry: &AppEntry, ctx: &LaunchContext) -> anyhow::Result<Option<Ch
         return Ok(None);
     }
 
-    // Physical-desktop footgun guard. Extend/duplicate the host's *real* session
-    // is the dangerous target: a cold-started GPU app lands on the live desktop
-    // AND can SIGSEGV NVENC. Refuse explicitly — never silently spawn onto the
-    // physical session. This is the spawn-side half of `is_supported()` gating,
-    // with the *reason* spelled out. (When the physical seam is finally wired,
-    // this stays the cold-start refusal; a future warm/attach path would carve
-    // out its own branch rather than dropping the guard.)
-    if classify_target(&entry.target).is_physical() {
+    // Physical-desktop footgun guard — LINUX ONLY. On the Linux compositor,
+    // extend/duplicate of the host's *real* session is the dangerous target: a
+    // cold-started GPU app lands on the live desktop AND can SIGSEGV NVENC (the
+    // documented libnvcuvid crash in the ffmpeg encode path). Refuse explicitly —
+    // never silently spawn onto the physical session. (When the physical seam is
+    // finally wired, this stays the cold-start refusal; a future warm/attach
+    // path would carve out its own branch rather than dropping the guard.)
+    //
+    // On WINDOWS (issue #22) the virtual/physical split this guard encodes does
+    // not exist: the streamed surface IS a real desktop output (DDA/WGC capture
+    // of `output_idx`), so every target — VirtualDisplay and the physical family
+    // alike — means "spawn normally onto the captured desktop". The guard's
+    // NVENC caveat doesn't carry over either: the libnvcuvid SIGSEGV lives in
+    // ffmpeg's CUVID loader on the Linux path, and the Windows wgc-zc pipeline
+    // drives the NVENC SDK in-process without ever loading it — verified live on
+    // the rig (2026-07-07): a cold Steam start + GPU game launch during a
+    // running in-process NVENC session encodes on undisturbed. So Windows skips
+    // both this guard and the not-yet-wired gate below.
+    if cfg!(not(windows)) && classify_target(&entry.target).is_physical() {
         anyhow::bail!(
             "app `{}` targets {:?} (the host's PHYSICAL desktop), which the \
              launcher refuses to cold-start into: a fresh GPU app would appear on \
@@ -151,10 +162,10 @@ pub fn launch(entry: &AppEntry, ctx: &LaunchContext) -> anyhow::Result<Option<Ch
         );
     }
 
-    // Defense in depth: any other not-yet-supported target (should be subsumed by
-    // the physical guard above, but keep the explicit gate so a new LaunchTarget
-    // variant can't silently slip through to a spawn).
-    if !entry.target.is_supported() {
+    // Defense in depth (Linux only, see above): any other not-yet-supported
+    // target (should be subsumed by the physical guard, but keep the explicit
+    // gate so a new LaunchTarget variant can't silently slip through to a spawn).
+    if cfg!(not(windows)) && !entry.target.is_supported() {
         anyhow::bail!(
             "app `{}` targets {:?}, which isn't wired into the compositor yet",
             entry.slug,
@@ -608,8 +619,19 @@ fn build_command_from_parts(
     if shell || kind_shell {
         #[cfg(windows)]
         {
+            use std::os::windows::process::CommandExt;
+            // `cmd.exe /C <line>` must be built with raw_arg, NOT arg(). cmd does
+            // not parse its tail with CommandLineToArgvW rules, so std's default
+            // arg-escaping — which backslash-escapes embedded quotes — corrupts a
+            // line like `start "" steam://rungameid/<id>`: cmd/`start` see `\"\"`
+            // and try to launch `\\`, which pops a "Windows cannot find '\\'"
+            // dialog and drops the URI on the floor (the Steam handoff never
+            // reaches Steam — observed live on the rig, issue #22). raw_arg passes
+            // the `/C <line>` verbatim so the quotes we wrote survive to cmd. The
+            // first token after `/C` is a bareword (`start`/an exe), never a
+            // quote, so cmd's outer-quote-stripping rule doesn't fire.
             let mut c = Command::new("cmd");
-            c.arg("/C").arg(line);
+            c.raw_arg(format!("/C {line}"));
             return Ok(c);
         }
         #[cfg(not(windows))]
@@ -1118,6 +1140,29 @@ mod tests {
         );
     }
 
+    /// Regression for the issue #22 live bug: the Steam handoff line
+    /// `start "" <uri>` was corrupted to `\"\"` by std's arg-escaping when handed
+    /// to `cmd /C` via `arg()`, so `start` tried to launch `\\` (a "Windows
+    /// cannot find '\\'" dialog) and the URI never reached Steam. The `raw_arg`
+    /// fix passes `/C <line>` verbatim. We can't read a `Command`'s line back, so
+    /// prove it through cmd itself: echo an empty-quote pair and confirm cmd saw
+    /// `""`, not the backslash-escaped `\"\"`.
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_line_quotes_survive_to_cmd() {
+        let mut cmd = build_command_from_parts("t", "echo \"\"", false, true).unwrap();
+        let out = cmd.output().expect("run cmd echo");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains('\\'),
+            "cmd must not receive backslash-escaped quotes: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("\"\""),
+            "the empty-quote pair must survive verbatim to cmd: {stdout:?}"
+        );
+    }
+
     #[test]
     fn empty_command_is_noop() {
         let e = AppEntry {
@@ -1130,6 +1175,7 @@ mod tests {
         assert!(child.is_none());
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn physical_target_is_refused_with_clear_reason() {
         for target in [
@@ -1148,6 +1194,36 @@ mod tests {
                 .to_string();
             assert!(err.contains("PHYSICAL"), "reason must be explicit: {err}");
             assert!(err.contains("NVENC"), "reason must name the footgun: {err}");
+        }
+    }
+
+    /// On Windows the guard is carved out (issue #22): the captured desktop IS a
+    /// physical output, so a physical-family target spawns normally instead of
+    /// being refused. Uses `ping -n` as the spawnable stand-in (ships in
+    /// System32; there is no `true.exe`).
+    #[cfg(windows)]
+    #[test]
+    fn physical_target_launches_on_windows() {
+        for (i, target) in [
+            LaunchTarget::ExtendPhysical,
+            LaunchTarget::DuplicatePhysical,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let e = AppEntry {
+                slug: format!("phys-win-{i}-{}", std::process::id()),
+                name: "X".into(),
+                command: "ping -n 1 127.0.0.1".into(),
+                target,
+                ..AppEntry::new()
+            };
+            let child = launch(&e, &LaunchContext::default())
+                .expect("physical targets must not be refused on Windows");
+            if let Some(mut c) = child {
+                c.kill().ok();
+                c.wait().ok();
+            }
         }
     }
 

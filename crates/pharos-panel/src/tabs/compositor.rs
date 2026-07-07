@@ -418,19 +418,21 @@ fn apply_preset(ui: &egui::Ui, state: &mut PanelState, preset: crate::model::Com
 /// behaviour. See `MIRROR_EXTEND_PLAN.md`.
 fn mirror_section(ui: &mut egui::Ui) {
     let connected = crate::control::handle().connected();
-    let read_only = crate::control::host_is_read_only();
+    // Gated on the host's advertised stream-mode capability (issue #22) — the
+    // Windows host is single-client only and doesn't serve SetStreamMode.
+    let can_mode = crate::control::host_caps().stream_mode;
     let mode = crate::control::handle().status().map(|s| s.stream_mode);
     let mut mirror_on = matches!(mode, Some(control_ipc::StreamMode::Mirror { .. }));
 
     ui.horizontal(|ui| {
         let resp = ui
             .add_enabled(
-                connected && !read_only,
+                connected && can_mode,
                 egui::Checkbox::new(&mut mirror_on, tr("compositor.mirror.label")),
             )
             .describe(tr("compositor.mirror.desc"))
-            .on_disabled_hover_text(if read_only {
-                tr("control.read_only")
+            .on_disabled_hover_text(if connected && !can_mode {
+                tr("control.no_cap.stream_mode")
             } else {
                 crate::control::unavailable_reason()
             });
@@ -2320,15 +2322,17 @@ fn preview_controls(ui: &mut egui::Ui) {
         } else {
             tr("compositor.preview.start")
         };
-        let read_only = crate::control::host_is_read_only();
+        // Gated on the host's advertised preview capability (issue #22) — the
+        // Windows host has no GPU-readback preview writer.
+        let can_preview = crate::control::host_caps().preview;
         if ui
             .add_enabled(
-                connected && !read_only,
+                connected && can_preview,
                 egui::Button::new(format!("{}  {}", ph::MONITOR, label)),
             )
             .describe(tr("compositor.preview.start_desc"))
-            .on_disabled_hover_text(if read_only {
-                tr("control.read_only")
+            .on_disabled_hover_text(if connected && !can_preview {
+                tr("control.no_cap.preview")
             } else {
                 crate::control::unavailable_reason()
             })

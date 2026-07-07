@@ -4530,6 +4530,7 @@ name = "pharos-win"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "app-launcher",
  "control-ipc",
  "core-crypto",
  "core-proto",

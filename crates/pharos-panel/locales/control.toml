@@ -24,14 +24,37 @@ nb = "Tilkoblet verten"
 en = "Not connected to a host"
 nb = "Ikke tilkoblet en vert"
 
-# Shown when the connected host is status-only (the Windows host): it reports
-# live status but doesn't accept control actions (pairing, relaunch, launch,
-# preview). The action controls are disabled with this as the reason.
-["control.read_only"]
-en = "This host reports status only — control actions (pairing, launch, preview, relaunch) aren't available from the panel here."
-nb = "Denne verten rapporterer kun status — kontrollhandlinger (paring, start, forhåndsvisning, omstart) er ikke tilgjengelige fra panelet her."
+# --- Per-capability disabled reasons (issue #22) ------------------------------
+# Each control gates on the specific capability the host advertises in
+# HostStatus.caps; when a live host lacks one, the control is disabled with the
+# matching honest reason below (instead of the old all-or-nothing "status-only
+# host" text). Hosts that predate the caps field read as pairing + peers only.
 
-# Short badge form of the above (for status_badge labels).
-["control.read_only_short"]
-en = "Status-only host"
-nb = "Kun-status-vert"
+# Short badge form shared by the capability reasons (for status_badge labels).
+["control.no_cap_short"]
+en = "Not supported by this host"
+nb = "Støttes ikke av denne verten"
+
+["control.no_cap.pairing"]
+en = "This host doesn't support panel-driven pairing — it doesn't advertise the pairing capability (an older or status-only host build). Pair from the host itself instead."
+nb = "Denne verten støtter ikke paring fra panelet — den annonserer ikke parings-egenskapen (en eldre eller kun-status-vert). Par fra selve verten i stedet."
+
+["control.no_cap.peers"]
+en = "This host doesn't support managing paired devices from the panel — it doesn't advertise the peer-fleet capability (an older host build)."
+nb = "Denne verten støtter ikke administrasjon av parede enheter fra panelet — den annonserer ikke enhetsflåte-egenskapen (en eldre vertversjon)."
+
+["control.no_cap.launch_app"]
+en = "This host doesn't support launching apps from the panel — it doesn't advertise the app-launch capability (an older host build)."
+nb = "Denne verten støtter ikke start av apper fra panelet — den annonserer ikke appstart-egenskapen (en eldre vertversjon)."
+
+["control.no_cap.stream_mode"]
+en = "This host doesn't support switching the stream fan-out mode — it streams to a single client only and doesn't advertise the mirror capability."
+nb = "Denne verten støtter ikke bytte av strømme-modus — den strømmer kun til én klient og annonserer ikke speilings-egenskapen."
+
+["control.no_cap.preview"]
+en = "This host doesn't support the live preview — it has no preview writer and doesn't advertise the capability."
+nb = "Denne verten støtter ikke direkte forhåndsvisning — den har ingen forhåndsvisningsskriver og annonserer ikke egenskapen."
+
+["control.no_cap.relaunch"]
+en = "This host doesn't support restarting itself from the panel — it doesn't advertise the relaunch capability. Use Stop and start it again on the host."
+nb = "Denne verten støtter ikke omstart fra panelet — den annonserer ikke omstarts-egenskapen. Bruk Stopp og start den igjen på verten."

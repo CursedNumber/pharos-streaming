@@ -48,6 +48,11 @@ pub mod client;
 /// [`Request::SetPrimaryPeer`], [`HostStatus::primary_pubkey`]) is additive the
 /// same way: old hosts answer the new requests with [`Event::Error`] via the
 /// lenient reader, and the new status field is `#[serde(default)]`.
+///
+/// The issue #22 capability set ([`HostStatus::caps`]) is additive too:
+/// `#[serde(default)]` decodes a pre-caps host as [`HostCaps::legacy`]
+/// (pairing + peers only), and per-field defaults keep a partially-populated
+/// caps object decoding as "absent capability = false". No bump.
 pub const PROTOCOL_VERSION: u32 = 4;
 
 // ---------------------------------------------------------------------------
@@ -365,11 +370,22 @@ pub struct HostStatus {
     /// True when this host's control plane is **status-only** — it answers
     /// `Hello`/`GetStatus` but `Event::Error`s every mutating request (the
     /// Windows host's render-loop-free [`serve_status`]; the full Linux
-    /// compositor is controllable and leaves this `false`). The panel reads it to
-    /// disable the controls that would otherwise just bounce. `#[serde(default)]`
+    /// compositor is controllable and leaves this `false`). `#[serde(default)]`
     /// → an older host decodes as `false` (controllable). Additive.
+    ///
+    /// Superseded by the per-verb [`Self::caps`] set (issue #22) — the panel now
+    /// gates each control on its specific capability. Kept (and still filled by
+    /// hosts) so an older panel's all-or-nothing gate keeps working.
     #[serde(default)]
     pub read_only: bool,
+    /// Per-verb capability set for this host's control plane (issue #22). The
+    /// panel gates each control on the specific capability it drives, with an
+    /// honest disabled reason, instead of the all-or-nothing [`Self::read_only`].
+    /// `#[serde(default)]` → a host that doesn't send it decodes as
+    /// [`HostCaps::legacy`] (pairing + peers only). Additive, no
+    /// `PROTOCOL_VERSION` bump.
+    #[serde(default)]
+    pub caps: HostCaps,
     /// GPU/encoder health, so the tray + panel can surface a fault without the
     /// user reading logs. Set by the compositor's encode classifier / watchdog
     /// (see `GPU_ERROR_HANDLING_PLAN.md`). `#[serde(default)]` → an older host
@@ -395,6 +411,112 @@ pub struct HostStatus {
     /// bump.
     #[serde(default)]
     pub primary_pubkey: Option<String>,
+}
+
+/// What this host's control plane can actually DO, advertised per verb so the
+/// panel gates each control on the specific capability it drives (issue #22)
+/// rather than the all-or-nothing [`HostStatus::read_only`] flag — which, once
+/// the Windows host grew pairing, enabled every control against it and left
+/// most of them clickable-but-bouncing.
+///
+/// Additive over the wire, twice over:
+///
+/// * A status with **no `caps` key at all** (any host predating this struct)
+///   decodes via the `#[serde(default)]` on [`HostStatus::caps`] as
+///   [`HostCaps::legacy`] — pairing + peers only. That matches what the old
+///   Windows host actually serves; a pre-caps *Linux* compositor connecting to
+///   a newer panel degrades to the same conservative set (honestly disabled
+///   controls) rather than the panel guessing at verbs it can't confirm.
+/// * A caps object **missing one field** (a host predating a newly added
+///   capability) decodes that field as `false` via the per-field
+///   `#[serde(default)]` — a host never gains a capability by omission.
+///
+/// No `PROTOCOL_VERSION` bump (the same additive pattern as `gpu_health` /
+/// `stream_mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostCaps {
+    /// [`Request::StartPairing`] / [`Request::CancelPairing`].
+    #[serde(default)]
+    pub pairing: bool,
+    /// The issue #19 fleet controls: [`Request::ForgetPeer`] /
+    /// [`Request::SetPrimaryPeer`].
+    #[serde(default)]
+    pub peers: bool,
+    /// [`Request::LaunchApp`] (the Apps tab's Launch button).
+    #[serde(default)]
+    pub launch_app: bool,
+    /// [`Request::SetStreamMode`] (the mirror fan-out toggle).
+    #[serde(default)]
+    pub stream_mode: bool,
+    /// [`Request::SetInputEnabled`] (the per-device input gate).
+    #[serde(default)]
+    pub input_toggle: bool,
+    /// [`Request::SetPreview`] (the live preview JPEG).
+    #[serde(default)]
+    pub preview: bool,
+    /// [`Request::Relaunch`] (restart the host in place).
+    #[serde(default)]
+    pub relaunch: bool,
+    /// The controller plane: [`Request::SetControllerAlias`] /
+    /// [`Request::SubscribeControllers`].
+    #[serde(default)]
+    pub controllers: bool,
+    /// [`Request::GetFrameTimings`] (the Performance section's live
+    /// instrumentation).
+    #[serde(default)]
+    pub frame_timings: bool,
+}
+
+impl HostCaps {
+    /// What a host that predates the caps field is assumed to serve: pairing +
+    /// peers only — the old Windows host's real surface, and the conservative
+    /// reading of any other pre-caps host. This is the decode default for a
+    /// status with no `caps` key.
+    pub fn legacy() -> Self {
+        HostCaps {
+            pairing: true,
+            peers: true,
+            ..HostCaps::none()
+        }
+    }
+
+    /// Every capability — the full Linux compositor.
+    pub fn all() -> Self {
+        HostCaps {
+            pairing: true,
+            peers: true,
+            launch_app: true,
+            stream_mode: true,
+            input_toggle: true,
+            preview: true,
+            relaunch: true,
+            controllers: true,
+            frame_timings: true,
+        }
+    }
+
+    /// No capabilities — a pure status publisher ([`serve_status`]).
+    pub fn none() -> Self {
+        HostCaps {
+            pairing: false,
+            peers: false,
+            launch_app: false,
+            stream_mode: false,
+            input_toggle: false,
+            preview: false,
+            relaunch: false,
+            controllers: false,
+            frame_timings: false,
+        }
+    }
+}
+
+impl Default for HostCaps {
+    /// The decode default for a missing `caps` key is [`HostCaps::legacy`] —
+    /// see the struct docs for why that is NOT `none()`.
+    fn default() -> Self {
+        HostCaps::legacy()
+    }
 }
 
 /// How the host fans the encoded stream out to connected clients.
@@ -1144,6 +1266,7 @@ mod tests {
             controllers: vec![],
             video_codec: Some("HEVC".into()),
             read_only: false,
+            caps: HostCaps::all(),
             gpu_health: GpuHealth::default(),
             stream_mode: StreamMode::default(),
             hdr_active: None,
@@ -1357,6 +1480,13 @@ mod tests {
             }],
             video_codec: Some("HEVC".into()),
             read_only: false,
+            // Exercise a real capability set over the wire (not the default).
+            caps: HostCaps {
+                pairing: true,
+                peers: true,
+                launch_app: true,
+                ..HostCaps::none()
+            },
             gpu_health: GpuHealth::Degraded {
                 reason: "thermal throttle".into(),
                 throttle: Some("HwThermalSlowdown".into()),
@@ -1473,6 +1603,42 @@ mod tests {
             let back: Request = serde_json::from_str(&json).unwrap();
             assert_eq!(serde_json::to_string(&back).unwrap(), json);
         }
+    }
+
+    /// The issue #22 additive guarantee, part 1: a status with NO `caps` key
+    /// (any pre-caps host) decodes as [`HostCaps::legacy`] — pairing + peers
+    /// only, so the panel enables exactly what such a host really serves.
+    #[test]
+    fn status_without_caps_decodes_as_legacy() {
+        let old =
+            r#"{"hostname":"pharos","streaming":false,"clients":[],"outputs":[],"media":null}"#;
+        let s: HostStatus = serde_json::from_str(old).unwrap();
+        assert_eq!(s.caps, HostCaps::legacy());
+        assert!(s.caps.pairing && s.caps.peers);
+        assert!(!s.caps.launch_app && !s.caps.relaunch && !s.caps.preview);
+    }
+
+    /// The issue #22 additive guarantee, part 2: a caps object missing a field
+    /// (a host predating a newly added capability) decodes that field as
+    /// `false` — a host never gains a capability by omission. Also proves a
+    /// full set round-trips intact.
+    #[test]
+    fn caps_partial_and_roundtrip() {
+        let partial: HostCaps = serde_json::from_str(r#"{"pairing":true,"peers":true}"#).unwrap();
+        assert!(partial.pairing && partial.peers);
+        assert!(!partial.launch_app && !partial.stream_mode && !partial.input_toggle);
+        assert!(!partial.preview && !partial.relaunch);
+        assert!(!partial.controllers && !partial.frame_timings);
+
+        let mut s = sample_status("rig");
+        s.caps = HostCaps {
+            pairing: true,
+            peers: true,
+            launch_app: true,
+            ..HostCaps::none()
+        };
+        let back: HostStatus = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.caps, s.caps);
     }
 
     /// A status without `primary_pubkey` (an older host) must still decode —

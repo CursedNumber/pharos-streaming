@@ -249,6 +249,7 @@ mod state_tests {
             controllers: vec![],
             video_codec: None,
             read_only: false,
+            caps: control_ipc::HostCaps::all(),
             gpu_health: gpu,
             stream_mode: control_ipc::StreamMode::Single,
             hdr_active: None,

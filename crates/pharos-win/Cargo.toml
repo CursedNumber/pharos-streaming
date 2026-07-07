@@ -27,6 +27,10 @@ integration-mqtt = { path = "../integration-mqtt" }
 # Win32 input injection (SendInput) + virtual-screen metrics. Reuses the
 # `windows` 0.52 already in the lockfile (pulled by winit/wgpu on the client).
 [target.'cfg(windows)'.dependencies]
+# Panel-driven app launch (issue #22): the same catalog + environment-aware
+# launcher the Linux compositor dispatches LaunchApp to (Steam URI handoff,
+# RTSS perf-overlay ensure-running, pid-registry idempotency).
+app-launcher = { path = "../app-launcher" }
 # Virtual Xbox 360 pads through the ViGEmBus driver (issue #2). Client-only:
 # without the driver installed, connect fails and gamepad events no-op.
 vigem-client = "0.1"
