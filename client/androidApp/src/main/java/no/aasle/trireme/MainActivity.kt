@@ -47,7 +47,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.pointerInteropFilter
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.focusProperties
@@ -89,6 +91,17 @@ private const val EDGE_HINT_MS = 4_000L
 private const val PEEK_TIMEOUT_MS = 10_000L
 // (Quitting is the rail Exit item — graceful StreamHub.shutdown() + finish() — not Back.)
 
+// Touch → pointer tuning (see MainActivity.onTouchEvent). Pixel values; rough but
+// serviceable — refine per density later if needed.
+/** Max press duration for a trackpad tap to count as a click. */
+private const val TAP_MS = 180L
+/** Movement (px) beyond which a trackpad gesture is a drag, not a tap. */
+private const val TAP_SLOP = 24f
+/** Trackpad relative-motion gain (host pixels per screen pixel of drag). */
+private const val TRACKPAD_SENS = 1.5f
+/** Two-finger scroll: screen px of drag per wheel notch. */
+private const val SCROLL_DIV = 48f
+
 /**
  * Trireme shell — a SINGLE full-screen, immersive Activity that is the launcher.
  *
@@ -124,6 +137,21 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     // Swallow the long-press OK release that opens the navbar so it doesn't
     // immediately click the focused rail item / row.
     private var swallowCenterUntilUp = false
+
+    // --- Touch → host pointer gesture state (see onTouchEvent) ---
+    private val hasTouch by lazy {
+        packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_TOUCHSCREEN)
+    }
+    private var tDownTime = 0L
+    private var tDownX = 0f
+    private var tDownY = 0f
+    private var tLastX = 0f
+    private var tLastY = 0f
+    private var tMoved = false // exceeded slop → a drag, not a tap
+    private var tInContent = false // absolute: DOWN landed inside the content rect
+    private var tScrolling = false // two-finger scroll active
+    private var tScrollLastY = 0f
+    private var tPressed = false // a left button is held down (absolute drag)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -210,6 +238,14 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     /** Reveal the navbar at the Peek (icon-rail) level; (re)starts the auto-hide timer. */
     private fun openNavbar() {
+        // The navbar is about to take over touches; release any in-progress touch
+        // gesture so an absolute-mode held button doesn't stick down on the host
+        // (its ACTION_UP would be swallowed by onTouchEvent's navbar guard).
+        if (tPressed) {
+            StreamHub.pointerButton(0, false)
+            tPressed = false
+        }
+        tScrolling = false
         if (navMode.value == NavMode.Hidden) navMode.value = NavMode.Peek
         peekTick.value++
     }
@@ -388,6 +424,142 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     }
 
     // ============================================================
+    // Touch → host pointer. onTouchEvent (not dispatchTouchEvent) so Compose owns
+    // the navbar/scrim/edge-grip gestures first; we only see touches on the bare
+    // stream area while the navbar is Hidden. Two modes (Settings → Touch):
+    //   absolute — tap/drag to place the cursor + click (touchscreen feel)
+    //   trackpad — one-finger drag = relative motion (PointerRel), tap = click,
+    //              two fingers = scroll.
+    // ============================================================
+
+    /** The letterboxed video content rect in window pixels `[x, y, w, h]`, matching
+     *  ShellContent's aspect-fit ("contain") exactly, or null if not laid out yet. */
+    private fun contentRect(): FloatArray? {
+        val v = window?.decorView ?: return null
+        val winW = v.width.toFloat()
+        val winH = v.height.toFloat()
+        if (winW <= 0f || winH <= 0f) return null
+        val aspect = StreamHub.videoAspect.value
+        if (aspect <= 0f) return null
+        val cw: Float
+        val ch: Float
+        if (winW / winH < aspect) {
+            cw = winW; ch = winW / aspect // fit width, bars top/bottom
+        } else {
+            ch = winH; cw = winH * aspect // fit height, bars left/right
+        }
+        return floatArrayOf((winW - cw) / 2f, (winH - ch) / 2f, cw, ch)
+    }
+
+    /** Dispatch a stream-area touch to the host pointer. Driven by a Compose
+     *  `pointerInteropFilter` on the video box (see ShellContent), which is only
+     *  attached while the navbar is Hidden — so this never fights the navbar/edge-grip
+     *  gestures. `Activity.onTouchEvent` can't be used: the ComposeView consumes the
+     *  events before they reach the Activity. Returns true to consume. */
+    fun onStreamTouch(event: MotionEvent): Boolean {
+        // Always release a held button on UP/CANCEL, so it never sticks on the host.
+        val a = event.actionMasked
+        if ((a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) && tPressed) {
+            StreamHub.pointerButton(0, false)
+            tPressed = false
+        }
+        if (!StreamHub.hasActiveSession()) return false
+        return if (StreamHub.isTouchAbsolute()) handleAbsoluteTouch(event)
+        else handleTrackpadTouch(event)
+    }
+
+    /** Absolute: the finger IS the cursor. DOWN places it + presses; MOVE drags it;
+     *  UP releases. Touches in the letterbox bars are ignored. */
+    private fun handleAbsoluteTouch(event: MotionEvent): Boolean {
+        val rect = contentRect() ?: return false
+        val cx = rect[0]
+        val cy = rect[1]
+        val cw = rect[2]
+        val ch = rect[3]
+        fun sendAbs(x: Float, y: Float) {
+            val nx = ((x - cx) / cw).coerceIn(0f, 1f)
+            val ny = ((y - cy) / ch).coerceIn(0f, 1f)
+            StreamHub.pointerAbs(nx, ny)
+        }
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                val x = event.x
+                val y = event.y
+                tInContent = x >= cx && x < cx + cw && y >= cy && y < cy + ch
+                if (tInContent) {
+                    sendAbs(x, y)
+                    StreamHub.pointerButton(0, true)
+                    tPressed = true
+                }
+            }
+            MotionEvent.ACTION_MOVE -> if (tInContent) sendAbs(event.x, event.y)
+            MotionEvent.ACTION_UP -> if (tPressed) {
+                StreamHub.pointerButton(0, false)
+                tPressed = false
+            }
+            MotionEvent.ACTION_CANCEL -> if (tPressed) {
+                StreamHub.pointerButton(0, false)
+                tPressed = false
+            }
+        }
+        return true
+    }
+
+    /** Trackpad: one-finger drag → PointerRel; quick tap → left click; two-finger
+     *  drag → scroll. */
+    private fun handleTrackpadTouch(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                tDownTime = event.eventTime
+                tDownX = event.x
+                tDownY = event.y
+                tLastX = event.x
+                tLastY = event.y
+                tMoved = false
+                tScrolling = false
+            }
+            MotionEvent.ACTION_POINTER_DOWN -> if (event.pointerCount >= 2) {
+                tScrolling = true
+                tScrollLastY = (event.getY(0) + event.getY(1)) / 2f
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (tScrolling && event.pointerCount >= 2) {
+                    val avgY = (event.getY(0) + event.getY(1)) / 2f
+                    val dy = avgY - tScrollLastY
+                    tScrollLastY = avgY
+                    // Drag down → scroll down (natural). SCROLL_DIV px per notch.
+                    StreamHub.pointerScroll(0f, -dy / SCROLL_DIV)
+                } else if (!tScrolling) {
+                    val dx = event.x - tLastX
+                    val dy = event.y - tLastY
+                    tLastX = event.x
+                    tLastY = event.y
+                    if (kotlin.math.abs(event.x - tDownX) > TAP_SLOP ||
+                        kotlin.math.abs(event.y - tDownY) > TAP_SLOP
+                    ) {
+                        tMoved = true
+                    }
+                    StreamHub.pointerRel(dx * TRACKPAD_SENS, dy * TRACKPAD_SENS)
+                }
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                // Second finger lifted; keep scrolling flag until full UP so the
+                // remaining finger doesn't dump a relative jump.
+            }
+            MotionEvent.ACTION_UP -> {
+                val quick = event.eventTime - tDownTime < TAP_MS
+                if (!tScrolling && !tMoved && quick) {
+                    StreamHub.pointerButton(0, true)
+                    StreamHub.pointerButton(0, false)
+                }
+                tScrolling = false
+            }
+            MotionEvent.ACTION_CANCEL -> tScrolling = false
+        }
+        return true
+    }
+
+    // ============================================================
     // Refresh / VRR configuration (needs a Window, so it lives in the shell)
     // ============================================================
 
@@ -505,6 +677,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
      *    badge (Connecting / Reconnecting / No active stream) is shown over the surface
      *    as a polite live region, so a full-screen user gets feedback over a black frame.
      */
+    @OptIn(ExperimentalComposeUiApi::class)
     @Composable
     private fun ShellContent(
         mode: NavMode,
@@ -535,7 +708,20 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
             // is taller than the video, else fit height — i.e. "contain" for any aspect.
             val videoAspect by StreamHub.videoAspect.collectAsState()
             val fitWidth = (maxWidth / maxHeight) < videoAspect
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            // Touch → host pointer: only while the navbar is Hidden (so it never
+            // fights the navbar/scrim/edge-grip gestures) and on a touch device.
+            // pointerInteropFilter hands us raw MotionEvents inside Compose — the
+            // ComposeView consumes touches before Activity.onTouchEvent, so that
+            // hook can't be used.
+            val touchMod = if (mode == NavMode.Hidden && hasTouch) {
+                Modifier.pointerInteropFilter { ev -> onStreamTouch(ev) }
+            } else {
+                Modifier
+            }
+            Box(
+                Modifier.fillMaxSize().then(touchMod),
+                contentAlignment = Alignment.Center,
+            ) {
                 AndroidView(
                     factory = { ctx -> SurfaceView(ctx).also { bindSurface(it) } },
                     modifier = (if (fitWidth) Modifier.fillMaxWidth() else Modifier.fillMaxHeight())

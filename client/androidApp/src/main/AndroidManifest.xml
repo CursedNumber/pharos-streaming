@@ -9,6 +9,12 @@
          service, so it survives leaving the export screen / runs while streaming. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- The connectedDevice FGS type (UsbExportService) requires, on Android 14+, one
+         of an anyOf permission set IN ADDITION to the type permission above. mDNS host
+         discovery (NsdManager) uses Wi-Fi multicast, so this both is justified and
+         satisfies that requirement — without it startForeground() throws a
+         SecurityException on API 34+ (Android 15/16) and force-closes the app. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- A TV has no touchscreen; don't let that gate installation. -->
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />

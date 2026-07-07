@@ -211,6 +211,35 @@ impl GamepadInput {
             .send(core_proto::InputEvent::GamepadAxis { slot, axis, value });
     }
 
+    /// Absolute pointer position, normalised 0..=1 over the **video content rect**
+    /// (the shell removes any letterbox margin first). The host scales it to
+    /// compositor pixels. Use for tap-to-position / absolute-touch pointing.
+    pub fn pointer_abs(&self, x: f32, y: f32) {
+        let _ = self.tx.send(core_proto::InputEvent::PointerAbs { x, y });
+    }
+
+    /// Relative pointer motion in host pixels (trackpad-style drag, or a
+    /// cursor-grabbed desktop client's raw mouse motion). The host advances the
+    /// cursor by the delta AND emits `wl_relative_pointer` motion, so both desktop
+    /// apps and pointer-locked games follow.
+    pub fn pointer_rel(&self, dx: f32, dy: f32) {
+        let _ = self.tx.send(core_proto::InputEvent::PointerRel { dx, dy });
+    }
+
+    /// Pointer button transition. `button`: 0=Left, 1=Right, 2=Middle, 3=Back,
+    /// 4=Forward (evdev `BTN_LEFT`+n on the host).
+    pub fn pointer_button(&self, button: u8, pressed: bool) {
+        let _ = self
+            .tx
+            .send(core_proto::InputEvent::PointerButton { button, pressed });
+    }
+
+    /// Wheel scroll, in notches (1.0 = one detent). `dy` > 0 scrolls up, `dx` > 0
+    /// scrolls right (the host maps to `wl_pointer` axis units).
+    pub fn scroll(&self, dx: f32, dy: f32) {
+        let _ = self.tx.send(core_proto::InputEvent::Scroll { dx, dy });
+    }
+
     /// Motion-sensor sample for gyro-aim: gyroscope (rad/s) + accelerometer (g).
     /// The host turns gyro into relative mouse motion.
     #[allow(clippy::too_many_arguments)]

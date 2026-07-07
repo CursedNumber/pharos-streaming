@@ -159,6 +159,10 @@ object StreamHub {
     // because nothing on the wire asks for it. Flipped live via [setGyroEnabled];
     // takes effect on the NEXT dial (the v2 auth handshake sends the flag once).
     @Volatile private var gyroEnabled: Boolean = false
+    // Touch-pointer mode. true = absolute (tap-to-position), false = trackpad
+    // (relative drag → PointerRel). Seeded in [init]; flipped live via
+    // [setTouchAbsolute] (takes effect immediately, no re-dial).
+    @Volatile private var touchAbsolute: Boolean = true
     // Controller-handling master switch (Settings / Controllers pane). Default
     // false: pads are forwarded RAW (host default profile, no gyro/swaps). When
     // on, ControllerManager applies the per-controller profile. Seeded in [init];
@@ -240,6 +244,7 @@ object StreamHub {
             this.identityPath = this.appContext.filesDir.resolve("identity.toml").absolutePath
             paceOverride = readPacePref(this.appContext)
             gyroEnabled = readGyroEnabledPref(this.appContext)
+            touchAbsolute = readTouchAbsolutePref(this.appContext)
             controllerHandling = readControllerHandlingPref(this.appContext)
             val sp = this.appContext.getSharedPreferences("trireme.settings", Context.MODE_PRIVATE)
             resTargetH = sp.getInt("res_target_h", 0)
@@ -571,6 +576,52 @@ object StreamHub {
      */
     fun dispatchControllerMotion(event: MotionEvent): Boolean =
         controllers?.onMotion(event) == true
+
+    // --- Touch → host pointer (MainActivity drives these from onTouchEvent) ---
+    // Always route through activeGamepad() per-call: a reconnect swaps the
+    // session's GamepadInput for a fresh handle, and a cached one silently drops.
+
+    /** Absolute pointer position, normalised 0..=1 over the video content rect. */
+    fun pointerAbs(x: Float, y: Float) {
+        runCatching { activeGamepad()?.pointerAbs(x, y) }
+    }
+
+    /** Relative pointer motion in pixels (trackpad drag). */
+    fun pointerRel(dx: Float, dy: Float) {
+        runCatching { activeGamepad()?.pointerRel(dx, dy) }
+    }
+
+    /** Pointer button (0=Left, 1=Right, 2=Middle). */
+    fun pointerButton(button: Int, pressed: Boolean) {
+        runCatching { activeGamepad()?.pointerButton(button.toUByte(), pressed) }
+    }
+
+    /** Wheel scroll in notches (dy>0 = up, dx>0 = right). */
+    fun pointerScroll(dx: Float, dy: Float) {
+        runCatching { activeGamepad()?.scroll(dx, dy) }
+    }
+
+    /** True while a live session can receive pointer input (gates touch capture). */
+    fun hasActiveSession(): Boolean = activeGamepad() != null
+
+    /** Touch-pointer mode: true = absolute (tap-to-position), false = trackpad
+     *  (relative drag + PointerRel). Read at gesture time by MainActivity. */
+    fun isTouchAbsolute(): Boolean = touchAbsolute
+
+    /** Persist + apply the touch-pointer mode. Takes effect immediately (it only
+     *  changes how the Activity maps touches — no re-dial). Safe on any thread. */
+    fun setTouchAbsolute(on: Boolean) {
+        touchAbsolute = on
+        appContext.getSharedPreferences("trireme.settings", Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean("touch_absolute", on)
+            .apply()
+        Log.i(TAG, "touch pointer mode = ${if (on) "absolute" else "trackpad"}")
+    }
+
+    private fun readTouchAbsolutePref(ctx: Context): Boolean =
+        ctx.getSharedPreferences("trireme.settings", Context.MODE_PRIVATE)
+            .getBoolean("touch_absolute", true)
 
     /**
      * Live slot index of the controller with this VID:PID on the active session,

@@ -50,10 +50,23 @@ class UsbExportService : Service() {
 
     private fun startForegroundCompat() {
         val notif = buildNotification()
-        if (Build.VERSION.SDK_INT >= 30) {
-            startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
-        } else {
-            startForeground(NOTIF_ID, notif)
+        // Android 14+ enforces foreground-service-type prerequisites; if they're ever
+        // not met (a missing anyOf permission, a future policy tightening, a sticky
+        // restart before USB is attached), startForeground throws — catch it and wind
+        // the service down instead of force-closing the whole app.
+        try {
+            if (Build.VERSION.SDK_INT >= 30) {
+                startForeground(
+                    NOTIF_ID,
+                    notif,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
+                )
+            } else {
+                startForeground(NOTIF_ID, notif)
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("UsbExportService", "startForeground failed; stopping service", e)
+            stopSelf()
         }
     }
 
