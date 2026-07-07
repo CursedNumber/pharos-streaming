@@ -112,6 +112,8 @@ fun SettingsPane(onOpenControllers: () -> Unit = {}) {
     // it). StreamHub owns the source of truth (also read at process start) and
     // applies on the NEXT dial.
     var gyroOn by remember { mutableStateOf(StreamHub.isGyroEnabled()) }
+    // Touch-pointer mode (absolute vs trackpad). Applies immediately — no re-dial.
+    var touchAbs by remember { mutableStateOf(StreamHub.isTouchAbsolute()) }
 
     // Master switches (both default off). USB/IP is persisted in UsbStore; controller
     // handling lives in StreamHub (which rebuilds the live ControllerManager on change).
@@ -283,6 +285,23 @@ fun SettingsPane(onOpenControllers: () -> Unit = {}) {
                 val next = !gyroOn
                 gyroOn = next
                 StreamHub.setGyroEnabled(next)
+            },
+        )
+
+        // --- Touch pointer mode: absolute (tap-to-position) vs trackpad (drag) ---
+        // OK cycles the two. Applies immediately (no re-dial) — it only changes how
+        // the shell maps finger touches to host pointer events.
+        val touchLabel = if (touchAbs) "Absolute" else "Trackpad"
+        SettingRow(
+            title = "Touch pointer",
+            summary = "How a finger drives the host cursor: Absolute = tap where you " +
+                "want; Trackpad = drag to move + tap to click, two fingers to scroll.",
+            trailing = touchLabel,
+            state = touchLabel,
+            onClick = {
+                val next = !touchAbs
+                touchAbs = next
+                StreamHub.setTouchAbsolute(next)
             },
         )
 

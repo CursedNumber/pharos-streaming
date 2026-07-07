@@ -1187,6 +1187,14 @@ struct App {
     /// `true` while the window is minimized/occluded — rendering is skipped so we
     /// don't churn the GPU presenting frames nobody can see.
     suspended: bool,
+    /// The user's cursor-grab intent (issue #5) — flipped by the `toggle_grab`
+    /// hotkey. Persists across focus loss so alt-tab-and-back resumes mouselook.
+    grab_wanted: bool,
+    /// Whether the OS cursor is *actually* grabbed right now. Only true while
+    /// `grab_wanted && focused` — [`Self::apply_grab`] reconciles the two. When on,
+    /// the cursor is hidden + locked and raw motion becomes `PointerRel` (instead of
+    /// `PointerAbs` from `CursorMoved`), for FPS-style mouselook.
+    grabbed: bool,
 }
 
 impl App {
@@ -1216,6 +1224,10 @@ impl ApplicationHandler<UserEvent> for App {
         if self.window.is_some() {
             return;
         }
+        // Deliver raw `DeviceEvent::MouseMotion` while focused — the source of
+        // relative deltas for cursor-grab mode (issue #5). winit doesn't emit
+        // device events by default.
+        el.listen_device_events(winit::event_loop::DeviceEvents::WhenFocused);
         let title = if self.sources.len() == 1 {
             format!("Trireme — {}", self.sources[0].name)
         } else {
@@ -1321,6 +1333,10 @@ impl ApplicationHandler<UserEvent> for App {
                         RECONNECT_BACKOFF
                     );
                 }
+                // Free the cursor if mouselook-grabbed — don't trap it during the
+                // reconnect window; the user re-grabs after reconnect.
+                self.grab_wanted = false;
+                self.apply_grab();
                 let proxy = self.proxy.clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(RECONNECT_BACKOFF);
@@ -1333,6 +1349,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(s) = self.sources.get_mut(i) {
                     s.input_tx = None; // back-channel is dead either way
                 }
+                // Free the cursor if mouselook-grabbed (same as a plain drop).
+                self.grab_wanted = false;
+                self.apply_grab();
                 let name = self
                     .sources
                     .get(i)
@@ -1453,6 +1472,10 @@ impl ApplicationHandler<UserEvent> for App {
                 if !f {
                     self.mods = core_proto::Modifiers::default();
                 }
+                // Reconcile the grab: release when we lose focus (don't trap the
+                // cursor on alt-tab), re-grab when we regain it if the user still
+                // wants mouselook.
+                self.apply_grab();
             }
             WE::ModifiersChanged(m) => {
                 let st = m.state();
@@ -1481,6 +1504,30 @@ impl ApplicationHandler<UserEvent> for App {
             WE::MouseInput { state, button, .. } => self.handle_mouse_button(state, button),
             WE::MouseWheel { delta, .. } => self.handle_mouse_wheel(delta),
             _ => {}
+        }
+    }
+
+    /// Raw device motion — the source of relative mouse deltas for cursor-grab
+    /// mode (issue #5). `WindowEvent::CursorMoved` is OS-accelerated and clamps at
+    /// the screen edge; `DeviceEvent::MouseMotion` is the unaccelerated delta a
+    /// mouselook game wants. Only forwarded while grabbed + capturing.
+    fn device_event(
+        &mut self,
+        _el: &ActiveEventLoop,
+        _id: winit::event::DeviceId,
+        ev: winit::event::DeviceEvent,
+    ) {
+        if let winit::event::DeviceEvent::MouseMotion { delta: (dx, dy) } = ev {
+            // `grabbed` already implies the window is focused (apply_grab), and an
+            // explicit grab is the user's capture intent — so it does NOT gate on
+            // capture_active() (which in Focus mode needs a cursor_cell that Locked
+            // grab can never refresh). Only the mouse class gate applies.
+            if self.grabbed && self.cfg.input.forward_mouse {
+                self.send_to_active(core_proto::InputEvent::PointerRel {
+                    dx: dx as f32,
+                    dy: dy as f32,
+                });
+            }
         }
     }
 }
@@ -1554,11 +1601,46 @@ impl App {
                 tracing::info!("disconnect hotkey — exiting");
                 el.exit();
             }
+            "toggle_grab" => {
+                self.grab_wanted = !self.grab_wanted;
+                self.apply_grab();
+            }
             _ => {}
         }
     }
 
+    /// Reconcile the OS cursor grab with `grab_wanted && focused` (issue #5). When
+    /// grabbed, the cursor is hidden + locked so raw motion (via `device_event`)
+    /// becomes `PointerRel` for mouselook. `Locked` is true pointer lock; fall back
+    /// to `Confined` where a platform/backend doesn't support it. Idempotent — safe
+    /// to call on every focus change / toggle. An explicit grab IS the capture
+    /// intent, so it works regardless of `CaptureMode`.
+    fn apply_grab(&mut self) {
+        use winit::window::CursorGrabMode;
+        let want = self.grab_wanted && self.focused;
+        if want == self.grabbed {
+            return;
+        }
+        self.grabbed = want;
+        if let Some(win) = &self.window {
+            if want {
+                if win.set_cursor_grab(CursorGrabMode::Locked).is_err() {
+                    let _ = win.set_cursor_grab(CursorGrabMode::Confined);
+                }
+            } else {
+                let _ = win.set_cursor_grab(CursorGrabMode::None);
+            }
+            win.set_cursor_visible(!want);
+        }
+        tracing::info!("cursor grab (relative mouse) = {want}");
+    }
+
     fn handle_pointer_move(&mut self) {
+        if self.grabbed {
+            // Grabbed: relative motion flows via `device_event` → PointerRel; the
+            // (edge-pinned, on the Confined fallback) absolute cursor is ignored.
+            return;
+        }
         if !self.capture_active() || !self.cfg.input.forward_mouse {
             return;
         }
@@ -2387,6 +2469,8 @@ pub fn run(cfg: PlayerCfg) -> Result<()> {
         capture_toggle_on: false,
         fullscreen: false,
         suspended: false,
+        grab_wanted: false,
+        grabbed: false,
     };
     event_loop.run_app(&mut app)?;
     Ok(())

@@ -44,6 +44,9 @@ pub struct Hotkeys {
     pub toggle_fullscreen: Option<String>,
     /// Disconnect all sources and exit. Default: `Ctrl+Alt+Backspace`.
     pub disconnect: Option<String>,
+    /// Toggle cursor-grab relative-mouse mode (FPS-style mouselook: hide + lock
+    /// the OS cursor, send raw motion as `PointerRel`). Default: `Ctrl+Alt+Home`.
+    pub toggle_grab: Option<String>,
 }
 
 /// `[input]` section of `sources.toml`. Everything has a sensible default so
@@ -70,6 +73,7 @@ impl Default for InputCfg {
                 toggle_capture: Some("Ctrl+Alt+End".into()),
                 toggle_fullscreen: Some("F10".into()),
                 disconnect: Some("Ctrl+Alt+Backspace".into()),
+                toggle_grab: Some("Ctrl+Alt+Home".into()),
             },
             forward_keyboard: true,
             forward_mouse: true,
@@ -315,6 +319,7 @@ pub fn classify_key(
             (&cfg.hotkeys.toggle_capture, "toggle_capture"),
             (&cfg.hotkeys.toggle_fullscreen, "toggle_fullscreen"),
             (&cfg.hotkeys.disconnect, "disconnect"),
+            (&cfg.hotkeys.toggle_grab, "toggle_grab"),
         ] {
             if let Some(chord) = slot.as_deref().and_then(Chord::parse) {
                 if chord.matches(mods, name) && state == ElementState::Pressed {
