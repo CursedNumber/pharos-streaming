@@ -371,10 +371,14 @@ class UsbExportEngine private constructor(context: Context) {
         deviceProtocol = dev.deviceProtocol.toUByte(),
         configurationValue = if (dev.configurationCount > 0) dev.getConfiguration(0).id.toUByte() else 1u,
         numConfigurations = dev.configurationCount.toUByte(),
-        interfaces = (0 until dev.interfaceCount).map { i ->
-            val f = dev.getInterface(i)
-            UsbInterfaceInfo(f.interfaceClass.toUByte(), f.interfaceSubclass.toUByte(), f.interfaceProtocol.toUByte())
-        },
+        // Android lists every *alternate setting* as its own UsbInterface (same
+        // id, differing altSetting), so a plain map would over-count bNumInterfaces
+        // and duplicate class triples — corrupting the OP_REP_IMPORT block the
+        // Windows vhci builds its PDO from. Dedup by id (first = altSetting 0, the
+        // active one), matching the Rust exporter's one-triple-per-interface hello.
+        interfaces = (0 until dev.interfaceCount).map { dev.getInterface(it) }
+            .distinctBy { it.id }
+            .map { UsbInterfaceInfo(it.interfaceClass.toUByte(), it.interfaceSubclass.toUByte(), it.interfaceProtocol.toUByte()) },
     )
 
     /** `UsbDevice.version` ("2.25") → BCD (0x0225), the `bcdDevice` coding.
