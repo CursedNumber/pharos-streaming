@@ -2582,8 +2582,13 @@ fn spawn_decode(
                         // PUT it back only if the reader hasn't installed a new child in
                         // the meantime. If the slot is now Some (rebuild swapped in the
                         // fresh chain), drop this stale stdin instead of clobbering it.
-                        if reinsert_stdin(stdin_quic.lock().unwrap().is_none()) {
-                            *stdin_quic.lock().unwrap() = Some(stdin);
+                        // Hold ONE guard across the check AND the set: with two separate
+                        // locks a rebuild's swap-in could land between them and be
+                        // clobbered by our stale handle (a TOCTOU that would starve the
+                        // new child and stall the stream).
+                        let mut slot = stdin_quic.lock().unwrap();
+                        if reinsert_stdin(slot.is_none()) {
+                            *slot = Some(stdin);
                         }
                     }
                 },
