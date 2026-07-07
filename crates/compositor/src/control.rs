@@ -188,8 +188,20 @@ impl ControlServer {
         // The pairing window runs off the render loop (its own QUIC endpoint), so
         // it shares the status mutex directly rather than bouncing through a
         // ControlCmd. One manager per host run, shared across serve threads.
-        // announce_mdns: the pairing window is this host's only mDNS presence.
+        // announce_mdns: the pairing window is this host's only mDNS presence
+        // (the compositor has no standalone process-wide advertise like the
+        // Windows host does), so `true` — the always-open listener below IS the
+        // host's discovery presence, and there's no second registration to ghost.
         let pairing = crate::pairing::PairingManager::new(status.clone(), true);
+        // Always-open, host-lifetime pairing (issue #17): a PIN-bearing listener
+        // up at startup so a fresh Trireme pairs with no panel action and no
+        // separate `pharos-compositor pair` terminal. It keeps accepting devices
+        // (rotating the PIN) until the process exits or the lockout trips; the
+        // panel's StartPairing still opens on-demand windows independently.
+        match pairing.start_host_lifetime(None) {
+            Ok(()) => tracing::info!("always-open pairing listener up (issue #17)"),
+            Err(e) => tracing::warn!("always-open pairing listener not started: {e}"),
+        }
         let listener = match control_ipc::bind() {
             Ok(l) => l,
             Err(e) => {

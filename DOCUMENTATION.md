@@ -71,12 +71,17 @@ configuration files. For an overview and the feature list, see
 
 | Port | Proto | Constant | Purpose |
 |---|---|---|---|
-| **15777** | UDP/QUIC | `STREAM` | video/audio/input stream (current default) |
+| **15777** | UDP/QUIC | `STREAM` | video/audio/input stream (current default; both hosts) |
 | **15778** | TCP | `CONTROL` | host↔panel control plane (`HostStatus`) |
 | **4432** | UDP/QUIC | `PAIR` | SPAKE2 pairing listener |
 | **4434** | UDP/QUIC | `USBIP` | USB/IP relay (export → import bridge) |
-| **4435** | UDP/QUIC |  | Windows host stream default bind |
 | 4433 | UDP/QUIC | `STREAM_LEGACY` | **deprecated** legacy stream port |
+
+The Windows host previously bound its own stream port (`4435`); it now uses the
+canonical `15777` like the Linux host, so one firewall/WAN rule covers both.
+Migration: a client that had *manually* saved a Windows host at `:4435` must
+update it to `:15777`; mDNS-discovered hosts carry the new port automatically, so
+re-discovered hosts fix themselves.
 
 If you move the stream port, remember to open it on the firewall
 (`ufw allow 15777/udp`).
@@ -150,27 +155,45 @@ uses the shared core, so an unmodified Trireme client connects to either host OS
 ```
 USAGE: pharos-host <SUBCOMMAND> [ARGS...]
 
+  (no subcommand)                        Run `stream` with all defaults, and surface
+                                         the pairing PIN to the console. This is what
+                                         a double-clicked / bare-invoked host does.
   pair [addr]                            SPAKE2 pairing listener; prints a rotating
                                          6-digit PIN, writes peers.toml. addr default
-                                         0.0.0.0:4432.
+                                         0.0.0.0:4432. (Rarely needed now: the host
+                                         opens an always-on pairing listener itself.)
   stream [bind] [output_idx] [fps] [qsv|nvenc|amf] [dda|wgc]
                                          Start the QUIC video host. bind default
-                                         0.0.0.0:4435; output_idx 0; fps 60; encoder
-                                         qsv (default); capture dda (default); use
-                                         wgc to capture an IddCx virtual display or
-                                         across adapters.
+                                         0.0.0.0:15777; output_idx 0; fps 60; encoder
+                                         auto (GPU-vendor detect); capture dda
+                                         (default); use wgc to capture an IddCx
+                                         virtual display or across adapters.
   wgc-test [monitor_idx] [frames] [out.bgra]
                                          Capture N frames via Windows.Graphics.Capture,
                                          dump the last as raw BGRA (validates WGC).
 
-With no/unknown subcommand: prints usage, exit 0. On non-Windows: prints a message
-and exits.
+With no subcommand: runs the streaming host (above). An UNRECOGNIZED subcommand
+prints usage, exit 0. On non-Windows: prints a message and exits.
 ```
 
 The `stream` path: loads/creates the Ed25519 identity, enforces pairing by default
 (`PHAROS_ALLOW_UNPAIRED=1` to bypass), optionally pins to a NIC (`config.toml
 [network] bind_mac`), publishes `HostStatus` on TCP `15778`, and runs a recovery
 ladder (exponential backoff + circuit breaker → sticky-red **Faulted**).
+
+**First connect (Windows).** Just run `pharos-host` (no arguments). The host:
+
+- advertises itself on the LAN over mDNS (`_pharos._udp`), so a fresh Trireme lists
+  it with no typed IP or port;
+- opens an **always-on** pairing listener at startup, so there is no separate
+  `pharos-host pair` terminal to run; and
+- surfaces the current 6-digit PIN in the **panel**, the **tray**, and the
+  **console** log (`pairing PIN: …`).
+
+Enter that PIN on the Trireme's pair dialog and you are paired; the host streams on
+the canonical port **15777**. After eight *consecutive* failed attempts the host
+locks pairing out as a brute-force guard; **relaunch** `pharos-host` to re-enable it
+(a successful pair resets the counter, so ordinary fumbles never trip it).
 
 ### hostd
 

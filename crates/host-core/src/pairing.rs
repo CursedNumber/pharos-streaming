@@ -30,6 +30,10 @@ use core_crypto::Identity;
 
 use crate::pair::{self, PairEvent};
 
+/// Panel-opened windows auto-close after this long without a pair (see
+/// [`PairingManager::start`]); the host-lifetime listener passes `None`.
+const PANEL_WINDOW: Duration = Duration::from_secs(60 * 60);
+
 /// Default pairing listen address — mirrors the `pharos-host pair` CLI default
 /// so a device's saved host/port keeps working whichever way you pair.
 pub const DEFAULT_PAIR_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(
@@ -50,6 +54,12 @@ pub struct PairingManager {
     epoch: AtomicU64,
     /// Whether an open window announces the host over mDNS — see [`Self::new`].
     announce_mdns: bool,
+    /// Latched `true` when the brute-force lockout trips ([`PairEvent::LockedOut`]):
+    /// from then on both [`Self::start`] and [`Self::start_host_lifetime`] refuse
+    /// to spawn a listener, so the "relaunch to re-enable" contract holds even
+    /// against a panel StartPairing. A fresh process starts with `false`, which
+    /// is what clears it (issue #17).
+    locked: AtomicBool,
 }
 
 /// The live listener: its cancel flag (flipped to stop) and the thread handle
@@ -74,13 +84,45 @@ impl PairingManager {
             inner: Mutex::new(None),
             epoch: AtomicU64::new(0),
             announce_mdns,
+            locked: AtomicBool::new(false),
         })
     }
 
     /// Open the pairing window: bring up the listener and surface the first PIN.
     /// **Idempotent** — if a listener is already live this is a no-op `Ok`. A
     /// bad address or identity-load failure returns `Err(msg)` for the panel.
+    ///
+    /// This is the panel-triggered variant: it pairs one device at a time
+    /// (`stop_after_pair = true`) and auto-closes after [`PANEL_WINDOW`] if
+    /// nobody pairs. See [`Self::start_host_lifetime`] for the always-open one.
     pub fn start(self: &Arc<Self>, addr: Option<String>) -> Result<(), String> {
+        self.start_inner(addr, true, Some(PANEL_WINDOW))
+    }
+
+    /// Open an **always-open** pairing listener for the host's whole lifetime
+    /// (issue #17): it keeps accepting devices (rotating the PIN after each one)
+    /// and never auto-closes. Host binaries call this once at startup so a
+    /// PIN-bearing listener is live without the panel having to open one. Same
+    /// idempotence + lockout rules as [`Self::start`].
+    pub fn start_host_lifetime(self: &Arc<Self>, addr: Option<String>) -> Result<(), String> {
+        self.start_inner(addr, false, None)
+    }
+
+    /// Shared body of [`Self::start`] / [`Self::start_host_lifetime`]. Refuses to
+    /// spawn once the brute-force lockout has latched (`self.locked`): only a
+    /// fresh process clears it, which is what makes the lockout require a
+    /// relaunch even against a panel StartPairing.
+    fn start_inner(
+        self: &Arc<Self>,
+        addr: Option<String>,
+        stop_after_pair: bool,
+        max_window: Option<Duration>,
+    ) -> Result<(), String> {
+        // Lockout gate: once tripped, stay down until the process restarts.
+        if self.locked.load(Ordering::SeqCst) {
+            return Err("pairing locked after failed attempts; relaunch the host to re-enable".into());
+        }
+
         let mut guard = self
             .inner
             .lock()
@@ -128,14 +170,6 @@ impl PairingManager {
             .name("pharos-pairing".into())
             .spawn(move || {
                 let on_event = move |ev: PairEvent| me_evt.apply_event(epoch, ev);
-                // GUI pairs one device at a time: stop the listener after the
-                // first successful pairing (the CLI keeps accepting devices).
-                let stop_after_pair = true;
-                // Generous safety cap: a window opened from the panel and then
-                // forgotten auto-closes after an hour rather than listening
-                // indefinitely. A successful pair closes it immediately (above);
-                // this only fires when nobody pairs in time.
-                let max_window = Some(Duration::from_secs(60 * 60));
                 if let Err(e) = pair::run_listener(
                     addr,
                     identity,
@@ -161,7 +195,9 @@ impl PairingManager {
             .map_err(|e| format!("spawn pairing thread: {e}"))?;
 
         *guard = Some(Running { cancel, handle });
-        tracing::info!("pairing window opened on {addr} (round {epoch})");
+        tracing::info!(
+            "pairing listener opened on {addr} (round {epoch}, stop_after_pair={stop_after_pair})"
+        );
         Ok(())
     }
 
@@ -231,6 +267,21 @@ impl PairingManager {
             PairEvent::Failed { reason } => {
                 p.last = Some(PairOutcome::Failed { reason });
             }
+            PairEvent::LockedOut { attempts } => {
+                // Latch the lockout so any later start()/start_host_lifetime()
+                // refuses until a relaunch. Surface a clearly-locked state to the
+                // panel/tray: no active listener, no PIN, and a Failed outcome
+                // whose reason spells out the relaunch requirement (reuses the
+                // existing wire field — no new control-ipc variant needed).
+                self.locked.store(true, Ordering::SeqCst);
+                p.active = false;
+                p.pin = None;
+                p.last = Some(PairOutcome::Failed {
+                    reason: format!(
+                        "pairing locked: {attempts} failed attempts; relaunch the host to re-enable"
+                    ),
+                });
+            }
             PairEvent::Stopped => {
                 p.active = false;
                 p.pin = None;
@@ -243,5 +294,71 @@ impl PairingManager {
         if let Ok(mut st) = self.status.lock() {
             st.pairing = Some(state);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The lockout latch (issue #17): a `LockedOut` event must flip the manager
+    //! into a locked state and make a subsequent `start` / `start_host_lifetime`
+    //! refuse to spawn a listener until the process is relaunched. The pairing
+    //! `run_loop`'s own failure-counting is exercised by the `pair.rs` tests via
+    //! the `PHAROS_PAIR_MAX_FAILURES` override; here we test the manager half in
+    //! isolation, driving `apply_event` directly (no real handshake needed).
+
+    use super::*;
+
+    fn blank_status() -> Arc<Mutex<HostStatus>> {
+        Arc::new(Mutex::new(HostStatus {
+            hostname: "test".into(),
+            streaming: false,
+            clients: vec![],
+            outputs: vec![],
+            media: None,
+            pairing: None,
+            controllers: vec![],
+            video_codec: None,
+            read_only: false,
+            caps: control_ipc::HostCaps::all(),
+            gpu_health: control_ipc::GpuHealth::Healthy,
+            stream_mode: control_ipc::StreamMode::Single,
+            hdr_active: None,
+            primary_pubkey: None,
+        }))
+    }
+
+    #[test]
+    fn locked_out_event_latches_and_blocks_restart() {
+        let mgr = PairingManager::new(blank_status(), false);
+        // Not locked initially.
+        assert!(!mgr.locked.load(Ordering::SeqCst));
+
+        // Simulate the current round emitting LockedOut (round 0 is current with
+        // no prior start; apply_event's epoch check passes).
+        mgr.apply_event(0, PairEvent::LockedOut { attempts: 8 });
+
+        // The latch is set and the shared status reflects a clearly-locked state:
+        // no active listener, no PIN, and a Failed outcome naming the lockout.
+        assert!(mgr.locked.load(Ordering::SeqCst));
+        let st = mgr.status.lock().unwrap();
+        let p = st.pairing.as_ref().expect("pairing state set");
+        assert!(!p.active);
+        assert!(p.pin.is_none());
+        match &p.last {
+            Some(PairOutcome::Failed { reason }) => {
+                assert!(reason.starts_with("pairing locked"), "reason: {reason}");
+                assert!(reason.contains("relaunch"));
+            }
+            other => panic!("expected a locked Failed outcome, got {other:?}"),
+        }
+        drop(st);
+
+        // Both entry points now refuse until a relaunch (a fresh process would
+        // build a new manager with locked=false).
+        assert!(mgr.start(None).is_err(), "start must refuse when locked");
+        assert!(
+            mgr.start_host_lifetime(None).is_err(),
+            "start_host_lifetime must refuse when locked"
+        );
     }
 }

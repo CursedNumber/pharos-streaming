@@ -65,42 +65,15 @@ fn main() -> anyhow::Result<()> {
             host_core::pair::run(addr)
         }
         // `pharos-host stream [bind] [output_idx] [fps] [qsv|nvenc|amf] [dda|wgc|wgc-zc]`
-        // Encoder defaults to GPU-vendor auto-detection when not given.
-        Some("stream") => {
-            let bind = match args.get(2) {
-                Some(s) => parse_bind(s)?,
-                None => (
-                    std::net::Ipv4Addr::UNSPECIFIED,
-                    core_proto::ports::WIN_STREAM,
-                )
-                    .into(),
-            };
-            let output_idx: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
-            let fps: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(60);
-            let encoder = match args.get(5).map(String::as_str) {
-                Some("nvenc") => encode::Encoder::Nvenc,
-                Some("amf") => encode::Encoder::Amf,
-                Some("qsv") => encode::Encoder::Qsv,
-                _ => detect_default_encoder(),
-            };
-            // Capture backend: ddagrab (DXGI Desktop Duplication, self-pacing) by
-            // default; `wgc` uses Windows.Graphics.Capture (captures IddCx virtual
-            // displays + by HMONITOR regardless of adapter — needed on the headless
-            // AMD rig where ddagrab can't reach the virtual display's adapter).
-            let capture = match args.get(6).map(String::as_str) {
-                Some("wgc") => CaptureBackend::Wgc,
-                Some("wgc-zc") => CaptureBackend::WgcZc,
-                _ => CaptureBackend::Dda,
-            };
-            // The zero-copy path IS the NVENC SDK; the qsv/amf ffmpeg encoders
-            // have no in-process equivalent here.
-            if matches!(capture, CaptureBackend::WgcZc)
-                && !matches!(encoder, encode::Encoder::Nvenc)
-            {
-                anyhow::bail!("wgc-zc requires the nvenc encoder");
-            }
-            run_stream(bind, output_idx, fps, encoder, capture)
-        }
+        // Encoder defaults to GPU-vendor auto-detection when not given. Bare
+        // `pharos-host` (no subcommand) also lands here with all defaults (below).
+        Some("stream") => run_stream_args(&args),
+        // No subcommand at all → run the streaming host with defaults, exactly
+        // like `pharos-host stream` with no args (issue #17). This makes a
+        // double-clicked / bare-invoked host a live capture+stream that surfaces
+        // its PIN, rather than a usage dump. An UNRECOGNIZED subcommand still
+        // prints usage (the `_ =>` arm below).
+        None => run_stream_args(&args),
         // `pharos-host wgc-test [monitor_idx] [frames] [out.bgra]` — capture via
         // Windows.Graphics.Capture and dump the last frame (validates WGC alone).
         Some("wgc-test") => {
@@ -142,8 +115,9 @@ fn main() -> anyhow::Result<()> {
             eprintln!(
                 "Pharos host (Windows)\n\
                  usage:\n  \
+                 pharos-host          (no subcommand: run `stream` with defaults)\n  \
                  pharos-host pair     [addr=0.0.0.0:4432]\n  \
-                 pharos-host stream   [bind=0.0.0.0:4435] [output_idx=0] [fps=60] [qsv|nvenc|amf] [dda|wgc|wgc-zc]\n  \
+                 pharos-host stream   [bind=0.0.0.0:15777] [output_idx=0] [fps=60] [qsv|nvenc|amf] [dda|wgc|wgc-zc]\n  \
                  pharos-host wgc-test [monitor_idx=0] [frames=120] [out.bgra]\n  \
                  pharos-host pad-test [seconds=10]\n  \
                  pharos-host nvenc-test [w=1920] [h=1080] [frames=120] [out.hevc]\n  \
@@ -152,6 +126,44 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Parse the `stream` argument vector and run the host. Shared by the explicit
+/// `pharos-host stream …` subcommand and the bare `pharos-host` default run mode
+/// (issue #17), so both honour the same defaults: the unified stream port, the
+/// first output, 60 fps, GPU-vendor-auto encoder, and ddagrab capture. `args` is
+/// the whole `std::env::args()` vector; positional args start at index 2 (index
+/// 1 is the subcommand or absent).
+#[cfg(windows)]
+fn run_stream_args(args: &[String]) -> anyhow::Result<()> {
+    let bind = match args.get(2) {
+        Some(s) => parse_bind(s)?,
+        // Unified canonical stream port (issue #17): was WIN_STREAM (4435).
+        None => (std::net::Ipv4Addr::UNSPECIFIED, core_proto::ports::STREAM).into(),
+    };
+    let output_idx: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let fps: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(60);
+    let encoder = match args.get(5).map(String::as_str) {
+        Some("nvenc") => encode::Encoder::Nvenc,
+        Some("amf") => encode::Encoder::Amf,
+        Some("qsv") => encode::Encoder::Qsv,
+        _ => detect_default_encoder(),
+    };
+    // Capture backend: ddagrab (DXGI Desktop Duplication, self-pacing) by
+    // default; `wgc` uses Windows.Graphics.Capture (captures IddCx virtual
+    // displays + by HMONITOR regardless of adapter — needed on the headless
+    // AMD rig where ddagrab can't reach the virtual display's adapter).
+    let capture = match args.get(6).map(String::as_str) {
+        Some("wgc") => CaptureBackend::Wgc,
+        Some("wgc-zc") => CaptureBackend::WgcZc,
+        _ => CaptureBackend::Dda,
+    };
+    // The zero-copy path IS the NVENC SDK; the qsv/amf ffmpeg encoders
+    // have no in-process equivalent here.
+    if matches!(capture, CaptureBackend::WgcZc) && !matches!(encoder, encode::Encoder::Nvenc) {
+        anyhow::bail!("wgc-zc requires the nvenc encoder");
+    }
+    run_stream(bind, output_idx, fps, encoder, capture)
 }
 
 /// Which capture source feeds the encoder.
@@ -666,10 +678,42 @@ fn run_stream(
     // the Linux compositor uses, mirroring the live PIN/outcome into `status`
     // (the ~4 Hz refresh above preserves that field). This is what makes the
     // panel's Pair button work on Windows instead of the raw `pharos-host pair`
-    // CLI. Its listener is opened on demand by StartPairing, off any render loop.
+    // CLI. The panel StartPairing path still opens on-demand windows off any
+    // render loop; the always-open listener below covers the headless operator.
     // announce_mdns = false: this host advertises process-wide below (`_mdns`);
     // a second registration would conflict-rename to "… (2)" on clients.
     let pairing = host_core::pairing::PairingManager::new(status.clone(), false);
+    // Always-open, host-lifetime pairing (issue #17): bring up a PIN-bearing
+    // listener at startup so a fresh Trireme can pair with no panel and no
+    // separate `pharos-host pair` terminal. It keeps accepting devices (rotating
+    // the PIN) until the process exits or the brute-force lockout trips.
+    match pairing.start_host_lifetime(None) {
+        Ok(()) => {
+            info!("always-open pairing listener up (issue #17)");
+            // Surface the PIN + discovery facts to a headless operator who has
+            // only this console (the panel/tray read it from HostStatus.pairing).
+            // The first PIN is minted synchronously by start_host_lifetime, so
+            // it's already in `status` here; the listener rotates it after each
+            // device (see the panel/tray for the live value).
+            let pin = status
+                .lock()
+                .ok()
+                .and_then(|s| s.pairing.as_ref().and_then(|p| p.pin.clone()));
+            match pin {
+                Some(pin) => info!(
+                    "pairing PIN: {pin} — enter on Trireme; discoverable on {} as this host; stream port {}",
+                    host_core::pair::MDNS_SERVICE_TYPE,
+                    bind.port()
+                ),
+                None => info!(
+                    "pairing open; discoverable on {}; stream port {}",
+                    host_core::pair::MDNS_SERVICE_TYPE,
+                    bind.port()
+                ),
+            }
+        }
+        Err(e) => warn!("always-open pairing listener not started: {e}"),
+    }
     let ctrl_addr = std::net::SocketAddr::from(([0, 0, 0, 0], core_proto::ports::CONTROL));
     match control_ipc::tcp_bind(ctrl_addr) {
         Ok(listener) => {
@@ -791,9 +835,9 @@ fn run_stream(
 
     // Advertise over mDNS so a fresh Trireme lists this host with no typed IP
     // (issue #17). The service is the pairing port; the `stream` TXT carries this
-    // host's *actual* stream port (`bind`, i.e. WIN_STREAM by default) so the
-    // client self-configures rather than assuming the Linux 15777. Held for the
-    // process lifetime — dropping `_mdns` withdraws the broadcast.
+    // host's *actual* stream port (`bind`, the unified STREAM 15777 by default,
+    // issue #17) so the client self-configures. Held for the process lifetime —
+    // dropping `_mdns` withdraws the broadcast.
     let _mdns = {
         let pair_addr = std::net::SocketAddr::from(([0, 0, 0, 0], core_proto::ports::PAIR));
         match host_core::pair::advertise(pair_addr, &identity, bind.port()) {

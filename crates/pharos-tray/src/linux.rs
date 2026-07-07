@@ -16,7 +16,8 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::{
-    detect_state, find_panel, host_launcher, open_panel, rasterize_rgba, State, POLL_INTERVAL,
+    detect_pairing, detect_state, find_panel, host_launcher, open_panel, rasterize_rgba,
+    PairingHint, State, POLL_INTERVAL,
 };
 
 /// SNI lets the host pick the closest pixmap; ship a tray-sized 22px and a 2×
@@ -85,6 +86,9 @@ enum Action {
 
 struct LighthouseTray {
     state: State,
+    /// Current pairing line (issue #17): the live PIN, a lockout note, or `None`
+    /// when there's nothing pairing-related to show. Rendered as a menu label.
+    pairing: Option<PairingHint>,
     icons: StateIcons,
     /// `None` = no panel binary found → omit the "Open Panel" entry.
     panel_path: Option<PathBuf>,
@@ -117,6 +121,19 @@ impl Tray for LighthouseTray {
     }
     fn menu(&self) -> Vec<MenuItem<Self>> {
         let mut items: Vec<MenuItem<Self>> = Vec::new();
+        // Pairing line (issue #17): a non-clickable label showing the live PIN
+        // (or a lockout note) so a device can be paired straight from the tray.
+        if let Some(hint) = &self.pairing {
+            items.push(
+                StandardItem {
+                    label: hint.label(),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
+            items.push(MenuItem::Separator);
+        }
         if self.panel_path.is_some() {
             items.push(
                 StandardItem {
@@ -174,6 +191,7 @@ async fn async_main() -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Action>();
     let tray = LighthouseTray {
         state: State::Offline,
+        pairing: None,
         icons,
         panel_path: panel_path.clone(),
         tx,
@@ -189,29 +207,27 @@ async fn async_main() -> Result<()> {
     // signals each tick.
     let poll_handle = handle.clone();
     let poller = tokio::spawn(async move {
-        let mut last = State::Offline;
-        // Prime the icon immediately rather than waiting one interval.
-        let first = tokio::task::spawn_blocking(detect_state)
-            .await
-            .unwrap_or(State::Offline);
-        if first != last {
-            let _ = poll_handle
-                .update(|t: &mut LighthouseTray| t.state = first)
-                .await;
-            last = first;
-        }
+        // Track both the icon state and the pairing line so a PIN rotation (or a
+        // lockout) re-renders the menu even when the icon state is unchanged.
+        let mut last: (State, Option<PairingHint>) = (State::Offline, None);
         loop {
-            tokio::time::sleep(POLL_INTERVAL).await;
-            let s = tokio::task::spawn_blocking(detect_state)
+            let snap = tokio::task::spawn_blocking(|| (detect_state(), detect_pairing()))
                 .await
-                .unwrap_or(State::Offline);
-            if s != last {
-                info!("state {:?} -> {:?}", last, s);
+                .unwrap_or((State::Offline, None));
+            if snap != last {
+                if snap.0 != last.0 {
+                    info!("state {:?} -> {:?}", last.0, snap.0);
+                }
+                let s = snap.clone();
                 let _ = poll_handle
-                    .update(|t: &mut LighthouseTray| t.state = s)
+                    .update(move |t: &mut LighthouseTray| {
+                        t.state = s.0;
+                        t.pairing = s.1;
+                    })
                     .await;
-                last = s;
+                last = snap;
             }
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
     });
 

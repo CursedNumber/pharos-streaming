@@ -29,6 +29,15 @@ use transport::pair_proto::PairMsg;
 /// and pairing's own bidi rides on the same UDP socket.
 pub const MDNS_SERVICE_TYPE: &str = "_pharos._udp.local.";
 
+/// How many *consecutive* failed pairing attempts trip the brute-force lockout:
+/// past this the listener stops and pairing stays down until the host is
+/// relaunched (issue #17). A successful pair resets the counter, so a household
+/// fumbling the PIN a few times before it pairs is never locked out; only a
+/// sustained wrong-PIN run trips it. Overridable at runtime with
+/// `PHAROS_PAIR_MAX_FAILURES` (so the lockout is testable without 8 real
+/// handshakes); a parse error or an absent var falls back to this const.
+pub const MAX_PAIR_FAILURES: u32 = 8;
+
 /// File the host writes after each successful pairing. Mirrors Trireme's
 /// `servers.toml` — there it's "which hosts do I know?", here it's "which
 /// clients may connect to me?".
@@ -226,6 +235,17 @@ pub fn sync_primary_to_transport() {
     transport::set_primary_peer(pk);
 }
 
+/// Resolve the brute-force lockout cap from the optional `PHAROS_PAIR_MAX_FAILURES`
+/// value: a valid non-zero count overrides [`MAX_PAIR_FAILURES`]; anything absent,
+/// unparseable, or zero (which would lock out before the first attempt) falls back
+/// to the const. Factored out of `run_loop` so the parse rule is unit-testable.
+fn pair_failure_cap(env_val: Option<&str>) -> u32 {
+    env_val
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(MAX_PAIR_FAILURES)
+}
+
 /// A fresh random six-digit pairing PIN. Public so the compositor's
 /// `PairingManager` can mint the first PIN synchronously (and surface it to the
 /// panel) before the listener thread starts rotating it.
@@ -252,6 +272,11 @@ pub enum PairEvent {
     },
     /// A pairing attempt failed (wrong PIN, protocol mismatch, hang-up, …).
     Failed { reason: String },
+    /// Too many *consecutive* failed attempts ([`MAX_PAIR_FAILURES`], or the
+    /// `PHAROS_PAIR_MAX_FAILURES` override): the listener is shutting down and
+    /// pairing stays locked until the host is relaunched (issue #17). Emitted
+    /// once, immediately before the trailing [`PairEvent::Stopped`].
+    LockedOut { attempts: u32 },
     /// The listener loop exited (cancelled or the endpoint died).
     Stopped,
 }
@@ -340,6 +365,9 @@ pub fn run(addr: SocketAddr) -> Result<()> {
                 info!("paired with {pubkey_hex} ({alias:?})")
             }
             PairEvent::Failed { reason } => warn!("pairing failed: {reason}"),
+            PairEvent::LockedOut { attempts } => warn!(
+                "pairing locked out after {attempts} failed attempts; relaunch the host to re-enable"
+            ),
             PairEvent::Stopped => info!("pair listener stopped"),
         },
     )
@@ -439,6 +467,14 @@ async fn run_loop(
     };
 
     let peers_path = peers_path()?;
+    // Brute-force lockout cap (issue #17): `PHAROS_PAIR_MAX_FAILURES` overrides
+    // the compiled-in default, so the lockout can be exercised in a test without
+    // eight real handshakes. A parse error or an absent var falls back to the
+    // const.
+    let max_failures = pair_failure_cap(std::env::var("PHAROS_PAIR_MAX_FAILURES").ok().as_deref());
+    // Count of *consecutive* failed attempts; reset to 0 on a successful pair so
+    // only a sustained wrong-PIN run trips the lockout.
+    let mut failures: u32 = 0;
     // One PIN per "round" — valid for the next client that connects, rotated
     // after each handshake (success or fail) so a guess can't be replayed.
     let mut pin = initial_pin;
@@ -511,9 +547,14 @@ async fn run_loop(
                     alias,
                 });
                 paired_ok = true;
+                // A good pair clears the consecutive-failure run: a device that
+                // finally pairs must not leave a partial count that later locks
+                // out the next device the household adds.
+                failures = 0;
             }
             Ok(Err(e)) => {
                 warn!("pairing failed: {e:?}");
+                failures += 1;
                 // Best-effort abort message; ignore I/O errors.
                 let _ = link
                     .send_msg(&PairMsg::Abort {
@@ -526,6 +567,7 @@ async fn run_loop(
             }
             Err(_elapsed) => {
                 warn!("pairing handshake from {peer_addr} timed out");
+                failures += 1;
                 let _ = link
                     .send_msg(&PairMsg::Abort {
                         reason: "handshake timed out".into(),
@@ -538,6 +580,18 @@ async fn run_loop(
         }
         // Tidy close; ignore errors — peer may have hung up already.
         let _ = tokio::time::timeout(Duration::from_secs(1), link.close()).await;
+        // Brute-force lockout (issue #17): once the *consecutive* failure count
+        // reaches the cap, stop the listener and stay down until the host is
+        // relaunched. `LockedOut` lets the manager latch the "relaunch to
+        // re-enable" state; breaking falls through to the `Stopped` event below.
+        if failures >= max_failures {
+            warn!(
+                "pairing locked out after {failures} consecutive failed attempts; \
+                 relaunch the host to re-enable pairing"
+            );
+            on_event(PairEvent::LockedOut { attempts: failures });
+            break;
+        }
         // One-shot mode (the GUI pairs one device at a time): stop after a
         // successful pairing rather than rotating the PIN for the next device.
         // The CLI passes `stop_after_pair = false` and keeps accepting devices.
@@ -776,6 +830,7 @@ mod tests {
     //! run in parallel with no config-dir or transport-global coupling.
 
     use super::*;
+    use std::net::Ipv4Addr;
     use std::sync::atomic::AtomicU32;
 
     static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -898,5 +953,131 @@ mod tests {
         forget_peer_at(&path, &hexk).unwrap();
         assert!(!auth(Some(pk)), "forgotten peer must be denied");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn failure_cap_env_override_rules() {
+        // Absent / unparseable / zero → the compiled-in default; a valid non-zero
+        // count overrides it (the testability lever for the lockout).
+        assert_eq!(pair_failure_cap(None), MAX_PAIR_FAILURES);
+        assert_eq!(pair_failure_cap(Some("")), MAX_PAIR_FAILURES);
+        assert_eq!(pair_failure_cap(Some("nope")), MAX_PAIR_FAILURES);
+        assert_eq!(pair_failure_cap(Some("0")), MAX_PAIR_FAILURES);
+        assert_eq!(pair_failure_cap(Some("2")), 2);
+        assert_eq!(pair_failure_cap(Some(" 3 ")), 3);
+    }
+
+    /// The full lockout path (issue #17): drive the real `run_loop` with a cap of
+    /// 2 and two clients that connect then hang up mid-handshake. After the second
+    /// failure the loop must emit `LockedOut { attempts: 2 }` and stop on its own
+    /// (no cancel). Uses the `PHAROS_PAIR_MAX_FAILURES` override so it needs two
+    /// failures, not eight. Env vars are process-global; the SEQ-suffixed
+    /// `PHAROS_CONFIG_DIR` isolates the peers path, and no other test in this crate
+    /// sets `PHAROS_PAIR_MAX_FAILURES`.
+    #[test]
+    fn run_loop_locks_out_after_cap_failures() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+
+        // Isolate the config dir so run_loop's peers_path() doesn't touch the real
+        // one, and set the low cap.
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let cfg_dir =
+            std::env::temp_dir().join(format!("pharos-lockout-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::env::set_var("PHAROS_CONFIG_DIR", &cfg_dir);
+        std::env::set_var("PHAROS_PAIR_MAX_FAILURES", "2");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let events: Arc<Mutex<Vec<PairEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev_sink = events.clone();
+
+        rt.block_on(async move {
+            // Bind an ephemeral pairing listener on loopback.
+            let addr: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+            let endpoint = transport::pair_listen(addr).unwrap();
+            let bound = endpoint.local_addr().unwrap();
+            drop(endpoint); // run_loop binds its own; free the port immediately.
+
+            let identity = Identity::generate();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let on_event = move |ev: PairEvent| ev_sink.lock().unwrap().push(ev);
+
+            // The listener task: no stop_after_pair, no window cap, no mDNS.
+            let server = tokio::spawn(run_loop(
+                bound,
+                identity,
+                generate_pin(),
+                cancel.clone(),
+                false,
+                None,
+                false,
+                on_event,
+            ));
+
+            // Two failing attempts. Each: connect, send a well-formed HelloPair so
+            // the host advances into the handshake (and sends HelloAck, which
+            // flushes our stream), then Abort so the host's next recv bails → a
+            // Failed round. Awaiting the HelloAck is what forces our data out and
+            // keeps the connection open until the host has seen the attempt.
+            for _ in 0..2 {
+                // Retry the connect briefly while the server rebinds the socket.
+                let mut link = None;
+                for _ in 0..50 {
+                    match transport::pair_connect(&[bound]).await {
+                        Ok(l) => {
+                            link = Some(l);
+                            break;
+                        }
+                        Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+                    }
+                }
+                let mut link = link.expect("client connect");
+                link.send_msg(&PairMsg::HelloPair {
+                    version: PAIRING_PROTOCOL_VERSION,
+                    client_pubkey: [0x42; 32],
+                    alias: Some("lockout-test".into()),
+                })
+                .await
+                .expect("send HelloPair");
+                // Wait for the host's HelloAck: proves the round reached the
+                // handshake, and flushes our HelloPair.
+                let _ = link.recv_msg().await;
+                // Now bail; the host's step-3 recv sees this Abort → Failed round.
+                let _ = link
+                    .send_msg(&PairMsg::Abort {
+                        reason: "test".into(),
+                    })
+                    .await;
+                let _ = link.close().await;
+                // Give the host time to finish this round before the next connect.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+
+            // The loop should end on its own once the cap is hit.
+            let _ = tokio::time::timeout(Duration::from_secs(10), server).await;
+        });
+
+        std::env::remove_var("PHAROS_PAIR_MAX_FAILURES");
+        std::env::remove_var("PHAROS_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&cfg_dir);
+
+        let evs = events.lock().unwrap();
+        let locked = evs
+            .iter()
+            .find_map(|e| match e {
+                PairEvent::LockedOut { attempts } => Some(*attempts),
+                _ => None,
+            })
+            .expect("run_loop must emit LockedOut once the cap is reached");
+        assert_eq!(locked, 2, "locked out at the configured cap");
+        assert!(
+            matches!(evs.last(), Some(PairEvent::Stopped)),
+            "LockedOut is followed by Stopped: {evs:?}"
+        );
     }
 }

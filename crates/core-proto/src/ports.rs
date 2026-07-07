@@ -19,10 +19,12 @@ pub const STREAM_LEGACY: u16 = 4433;
 /// USB/IP import listener (`pharos-usbimport`); the client's export target.
 pub const USBIP: u16 = 4434;
 
-/// Windows host stream (`pharos-host stream`).
-pub const WIN_STREAM: u16 = 4435;
-
-/// Current QUIC stream port — the single deliberate LAN+WAN port.
+/// Current QUIC stream port — the single deliberate LAN+WAN port. Both hosts
+/// bind it by default now: the Windows host's old `WIN_STREAM` (4435) was
+/// unified onto this canonical port (issue #17) so the firewall/WAN rules that
+/// already allow 15777 cover it too. A client that had manually saved a Windows
+/// host at :4435 must update to :15777; mDNS-discovered hosts carry the new
+/// port automatically.
 pub const STREAM: u16 = 15777;
 
 /// TCP control plane (panel ⟷ host) for hosts reached over the network — the

@@ -140,6 +140,55 @@ fn detect_state() -> State {
     State::from_status(connected, status.as_ref(), faulted_offline)
 }
 
+/// The pairing line shown in the tray menu (issue #17): the current PIN while a
+/// listener is open, or a "locked" note if the brute-force lockout tripped.
+/// `None` = nothing pairing-related to show (no PIN, no lockout).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PairingHint {
+    /// A listener is open; show the six-digit PIN to enter on the Trireme.
+    Pin(String),
+    /// The lockout tripped: pairing is down until the host is relaunched.
+    Locked,
+}
+
+impl PairingHint {
+    /// The menu-item label for this hint.
+    fn label(&self) -> String {
+        match self {
+            PairingHint::Pin(pin) => format!("Pairing PIN: {pin}"),
+            PairingHint::Locked => "Pairing locked (relaunch host)".to_string(),
+        }
+    }
+}
+
+/// Map a [`control_ipc::PairingState`] to the tray's pairing line. Pure so it's
+/// unit-testable without a live control plane. A live PIN wins; otherwise a
+/// `Failed` outcome whose reason names the lockout shows the locked note; a
+/// closed window with no PIN and no lockout shows nothing.
+fn pairing_hint_from(p: Option<&control_ipc::PairingState>) -> Option<PairingHint> {
+    let p = p?;
+    if let Some(pin) = p.pin.as_ref() {
+        return Some(PairingHint::Pin(pin.clone()));
+    }
+    // No live PIN: surface the lockout (the host latches it as a Failed outcome
+    // whose reason starts with "pairing locked"), else nothing.
+    match &p.last {
+        Some(control_ipc::PairOutcome::Failed { reason })
+            if reason.starts_with("pairing locked") =>
+        {
+            Some(PairingHint::Locked)
+        }
+        _ => None,
+    }
+}
+
+/// The current pairing hint from the cached control link (issue #17).
+fn detect_pairing() -> Option<PairingHint> {
+    let h = control_ipc::client::handle();
+    let status = h.status();
+    pairing_hint_from(status.as_ref().and_then(|s| s.pairing.as_ref()))
+}
+
 /// One rasterized icon as straight RGBA (premultiplied, per tiny-skia). The
 /// Linux backend byte-swaps this into SNI's ARGB; the Windows backend feeds it
 /// to `tray_icon::Icon::from_rgba` directly.
@@ -231,6 +280,60 @@ fn host_launcher() -> String {
         .unwrap_or(raw)
         .to_string_lossy()
         .into_owned()
+}
+
+#[cfg(test)]
+mod pairing_hint_tests {
+    use super::{pairing_hint_from, PairingHint};
+    use control_ipc::{PairOutcome, PairingState};
+
+    fn state(pin: Option<&str>, last: Option<PairOutcome>) -> PairingState {
+        PairingState {
+            active: pin.is_some(),
+            addr: "0.0.0.0:4432".into(),
+            pin: pin.map(str::to_string),
+            last,
+        }
+    }
+
+    #[test]
+    fn none_when_no_pairing_field() {
+        assert_eq!(pairing_hint_from(None), None);
+    }
+
+    #[test]
+    fn live_pin_wins() {
+        let s = state(Some("123456"), None);
+        assert_eq!(
+            pairing_hint_from(Some(&s)),
+            Some(PairingHint::Pin("123456".into()))
+        );
+    }
+
+    #[test]
+    fn lockout_shows_locked_note_when_no_pin() {
+        // The host latches the lockout as a Failed outcome whose reason names it.
+        let s = state(
+            None,
+            Some(PairOutcome::Failed {
+                reason: "pairing locked: 8 failed attempts; relaunch the host to re-enable".into(),
+            }),
+        );
+        assert_eq!(pairing_hint_from(Some(&s)), Some(PairingHint::Locked));
+    }
+
+    #[test]
+    fn ordinary_failure_is_not_a_lockout() {
+        // A plain wrong-PIN failure (listener still open, no PIN yet mid-rotation)
+        // must not read as locked.
+        let s = state(
+            None,
+            Some(PairOutcome::Failed {
+                reason: "protocol version mismatch".into(),
+            }),
+        );
+        assert_eq!(pairing_hint_from(Some(&s)), None);
+    }
 }
 
 #[cfg(test)]

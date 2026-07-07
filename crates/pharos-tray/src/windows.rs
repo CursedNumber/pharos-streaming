@@ -17,7 +17,7 @@ use tracing::{info, warn};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-use crate::{detect_state, find_panel, open_panel, State, POLL_INTERVAL};
+use crate::{detect_pairing, detect_state, find_panel, open_panel, PairingHint, State, POLL_INTERVAL};
 
 /// Build a `tray-icon` icon from the shared RGBA raster at a tray-friendly size.
 fn icon_for(state: State) -> Result<Icon> {
@@ -34,10 +34,16 @@ pub fn run() -> Result<()> {
 
     let event_loop = EventLoopBuilder::new().build();
 
-    // Build the menu: "Open Panel" (only when a panel binary is resolvable) +
-    // "Exit Pharos". The MenuIds are cloned out so we can match clicks after the
-    // menu itself is moved into the tray.
+    // Build the menu: an informational pairing line (issue #17), "Open Panel"
+    // (only when a panel binary is resolvable) + "Exit Pharos". The MenuIds are
+    // cloned out so we can match clicks after the menu itself is moved into the
+    // tray.
     let menu = Menu::new();
+    // Pairing line: a disabled label whose text tracks the live PIN / lockout.
+    // Kept out of `menu_slot`'s move so we can update it from the loop.
+    let pairing_item = MenuItem::new("", false, None);
+    menu.append(&pairing_item).context("append pairing line")?;
+    menu.append(&PredefinedMenuItem::separator()).ok();
     let open_id: Option<MenuId> = if panel_path.is_some() {
         let it = MenuItem::new("Open Panel", true, None);
         menu.append(&it).context("append Open Panel")?;
@@ -50,17 +56,19 @@ pub fn run() -> Result<()> {
     menu.append(&exit).context("append Exit")?;
     let exit_id = exit.id().clone();
 
-    // Background poller -> state channel (send only on change).
-    let (state_tx, state_rx) = mpsc::channel::<State>();
+    // Background poller -> state channel (send only on change). Carries both the
+    // icon state and the pairing line (issue #17) so a PIN rotation re-renders
+    // even when the icon state is unchanged.
+    let (state_tx, state_rx) = mpsc::channel::<(State, Option<PairingHint>)>();
     std::thread::Builder::new()
         .name("pharos-tray-poll".into())
         .spawn(move || {
-            let mut last = State::Offline;
+            let mut last: (State, Option<PairingHint>) = (State::Offline, None);
             loop {
-                let s = detect_state();
-                if s != last {
-                    let _ = state_tx.send(s);
-                    last = s;
+                let snap = (detect_state(), detect_pairing());
+                if snap != last {
+                    let _ = state_tx.send(snap.clone());
+                    last = snap;
                 }
                 std::thread::sleep(POLL_INTERVAL);
             }
@@ -100,8 +108,18 @@ pub fn run() -> Result<()> {
             }
         }
 
-        // Apply any pending state change to the live icon + tooltip.
-        while let Ok(s) = state_rx.try_recv() {
+        // Apply any pending state change to the live icon + tooltip + pairing line.
+        while let Ok((s, hint)) = state_rx.try_recv() {
+            // Pairing line: show the PIN / lockout label, or hide when there's
+            // nothing to show. `tray-icon` has no per-item hide, so an empty
+            // string + disabled reads as a blank spacer.
+            match &hint {
+                Some(h) => {
+                    pairing_item.set_text(h.label());
+                    pairing_item.set_enabled(false);
+                }
+                None => pairing_item.set_text(""),
+            }
             if s != last_state {
                 info!("state {:?} -> {:?}", last_state, s);
                 last_state = s;
