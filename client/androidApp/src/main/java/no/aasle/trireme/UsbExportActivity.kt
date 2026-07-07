@@ -91,6 +91,10 @@ class UsbExportActivity : ComponentActivity() {
                 ExportScreen(
                     engine = engine,
                     pharos = pharos,
+                    // Give the user a way back to the main Trireme shell: this screen
+                    // is reached standalone (USB attach / Settings), so without it the
+                    // only exit is leaving the app. Reuses the running MainActivity.
+                    onOpenTrireme = { bounceToStream() },
                     initialUsbIp = store.usbIpEnabled(),
                     onSetUsbIp = { on ->
                         store.setUsbIpEnabled(on)
@@ -174,6 +178,7 @@ class UsbExportActivity : ComponentActivity() {
 private fun ExportScreen(
     engine: UsbExportEngine,
     pharos: String,
+    onOpenTrireme: () -> Unit,
     initialUsbIp: Boolean,
     onSetUsbIp: (Boolean) -> Unit,
     onToggle: (DeviceRow) -> Unit,
@@ -191,12 +196,27 @@ private fun ExportScreen(
     val rows by engine.rows
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().safeDrawingPadding().padding(16.dp)) {
-            Text(
-                if (pharos.isBlank()) "Trireme — share USB with the host"
-                else "Trireme — share USB with $pharos",
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onSurface,
-            )
+            // Header: screen title, plus a nav button back to the main Trireme shell
+            // (the whole pill is its own D-pad target; see lesson-compose-tv-focus).
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    if (pharos.isBlank()) "Trireme — share USB with the host"
+                    else "Trireme — share USB with $pharos",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.width(12.dp))
+                ActionPill(
+                    label = "Open Trireme",
+                    emphasized = true,
+                    emphasisColor = MaterialTheme.colorScheme.primary,
+                    onClick = onOpenTrireme,
+                )
+            }
             Spacer(Modifier.padding(4.dp))
             // Master switch (default off): with it off nothing is forwarded and no
             // plug-in prompts fire. The whole row is the single D-pad target.
