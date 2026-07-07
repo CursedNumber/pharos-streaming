@@ -47,6 +47,10 @@ postcard = { version = "1", features = ["use-std"] }
 thiserror = "2"
 uniffi = "0.28"
 core-proto = { path = "crates/core-proto" }
+# Cross-platform gamepad capture for the desktop Trireme client (issue #14):
+# evdev on Linux, XInput/DInput on Windows, so one poll loop serves both host
+# targets. Non-async; driven from a dedicated std::thread in trireme's gamepad.rs.
+gilrs = "0.11"
 
 # Local override of the (MIT) NVENC bindings crate. Upstream 0.4.0 (the latest
 # published version) seals the encoder handle and ships no `reconfigure` wrapper,

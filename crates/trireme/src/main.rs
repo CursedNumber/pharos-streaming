@@ -19,6 +19,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result};
 
 mod discover;
+mod gamepad;
 mod input;
 mod menu;
 mod pair;

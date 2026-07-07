@@ -16,6 +16,8 @@ transport = { path = "../transport" }
 # Input event wire types (re-exported via transport, but used directly by the
 # filter/classify path in `input.rs`).
 core-proto = { path = "../core-proto" }
+# Cross-platform gamepad capture (issue #14): Linux evdev + Windows XInput/DInput.
+gilrs = { workspace = true }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

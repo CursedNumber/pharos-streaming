@@ -1187,6 +1187,14 @@ struct App {
     /// `true` while the window is minimized/occluded — rendering is skipped so we
     /// don't churn the GPU presenting frames nobody can see.
     suspended: bool,
+    /// Reconnect-safe target for the desktop gamepad capture thread (issue #14).
+    /// The capture thread (spawned once in `resumed`) writes canonical Gamepad*
+    /// events here; we keep it pointed at the ACTIVE source's `input_tx`. It is a
+    /// shared `Option<Sender>` and not a bare `Sender` because `input_tx` is
+    /// re-created on every (re)connect — handing the thread a `Sender` by value
+    /// would leave pads dead after the first blip. `None` means "don't forward":
+    /// either no source is connected, or `CaptureMode::Off` has muted input.
+    gamepad_sink: crate::gamepad::GamepadSink,
 }
 
 impl App {
@@ -1275,6 +1283,11 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
+            // Point the gamepad sink at the freshly-connected active source, then
+            // spawn the capture thread ONCE (issue #14). The thread outlives every
+            // reconnect; only the shared sink is re-pointed as sources cycle.
+            self.refresh_gamepad_sink();
+            crate::gamepad::run_gamepad_capture(self.gamepad_sink.clone());
         }
     }
 
@@ -1321,6 +1334,7 @@ impl ApplicationHandler<UserEvent> for App {
                         RECONNECT_BACKOFF
                     );
                 }
+                self.refresh_gamepad_sink(); // pads mute until the source is back
                 let proxy = self.proxy.clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(RECONNECT_BACKOFF);
@@ -1333,6 +1347,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(s) = self.sources.get_mut(i) {
                     s.input_tx = None; // back-channel is dead either way
                 }
+                self.refresh_gamepad_sink(); // pads mute while refused
                 let name = self
                     .sources
                     .get(i)
@@ -1397,6 +1412,7 @@ impl ApplicationHandler<UserEvent> for App {
                             s.input_tx = tx;
                             s.taps = taps;
                         }
+                        self.refresh_gamepad_sink(); // re-point pads at the new channel
                         tracing::info!("source[{i}] ({name}) reconnecting on {addr}");
                     }
                     Err(e) => {
@@ -1496,6 +1512,30 @@ impl App {
             CaptureMode::Always => true,
             CaptureMode::Toggle => self.capture_toggle_on,
             CaptureMode::Focus => self.focused && self.cursor_cell.is_some(),
+        }
+    }
+
+    /// Re-point the gamepad capture thread's sink at the source it should drive,
+    /// or clear it (issue #14). Called at every site that (re)assigns or clears a
+    /// source's `input_tx` — spawn, reconnect, stream-end/refuse — so a pad keeps
+    /// working across reconnects even though the underlying channel is recreated.
+    ///
+    /// Pads forward whenever a source is CONNECTED regardless of window focus
+    /// (matching Android and player expectation), so this deliberately does NOT
+    /// consult `capture_active()`'s focus/cursor logic — only the hard
+    /// `CaptureMode::Off` mute, which clears the sink to `None`. The single-stream
+    /// case uses source 0 (the same fallback `send_to_active` uses); its channel
+    /// is the one the pads should reach.
+    fn refresh_gamepad_sink(&self) {
+        use crate::input::CaptureMode;
+        let muted = matches!(self.cfg.input.mode, CaptureMode::Off);
+        let tx = if muted {
+            None
+        } else {
+            self.sources.first().and_then(|s| s.input_tx.clone())
+        };
+        if let Ok(mut guard) = self.gamepad_sink.lock() {
+            *guard = tx;
         }
     }
 
@@ -2468,6 +2508,7 @@ pub fn run(cfg: PlayerCfg) -> Result<()> {
         capture_toggle_on: false,
         fullscreen: false,
         suspended: false,
+        gamepad_sink: Arc::new(Mutex::new(None)),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
