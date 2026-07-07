@@ -750,7 +750,19 @@ fn pairing_card(ui: &mut egui::Ui, state: &mut PanelState) {
                     ui.add_space(4.0);
                     ui.label(RichText::new(tr("overview.pairing.waiting")).weak());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
+                        // The always-open, host-lifetime listener (issue #17) is a
+                        // permanent host property: it can't be cancelled from the
+                        // panel (the host no-ops a Cancel), so don't present a
+                        // misleading Cancel button. Show an "always on" note
+                        // instead; only a real panel-opened window gets Cancel.
+                        if p.always_on {
+                            ui.label(
+                                RichText::new(tr("overview.pairing.always_on"))
+                                    .small()
+                                    .weak(),
+                            )
+                            .describe(tr("overview.pairing.always_on_desc"));
+                        } else if ui
                             .button(format!("{}  {}", ph::X, tr("overview.pairing.cancel")))
                             .describe(tr("overview.pairing.cancel_desc"))
                             .clicked()

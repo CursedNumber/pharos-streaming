@@ -817,6 +817,14 @@ pub struct PairingState {
     /// stays open for the next device.
     #[serde(default)]
     pub last: Option<PairOutcome>,
+    /// True when this is the host's always-open, host-lifetime pairing listener
+    /// (issue #17): it is a permanent host property that a panel Cancel cannot
+    /// tear down, so the panel shows an informational "pairing is always on"
+    /// state instead of a misleading Cancel button. `#[serde(default)]` keeps
+    /// older hosts (which never set it) deserializing as a normal, cancellable
+    /// window.
+    #[serde(default)]
+    pub always_on: bool,
 }
 
 /// The outcome of one pairing attempt, surfaced in [`PairingState::last`].
@@ -1469,6 +1477,7 @@ mod tests {
                     pubkey: "abcd".into(),
                     alias: Some("living-room".into()),
                 }),
+                always_on: false,
             }),
             controllers: vec![ControllerStatus {
                 vendor: 0x057e,

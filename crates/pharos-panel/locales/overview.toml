@@ -445,6 +445,14 @@ nb = "Avbryt"
 en = "Close the pairing window and stop the listener."
 nb = "Lukk paringsvinduet og stopp lytteren."
 
+["overview.pairing.always_on"]
+en = "Pairing is always on"
+nb = "Paring er alltid på"
+
+["overview.pairing.always_on_desc"]
+en = "This host keeps a pairing listener open for its whole lifetime, so a device can pair at any time; there's nothing to cancel. The PIN rotates after each device."
+nb = "Denne verten holder en paringslytter åpen hele levetiden, så en enhet kan pares når som helst; det er ingenting å avbryte. PIN-en roterer etter hver enhet."
+
 ["overview.pairing.connecting"]
 en = "Device connecting from"
 nb = "Enhet kobler til fra"

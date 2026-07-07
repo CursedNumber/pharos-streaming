@@ -255,6 +255,45 @@ pub fn generate_pin() -> String {
     format!("{n:06}")
 }
 
+/// Why a pairing handshake failed, so [`run_loop`] can decide whether the
+/// attempt should advance the brute-force lockout counter (issue #17). ONLY a
+/// genuine wrong-PIN guess (the SPAKE2 key-confirmation MAC didn't verify)
+/// counts toward the lockout: a malformed/protocol/version/abort/transport
+/// failure or a handshake timeout is junk traffic any LAN peer can spew without
+/// knowing a PIN, and must not be able to latch the "relaunch to re-enable"
+/// lockout on the always-open listener. See [`handle_one`].
+#[derive(Debug)]
+enum HandshakeError {
+    /// The peer completed the SPAKE2 exchange but its confirmation MAC didn't
+    /// verify: a real brute-force PIN guess ([`PairingError::ConfirmationFailed`]).
+    /// The ONLY failure that advances the lockout counter.
+    WrongPin(anyhow::Error),
+    /// Anything else: malformed message, version mismatch, client abort,
+    /// transport error, etc. Reported (telemetry/status) but never counted.
+    Other(anyhow::Error),
+}
+
+impl HandshakeError {
+    /// The wrapped error, for the `Failed { reason }` event / logs; the variant
+    /// (not this text) decides lockout counting.
+    fn as_err(&self) -> &anyhow::Error {
+        match self {
+            HandshakeError::WrongPin(e) | HandshakeError::Other(e) => e,
+        }
+    }
+    /// True only for a completed-exchange wrong-PIN guess: the sole failure that
+    /// advances the lockout counter.
+    fn is_wrong_pin(&self) -> bool {
+        matches!(self, HandshakeError::WrongPin(_))
+    }
+}
+
+impl std::fmt::Display for HandshakeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_err())
+    }
+}
+
 /// An event the pair listener emits as it runs, so an embedder (the compositor's
 /// `PairingManager`) can surface the live PIN + attempt outcomes to the panel.
 /// The CLI [`run`] maps these straight back to the stdout banner + `tracing`.
@@ -472,8 +511,9 @@ async fn run_loop(
     // eight real handshakes. A parse error or an absent var falls back to the
     // const.
     let max_failures = pair_failure_cap(std::env::var("PHAROS_PAIR_MAX_FAILURES").ok().as_deref());
-    // Count of *consecutive* failed attempts; reset to 0 on a successful pair so
-    // only a sustained wrong-PIN run trips the lockout.
+    // Count of *consecutive* wrong-PIN attempts (only a completed-exchange PIN
+    // mismatch counts; see the `Ok(Err(..))` arm below); reset to 0 on a
+    // successful pair so only a sustained wrong-PIN run trips the lockout.
     let mut failures: u32 = 0;
     // One PIN per "round" — valid for the next client that connects, rotated
     // after each handshake (success or fail) so a guess can't be replayed.
@@ -552,22 +592,36 @@ async fn run_loop(
                 // out the next device the household adds.
                 failures = 0;
             }
-            Ok(Err(e)) => {
-                warn!("pairing failed: {e:?}");
-                failures += 1;
+            Ok(Err(he)) => {
+                // Only a genuine wrong-PIN guess (the peer completed the SPAKE2
+                // exchange and its confirmation MAC didn't verify) advances the
+                // brute-force lockout counter (issue #17). Malformed/protocol/
+                // version/abort/transport failures are junk any LAN peer can
+                // send without a PIN, so they're reported but NOT counted; that
+                // removes the trivial LAN denial-of-pairing while preserving
+                // "8 wrong-PIN guesses → relaunch".
+                if he.is_wrong_pin() {
+                    failures += 1;
+                    warn!("pairing failed (wrong PIN): {:?}", he.as_err());
+                } else {
+                    warn!("pairing failed (not counted toward lockout): {:?}", he.as_err());
+                }
                 // Best-effort abort message; ignore I/O errors.
                 let _ = link
                     .send_msg(&PairMsg::Abort {
-                        reason: format!("{e}"),
+                        reason: format!("{he}"),
                     })
                     .await;
                 on_event(PairEvent::Failed {
-                    reason: format!("{e}"),
+                    reason: format!("{he}"),
                 });
             }
             Err(_elapsed) => {
-                warn!("pairing handshake from {peer_addr} timed out");
-                failures += 1;
+                // A peer that connected then stalled never completed the
+                // exchange: it's not a PIN guess, so a timeout must NOT advance
+                // the lockout counter (else any LAN peer could latch the lockout
+                // by connecting and going silent). Reported for status only.
+                warn!("pairing handshake from {peer_addr} timed out (not counted toward lockout)");
                 let _ = link
                     .send_msg(&PairMsg::Abort {
                         reason: "handshake timed out".into(),
@@ -625,57 +679,101 @@ async fn handle_one(
     link: &mut transport::PairLink,
     identity: &Identity,
     pin: &str,
-) -> Result<(String, Option<String>)> {
-    // Step 1: receive HelloPair.
-    let hello = link.recv_msg().await?;
+) -> std::result::Result<(String, Option<String>), HandshakeError> {
+    // Step 1: receive HelloPair. Every failure up to (and excluding) the
+    // key-confirmation step is `Other`: the peer never proved it completed the
+    // SPAKE2 exchange, so it isn't a PIN guess and must not count toward the
+    // lockout. Only the `verify_peer_mac` mismatch below is a wrong-PIN guess.
+    let hello = link.recv_msg().await.map_err(HandshakeError::Other)?;
     let (client_pub, alias) = match hello {
         PairMsg::HelloPair {
             version,
             client_pubkey,
             alias,
         } => {
-            anyhow::ensure!(
-                version == PAIRING_PROTOCOL_VERSION,
-                "protocol version mismatch: client={version} expected={PAIRING_PROTOCOL_VERSION}"
-            );
+            if version != PAIRING_PROTOCOL_VERSION {
+                return Err(HandshakeError::Other(anyhow::anyhow!(
+                    "protocol version mismatch: client={version} expected={PAIRING_PROTOCOL_VERSION}"
+                )));
+            }
             (client_pubkey, alias)
         }
-        other => anyhow::bail!("expected HelloPair, got {other:?}"),
+        other => {
+            return Err(HandshakeError::Other(anyhow::anyhow!(
+                "expected HelloPair, got {other:?}"
+            )))
+        }
     };
 
     // Step 2: start our SPAKE2, send HelloAck.
     let mut session =
         PairingSession::new(PairingRole::Host, pin.to_string(), identity.public_bytes());
     session.set_peer_pubkey(client_pub);
-    let spake2_msg_b = session.start().map_err(map_pair_err)?;
+    let spake2_msg_b = session
+        .start()
+        .map_err(|e| HandshakeError::Other(map_pair_err(e)))?;
     let host_alias = hostname_alias();
     link.send_msg(&PairMsg::HelloAck {
         host_pubkey: identity.public_bytes(),
         spake2_msg_b,
         host_alias,
     })
-    .await?;
+    .await
+    .map_err(HandshakeError::Other)?;
 
     // Step 3: receive Spake2Reply.
-    let reply = link.recv_msg().await?;
+    let reply = link.recv_msg().await.map_err(HandshakeError::Other)?;
     let spake2_msg_a = match reply {
         PairMsg::Spake2Reply { spake2_msg_a } => spake2_msg_a,
-        PairMsg::Abort { reason } => anyhow::bail!("client aborted: {reason}"),
-        other => anyhow::bail!("expected Spake2Reply, got {other:?}"),
+        PairMsg::Abort { reason } => {
+            return Err(HandshakeError::Other(anyhow::anyhow!(
+                "client aborted: {reason}"
+            )))
+        }
+        other => {
+            return Err(HandshakeError::Other(anyhow::anyhow!(
+                "expected Spake2Reply, got {other:?}"
+            )))
+        }
     };
-    session.finish(&spake2_msg_a).map_err(map_pair_err)?;
+    session
+        .finish(&spake2_msg_a)
+        .map_err(|e| HandshakeError::Other(map_pair_err(e)))?;
 
-    // Step 4: receive ClientConfirm, verify, send HostConfirm.
-    let confirm = link.recv_msg().await?;
+    // Step 4: receive ClientConfirm, verify, send HostConfirm. The
+    // `verify_peer_mac` step is the ONLY wrong-PIN signal: the peer completed
+    // the exchange and its confirmation MAC didn't match, i.e. it guessed a
+    // wrong PIN (`PairingError::ConfirmationFailed`). Classify that as
+    // `WrongPin`; everything else here (abort, wrong message, transport error)
+    // stays `Other`.
+    let confirm = link.recv_msg().await.map_err(HandshakeError::Other)?;
     let client_mac = match confirm {
         PairMsg::ClientConfirm { mac } => mac,
-        PairMsg::Abort { reason } => anyhow::bail!("client aborted: {reason}"),
-        other => anyhow::bail!("expected ClientConfirm, got {other:?}"),
+        PairMsg::Abort { reason } => {
+            return Err(HandshakeError::Other(anyhow::anyhow!(
+                "client aborted: {reason}"
+            )))
+        }
+        other => {
+            return Err(HandshakeError::Other(anyhow::anyhow!(
+                "expected ClientConfirm, got {other:?}"
+            )))
+        }
     };
-    session.verify_peer_mac(&client_mac).map_err(map_pair_err)?;
-    let host_mac = session.our_mac().map_err(map_pair_err)?;
+    if let Err(e) = session.verify_peer_mac(&client_mac) {
+        return Err(match e {
+            // A completed-exchange PIN mismatch: the genuine brute-force guess.
+            PairingError::ConfirmationFailed => HandshakeError::WrongPin(map_pair_err(e)),
+            // Any other verify error (e.g. a torn session) isn't a PIN guess.
+            other => HandshakeError::Other(map_pair_err(other)),
+        });
+    }
+    let host_mac = session
+        .our_mac()
+        .map_err(|e| HandshakeError::Other(map_pair_err(e)))?;
     link.send_msg(&PairMsg::HostConfirm { mac: host_mac })
-        .await?;
+        .await
+        .map_err(HandshakeError::Other)?;
 
     Ok((hex::encode(client_pub), alias))
 }
@@ -823,6 +921,18 @@ fn sanitize_label(name: &str) -> String {
     }
 }
 
+/// A process-wide lock serializing every test that mutates the global
+/// `PHAROS_CONFIG_DIR` / `PHAROS_PAIR_MAX_FAILURES` env vars. Both this module's
+/// `run_loop` lockout tests and `crate::pairing`'s manager tests take it, so
+/// concurrent tests across the two files can't clobber each other's env (env is
+/// process-global; a SEQ-suffixed dir isolates the *paths*, but the *variable*
+/// itself is shared).
+#[cfg(test)]
+pub(crate) fn env_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 #[cfg(test)]
 mod tests {
     //! File-level tests for the peer-registry helpers (issue #19). They use the
@@ -856,6 +966,105 @@ mod tests {
 
     fn key(byte: u8) -> String {
         hex::encode([byte; 32])
+    }
+
+    /// Drive one full SPAKE2 handshake as a *client* that types the WRONG PIN,
+    /// so the host's `verify_peer_mac` fails with `ConfirmationFailed`: a
+    /// genuine brute-force guess (the only failure that counts toward the
+    /// lockout, issue #17). Completing the whole exchange (not aborting) is what
+    /// distinguishes this from junk traffic. `wrong_pin` must differ from the
+    /// host's current PIN (we don't know it, and the point is that it's wrong).
+    async fn wrong_pin_attempt(bound: SocketAddr, wrong_pin: &str) {
+        // The server rebinds its own socket per round; retry the connect briefly.
+        let mut link = None;
+        for _ in 0..50 {
+            match transport::pair_connect(&[bound]).await {
+                Ok(l) => {
+                    link = Some(l);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        let mut link = link.expect("client connect");
+
+        // Our own long-term identity (any key works; it just gets rejected).
+        let client_id = Identity::generate();
+        let client_pub = client_id.public_bytes();
+
+        // Step 1: HelloPair.
+        link.send_msg(&PairMsg::HelloPair {
+            version: PAIRING_PROTOCOL_VERSION,
+            client_pubkey: client_pub,
+            alias: Some("wrong-pin-test".into()),
+        })
+        .await
+        .expect("send HelloPair");
+
+        // Step 2: receive HelloAck (host pubkey + its SPAKE2 msg B).
+        let (host_pub, spake2_msg_b) = match link.recv_msg().await.expect("recv HelloAck") {
+            PairMsg::HelloAck {
+                host_pubkey,
+                spake2_msg_b,
+                ..
+            } => (host_pubkey, spake2_msg_b),
+            other => panic!("expected HelloAck, got {other:?}"),
+        };
+
+        // Run our client-side SPAKE2 with the WRONG pin: `finish` still succeeds
+        // (both sides derive *a* secret), but they differ, so our confirmation
+        // MAC won't verify on the host → ConfirmationFailed.
+        let mut session =
+            PairingSession::new(PairingRole::Client, wrong_pin.to_string(), client_pub);
+        session.set_peer_pubkey(host_pub);
+        let spake2_msg_a = session.start().expect("client spake start");
+        session.finish(&spake2_msg_b).expect("client spake finish");
+        link.send_msg(&PairMsg::Spake2Reply { spake2_msg_a })
+            .await
+            .expect("send Spake2Reply");
+        let mac = session.our_mac().expect("client mac");
+        link.send_msg(&PairMsg::ClientConfirm { mac })
+            .await
+            .expect("send ClientConfirm");
+        // The host now verifies our (wrong) MAC, fails, and aborts. Read the
+        // abort so the exchange completes on our end, then close.
+        let _ = link.recv_msg().await;
+        let _ = link.close().await;
+        // Let the host finish this round before the caller connects again.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    /// Connect, send a well-formed HelloPair (so the host advances into the
+    /// handshake), then Abort mid-exchange: junk traffic that never proves a
+    /// PIN guess. Post-fix (issue #17) this must NOT advance the lockout counter.
+    async fn junk_abort_attempt(bound: SocketAddr) {
+        let mut link = None;
+        for _ in 0..50 {
+            match transport::pair_connect(&[bound]).await {
+                Ok(l) => {
+                    link = Some(l);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        let mut link = link.expect("client connect");
+        link.send_msg(&PairMsg::HelloPair {
+            version: PAIRING_PROTOCOL_VERSION,
+            client_pubkey: [0x42; 32],
+            alias: Some("junk-test".into()),
+        })
+        .await
+        .expect("send HelloPair");
+        // Wait for HelloAck (proves the round reached the handshake), then bail.
+        let _ = link.recv_msg().await;
+        let _ = link
+            .send_msg(&PairMsg::Abort {
+                reason: "test".into(),
+            })
+            .await;
+        let _ = link.close().await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 
     #[test]
@@ -967,26 +1176,29 @@ mod tests {
         assert_eq!(pair_failure_cap(Some(" 3 ")), 3);
     }
 
-    /// The full lockout path (issue #17): drive the real `run_loop` with a cap of
-    /// 2 and two clients that connect then hang up mid-handshake. After the second
-    /// failure the loop must emit `LockedOut { attempts: 2 }` and stop on its own
-    /// (no cancel). Uses the `PHAROS_PAIR_MAX_FAILURES` override so it needs two
-    /// failures, not eight. Env vars are process-global; the SEQ-suffixed
-    /// `PHAROS_CONFIG_DIR` isolates the peers path, and no other test in this crate
-    /// sets `PHAROS_PAIR_MAX_FAILURES`.
-    #[test]
-    fn run_loop_locks_out_after_cap_failures() {
+    /// Spin up a real `run_loop` on an ephemeral loopback pair listener with the
+    /// given failure cap, run `client` against it (the attempt driver), and
+    /// return the events the loop emitted. Shared by the two lockout tests so
+    /// they differ only in what the client sends. Env vars are process-global;
+    /// the SEQ-suffixed `PHAROS_CONFIG_DIR` isolates the peers path, and
+    /// `PHAROS_PAIR_MAX_FAILURES` is set+cleared inside here.
+    fn drive_run_loop<F, Fut>(cap: &str, client: F) -> Vec<PairEvent>
+    where
+        F: FnOnce(SocketAddr) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()>,
+    {
         use std::sync::atomic::AtomicBool;
         use std::sync::{Arc, Mutex};
 
-        // Isolate the config dir so run_loop's peers_path() doesn't touch the real
-        // one, and set the low cap.
+        // Serialize against every other env-mutating test (this file + pairing.rs).
+        let _env = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let cfg_dir =
             std::env::temp_dir().join(format!("pharos-lockout-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&cfg_dir).unwrap();
         std::env::set_var("PHAROS_CONFIG_DIR", &cfg_dir);
-        std::env::set_var("PHAROS_PAIR_MAX_FAILURES", "2");
+        std::env::set_var("PHAROS_PAIR_MAX_FAILURES", cap);
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1019,46 +1231,10 @@ mod tests {
                 on_event,
             ));
 
-            // Two failing attempts. Each: connect, send a well-formed HelloPair so
-            // the host advances into the handshake (and sends HelloAck, which
-            // flushes our stream), then Abort so the host's next recv bails → a
-            // Failed round. Awaiting the HelloAck is what forces our data out and
-            // keeps the connection open until the host has seen the attempt.
-            for _ in 0..2 {
-                // Retry the connect briefly while the server rebinds the socket.
-                let mut link = None;
-                for _ in 0..50 {
-                    match transport::pair_connect(&[bound]).await {
-                        Ok(l) => {
-                            link = Some(l);
-                            break;
-                        }
-                        Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
-                    }
-                }
-                let mut link = link.expect("client connect");
-                link.send_msg(&PairMsg::HelloPair {
-                    version: PAIRING_PROTOCOL_VERSION,
-                    client_pubkey: [0x42; 32],
-                    alias: Some("lockout-test".into()),
-                })
-                .await
-                .expect("send HelloPair");
-                // Wait for the host's HelloAck: proves the round reached the
-                // handshake, and flushes our HelloPair.
-                let _ = link.recv_msg().await;
-                // Now bail; the host's step-3 recv sees this Abort → Failed round.
-                let _ = link
-                    .send_msg(&PairMsg::Abort {
-                        reason: "test".into(),
-                    })
-                    .await;
-                let _ = link.close().await;
-                // Give the host time to finish this round before the next connect.
-                tokio::time::sleep(Duration::from_millis(150)).await;
-            }
-
-            // The loop should end on its own once the cap is hit.
+            // Run the attempt driver, then stop the loop (a cap it never reaches
+            // wouldn't stop on its own; cancel it so the test doesn't hang).
+            client(bound).await;
+            cancel.store(true, Ordering::Relaxed);
             let _ = tokio::time::timeout(Duration::from_secs(10), server).await;
         });
 
@@ -1067,17 +1243,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cfg_dir);
 
         let evs = events.lock().unwrap();
+        evs.clone()
+    }
+
+    /// The full lockout path (issue #17, BUG B): drive the real `run_loop` with a
+    /// cap of 2 and two clients that each complete the SPAKE2 exchange with the
+    /// WRONG PIN, i.e. genuine brute-force guesses. After the second wrong-PIN failure
+    /// the loop must emit `LockedOut { attempts: 2 }` and stop on its own.
+    #[test]
+    fn run_loop_locks_out_after_wrong_pin_failures() {
+        let evs = drive_run_loop("2", |bound| async move {
+            // Two wrong-PIN guesses (the host's real PIN is a random six-digit
+            // code we don't know; "000000" all-but-certainly differs, and even if
+            // it collided the second attempt uses a different one).
+            wrong_pin_attempt(bound, "000000").await;
+            wrong_pin_attempt(bound, "111111").await;
+        });
+
         let locked = evs
             .iter()
             .find_map(|e| match e {
                 PairEvent::LockedOut { attempts } => Some(*attempts),
                 _ => None,
             })
-            .expect("run_loop must emit LockedOut once the cap is reached");
+            .expect("run_loop must emit LockedOut once the wrong-PIN cap is reached");
         assert_eq!(locked, 2, "locked out at the configured cap");
         assert!(
             matches!(evs.last(), Some(PairEvent::Stopped)),
             "LockedOut is followed by Stopped: {evs:?}"
+        );
+    }
+
+    /// The other half of BUG B (issue #17): junk traffic must NOT trip the
+    /// lockout. With a cap of 2, drive four connect-then-abort attempts (no PIN
+    /// guessed, just a mid-handshake bail). The loop must emit `Failed` for each
+    /// (telemetry) but NEVER `LockedOut`: a LAN peer that can't guess a PIN can't
+    /// deny pairing to everyone else.
+    #[test]
+    fn run_loop_ignores_junk_failures_for_lockout() {
+        let evs = drive_run_loop("2", |bound| async move {
+            for _ in 0..4 {
+                junk_abort_attempt(bound).await;
+            }
+        });
+
+        let failed = evs
+            .iter()
+            .filter(|e| matches!(e, PairEvent::Failed { .. }))
+            .count();
+        assert!(
+            failed >= 4,
+            "each junk attempt is reported as Failed: {evs:?}"
+        );
+        assert!(
+            !evs.iter().any(|e| matches!(e, PairEvent::LockedOut { .. })),
+            "junk/abort traffic must NOT trip the lockout: {evs:?}"
         );
     }
 }

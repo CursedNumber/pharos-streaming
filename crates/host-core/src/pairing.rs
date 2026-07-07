@@ -67,6 +67,14 @@ pub struct PairingManager {
 struct Running {
     cancel: Arc<AtomicBool>,
     handle: std::thread::JoinHandle<()>,
+    /// True when this is the always-open, host-lifetime listener
+    /// ([`PairingManager::start_host_lifetime`]) rather than a panel-opened
+    /// 60-minute window ([`PairingManager::start`]). It makes [`PairingManager::cancel`]
+    /// a no-op: with always-open pairing the listener is a permanent host
+    /// property, so a stray panel Cancel must never withdraw mDNS and leave the
+    /// host undiscoverable/unpairable until a relaunch (issue #17 BUG A). Only
+    /// the 8-wrong-PIN lockout or a relaunch may stop it.
+    host_lifetime: bool,
 }
 
 impl PairingManager {
@@ -96,7 +104,7 @@ impl PairingManager {
     /// (`stop_after_pair = true`) and auto-closes after [`PANEL_WINDOW`] if
     /// nobody pairs. See [`Self::start_host_lifetime`] for the always-open one.
     pub fn start(self: &Arc<Self>, addr: Option<String>) -> Result<(), String> {
-        self.start_inner(addr, true, Some(PANEL_WINDOW))
+        self.start_inner(addr, true, Some(PANEL_WINDOW), false)
     }
 
     /// Open an **always-open** pairing listener for the host's whole lifetime
@@ -105,18 +113,23 @@ impl PairingManager {
     /// PIN-bearing listener is live without the panel having to open one. Same
     /// idempotence + lockout rules as [`Self::start`].
     pub fn start_host_lifetime(self: &Arc<Self>, addr: Option<String>) -> Result<(), String> {
-        self.start_inner(addr, false, None)
+        self.start_inner(addr, false, None, true)
     }
 
     /// Shared body of [`Self::start`] / [`Self::start_host_lifetime`]. Refuses to
     /// spawn once the brute-force lockout has latched (`self.locked`): only a
     /// fresh process clears it, which is what makes the lockout require a
     /// relaunch even against a panel StartPairing.
+    ///
+    /// `host_lifetime` marks the always-open listener so [`Self::cancel`] leaves
+    /// it running (issue #17 BUG A); a panel-opened window passes `false` and
+    /// cancels normally.
     fn start_inner(
         self: &Arc<Self>,
         addr: Option<String>,
         stop_after_pair: bool,
         max_window: Option<Duration>,
+        host_lifetime: bool,
     ) -> Result<(), String> {
         // Lockout gate: once tripped, stay down until the process restarts.
         if self.locked.load(Ordering::SeqCst) {
@@ -159,6 +172,7 @@ impl PairingManager {
             addr: addr.to_string(),
             pin: Some(pin.clone()),
             last: None,
+            always_on: host_lifetime,
         });
 
         let cancel = Arc::new(AtomicBool::new(false));
@@ -194,16 +208,41 @@ impl PairingManager {
             })
             .map_err(|e| format!("spawn pairing thread: {e}"))?;
 
-        *guard = Some(Running { cancel, handle });
+        *guard = Some(Running {
+            cancel,
+            handle,
+            host_lifetime,
+        });
         tracing::info!(
-            "pairing listener opened on {addr} (round {epoch}, stop_after_pair={stop_after_pair})"
+            "pairing listener opened on {addr} (round {epoch}, stop_after_pair={stop_after_pair}, host_lifetime={host_lifetime})"
         );
         Ok(())
     }
 
     /// Close the pairing window. Idempotent; the listener thread observes the
     /// cancel flag within ~200ms and exits, withdrawing its mDNS broadcast.
+    ///
+    /// **No-op for the always-open, host-lifetime listener** (issue #17 BUG A):
+    /// with always-open pairing the listener is a permanent host property (on
+    /// Linux it's the compositor's only mDNS discovery presence), so a panel
+    /// Cancel must never be able to tear it down and leave the host
+    /// undiscoverable/unpairable until a relaunch. Only the 8-wrong-PIN lockout
+    /// or a relaunch may stop it. A panel-opened 60-minute window
+    /// (`host_lifetime = false`) still cancels normally.
     pub fn cancel(&self) {
+        if let Ok(guard) = self.inner.lock() {
+            if let Some(r) = guard.as_ref() {
+                // Leave a live host-lifetime listener alone: don't cancel it,
+                // don't clear inner, don't withdraw mDNS or drop the PIN. A
+                // finished handle here is stale (the thread already exited, e.g.
+                // a transient bind loss), so let that fall through to a real
+                // close rather than pretend it's still running.
+                if r.host_lifetime && !r.handle.is_finished() {
+                    tracing::debug!("ignoring cancel: always-open pairing listener stays up");
+                    return;
+                }
+            }
+        }
         // Bump the round id first so any trailing event from the thread we're
         // about to detach is ignored by `apply_event`.
         self.epoch.fetch_add(1, Ordering::SeqCst);
@@ -241,11 +280,17 @@ impl PairingManager {
         if self.epoch.load(Ordering::SeqCst) != round {
             return;
         }
+        // `always_on` is primed by `start_inner` (via `set_pairing`) and left
+        // untouched by the mutating arms below, so a host-lifetime round keeps
+        // it `true` across PIN rotations; only the terminal arms clear it. This
+        // insert-default is a belt-and-suspenders fallback for the (unreached
+        // in practice) case where an event lands before the prime.
         let p = st.pairing.get_or_insert_with(|| PairingState {
             active: true,
             addr: DEFAULT_PAIR_ADDR.to_string(),
             pin: None,
             last: None,
+            always_on: false,
         });
         match ev {
             PairEvent::Listening { addr, pin } => {
@@ -276,6 +321,10 @@ impl PairingManager {
                 self.locked.store(true, Ordering::SeqCst);
                 p.active = false;
                 p.pin = None;
+                // The listener is down for good (relaunch to re-enable): drop
+                // the always-on flag so the panel/tray don't claim pairing is
+                // still always available.
+                p.always_on = false;
                 p.last = Some(PairOutcome::Failed {
                     reason: format!(
                         "pairing locked: {attempts} failed attempts; relaunch the host to re-enable"
@@ -285,6 +334,7 @@ impl PairingManager {
             PairEvent::Stopped => {
                 p.active = false;
                 p.pin = None;
+                p.always_on = false;
             }
         }
     }
@@ -360,5 +410,113 @@ mod tests {
             mgr.start_host_lifetime(None).is_err(),
             "start_host_lifetime must refuse when locked"
         );
+    }
+
+    /// Isolate `PHAROS_CONFIG_DIR` to a unique temp dir so `start_inner`'s
+    /// identity load/create doesn't touch the real config. Env is process-global,
+    /// so this takes the shared env lock (also held by `pair.rs`'s run_loop tests)
+    /// and returns the guard: the caller holds it for the whole test so no other
+    /// env-mutating test can clobber `PHAROS_CONFIG_DIR` mid-run. Returns the dir
+    /// (for cleanup) and the guard (to keep alive).
+    fn isolate_config_dir(
+        tag: &str,
+    ) -> (std::path::PathBuf, std::sync::MutexGuard<'static, ()>) {
+        use std::sync::atomic::AtomicU32;
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let guard = crate::pair::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "pharos-pairmgr-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("PHAROS_CONFIG_DIR", &dir);
+        (dir, guard)
+    }
+
+    /// Wait (briefly) until the manager's live listener reports itself running,
+    /// so `cancel()` under test sees a not-yet-finished handle rather than a
+    /// still-spawning one.
+    fn wait_active(mgr: &Arc<PairingManager>) {
+        for _ in 0..100 {
+            let up = mgr
+                .inner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|r| !r.handle.is_finished());
+            if up {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("listener never came up");
+    }
+
+    /// BUG A (issue #17): a `cancel()` on the always-open, host-lifetime listener
+    /// is a NO-OP: the listener stays up (inner still Some, status still active)
+    /// so a stray panel Cancel can't brick discovery/pairing until a relaunch.
+    #[test]
+    fn cancel_is_noop_for_host_lifetime_listener() {
+        let (dir, _env) = isolate_config_dir("hostlife");
+        let mgr = PairingManager::new(blank_status(), false);
+        // Bind an ephemeral loopback listener so no real port/mDNS is claimed.
+        mgr.start_host_lifetime(Some("127.0.0.1:0".into()))
+            .expect("start_host_lifetime");
+        wait_active(&mgr);
+
+        // A panel Cancel must not tear it down.
+        mgr.cancel();
+
+        assert!(
+            mgr.inner.lock().unwrap().is_some(),
+            "host-lifetime listener must survive cancel() (inner still Some)"
+        );
+        let st = mgr.status.lock().unwrap();
+        let p = st.pairing.as_ref().expect("pairing state");
+        assert!(p.active, "always-open listener stays active through cancel()");
+        assert!(p.always_on, "the always_on flag is surfaced to the panel");
+        assert!(p.pin.is_some(), "the PIN is retained (nothing was torn down)");
+        drop(st);
+
+        std::env::remove_var("PHAROS_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The complement: a panel-opened window (`host_lifetime = false`) still
+    /// cancels normally: inner cleared, status inactive, PIN dropped.
+    #[test]
+    fn cancel_stops_a_panel_window_as_before() {
+        let (dir, _env) = isolate_config_dir("panelwin");
+        let mgr = PairingManager::new(blank_status(), false);
+        mgr.start(Some("127.0.0.1:0".into())).expect("start");
+        wait_active(&mgr);
+        // The panel window is not always-on.
+        assert!(
+            !mgr.status
+                .lock()
+                .unwrap()
+                .pairing
+                .as_ref()
+                .unwrap()
+                .always_on
+        );
+
+        mgr.cancel();
+
+        assert!(
+            mgr.inner.lock().unwrap().is_none(),
+            "a panel window must be torn down by cancel() (inner None)"
+        );
+        let st = mgr.status.lock().unwrap();
+        let p = st.pairing.as_ref().expect("pairing state");
+        assert!(!p.active, "cancelled panel window is inactive");
+        assert!(p.pin.is_none(), "cancelled panel window drops its PIN");
+        drop(st);
+
+        std::env::remove_var("PHAROS_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

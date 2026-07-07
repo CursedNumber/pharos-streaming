@@ -293,6 +293,7 @@ mod pairing_hint_tests {
             addr: "0.0.0.0:4432".into(),
             pin: pin.map(str::to_string),
             last,
+            always_on: false,
         }
     }
 
