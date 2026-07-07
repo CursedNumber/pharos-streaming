@@ -1687,6 +1687,12 @@ const CAPACITY_CLOSE_CODE: u32 = 0xA;
 /// Close code when the host switches stream mode (mirror↔single): the client
 /// treats it as a benign reconnect, NOT a pre-emption.
 const MODE_SWITCH_CLOSE_CODE: u32 = 0xB;
+/// Close code the CLIENT sends when its own input send path is genuinely stuck
+/// (transition cap or age bound, issue #13): tears the whole session down so the
+/// client's normal StreamEnded → reconnect path fires with a fresh connection.
+/// Deliberately NOT one of the host's special stop codes (RESERVED / UNPAIRED),
+/// so `app_close_error` maps it to `None` = an ordinary drop = fast reconnect.
+const INPUT_STUCK_CLOSE_CODE: u32 = 0xE;
 
 /// Per-device input gate: the set of client pubkeys whose input forwarding is
 /// DISABLED (default empty → every device's input reaches the seat, today's
@@ -3560,9 +3566,14 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
         // `write_all`s them uninterrupted. `write_all` is not cancel-safe, so the
         // two are split across tasks rather than `select!`ed against a `recv()` —
         // a partial length-prefix write must never be dropped. If the writer stays
-        // stuck (transition cap or age bound), the coalescer trips shutdown and the
-        // writer errors, tearing the session down to reconnect. `_input_send` is an
-        // abort-on-drop guard so this inner task never leaks across a reconnect.
+        // stuck (transition cap or age bound), the coalescer trips shutdown and
+        // closes the WHOLE connection (INPUT_STUCK_CLOSE_CODE) so the video +
+        // datagram loops error out, `run_video_client_with_input` returns Err, and
+        // the client reconnects fresh (rather than sitting on a live-but-muted
+        // stream). On a clean teardown (`input_rx` closes) the coalescer sets a
+        // `closing` flag and the writer flushes the remainder and `finish()`es the
+        // stream with a real FIN. `_input_send` is an abort-on-drop guard so this
+        // inner task never leaks across a reconnect.
         let mut _input_send: Option<AbortOnDrop> = None;
         if let Some(mut input_rx) = input_rx {
             let (mut send, _recv) = conn.open_bi().await?;
@@ -3580,6 +3591,7 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
                 // shared staging, then wakes the writer.
                 let co_staging = staging.clone();
                 let co_notify = notify.clone();
+                let co_conn = conn_input.clone();
                 let coalescer = async move {
                     while let Some(ev) = input_rx.recv().await {
                         let mut s = co_staging.lock().await;
@@ -3594,40 +3606,65 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
                         drop(s);
                         co_notify.notify_one();
                         if stuck {
-                            // Link is genuinely dead; wake the writer to observe
-                            // the shutdown flag and error out, then stop draining.
+                            // Link is genuinely dead. Tear the WHOLE session down so
+                            // the client reconnects fresh: closing the connection
+                            // errors out the video + datagram read loops, so
+                            // `run_video_client_with_input` returns Err and the
+                            // normal StreamEnded → reconnect path fires. The code is
+                            // deliberately NOT one of the host's stop codes, so the
+                            // client treats it as an ordinary drop, not a refusal.
+                            co_conn.close(INPUT_STUCK_CLOSE_CODE.into(), b"input stuck");
                             return;
                         }
                     }
-                    // `input_rx` closed (client tearing down): let the writer flush
-                    // and finish the stream.
+                    // `input_rx` closed (client tearing down): flag a graceful close
+                    // and wake the writer so it flushes the remainder and `finish()`es
+                    // the stream with a real FIN (not a dropped-stream RESET_STREAM).
+                    // Then park on the connection instead of returning, so the WRITER
+                    // arm (not this one) wins the outer `select!` and actually reaches
+                    // its flush + `finish()`; if the link drops first this still ends.
+                    {
+                        let mut s = co_staging.lock().await;
+                        s.closing = true;
+                    }
+                    co_notify.notify_one();
+                    co_conn.closed().await;
                 };
 
                 // Writer: pops one compacted item under the lock, releases it, then
                 // `write_all`s uninterrupted (never inside a `select!`, so a partial
-                // length-prefix write is never cancelled). Observes the shutdown flag
-                // and returns so the session reconnects. Owns `send` and `finish()`es
-                // it on a clean exit; a shutdown/error just drops it (the stream is
-                // being torn down anyway).
+                // length-prefix write is never cancelled). On the stuck path it just
+                // returns (the coalescer has already closed the connection to force a
+                // reconnect). On a clean close (`closing` set with the staging
+                // drained) it flushes the remainder and `finish()`es the stream with
+                // a real FIN so no staged item is silently dropped.
                 let wr_staging = staging.clone();
                 let wr_notify = notify.clone();
                 let writer = async move {
                     let mut send = send;
                     loop {
-                        let next = {
+                        let (next, closing) = {
                             let mut s = wr_staging.lock().await;
                             if s.shutdown {
-                                // Genuinely-stuck link: drop the stream so the whole
-                                // session tears down and reconnects rather than
-                                // replaying minutes-late input.
+                                // Genuinely-stuck link: the coalescer has closed the
+                                // whole connection, so just end this task; the session
+                                // tears down and reconnects rather than replaying
+                                // minutes-late input.
                                 tracing::warn!(
                                     "input send stuck (backlog/age bound); tearing down"
                                 );
                                 return;
                             }
-                            s.pop_front()
+                            (s.pop_front(), s.closing)
                         };
                         let Some(ev) = next else {
+                            if closing {
+                                // Clean teardown and nothing left staged: end the
+                                // stream with a graceful FIN instead of a dropped
+                                // RESET_STREAM.
+                                send.finish().ok();
+                                return;
+                            }
                             // Nothing staged: park until the coalescer wakes us. If
                             // the coalescer has already exited (channel closed), the
                             // outer select's `coalescer` arm ends the pair, so this
@@ -3652,12 +3689,14 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
                 };
 
                 // Both run on this one spawned task; whichever finishes first ends
-                // the pair (coalescer: channel closed or shutdown tripped; writer:
-                // stream died or shutdown observed). A watcher on the connection
-                // stops the coalescer even when `input_rx` never closes but the link
-                // dropped. The writer owns `send` and finishes it on its own clean
-                // exit; if the select cancels a partial `write_all` here it is only
-                // because the link is already dying, and we never reuse the stream.
+                // the pair. On a stuck link the coalescer closes the connection and
+                // returns (the writer sees `shutdown` and ends, and `conn_closed`
+                // fires too). On a clean close the coalescer flags `closing` and then
+                // parks on the connection, so the WRITER arm wins the select, flushes
+                // the remainder, and `finish()`es the stream with a real FIN. A
+                // watcher on the connection ends the pair even if `input_rx` never
+                // closes but the link dropped. `write_all` is never inside this
+                // `select!`, so no partial length-prefix write is ever cancelled.
                 let watch_conn = conn_input.clone();
                 let conn_closed = async move {
                     watch_conn.closed().await;
@@ -4727,6 +4766,11 @@ struct Staging {
     /// bound). The writer observes it and returns an error so the session tears
     /// down and reconnects.
     shutdown: bool,
+    /// Set when the coalescer's `input_rx` closes (client teardown). The writer
+    /// drains whatever is still staged, then `finish()`es the stream with a real
+    /// FIN instead of letting the dropped `SendStream` emit RESET_STREAM and
+    /// silently drop the remainder (#13 clean-close nicety).
+    closing: bool,
 }
 
 impl Staging {
@@ -4736,6 +4780,7 @@ impl Staging {
             pending_transitions: 0,
             oldest_at: None,
             shutdown: false,
+            closing: false,
         }
     }
 
@@ -4744,9 +4789,14 @@ impl Staging {
     /// - Transitions: appended verbatim (never merged, never dropped).
     /// - `PointerAbs`: latest wins; replaces any `PointerAbs` in the trailing run.
     /// - `GamepadAxis{slot,axis}`: latest wins per distinct channel in the run.
-    /// - `GamepadMotion{slot}`: latest wins per slot in the run. This is a gyro
-    ///   AIM-RATE sample, so latest-wins under a stall only loses aim resolution
-    ///   (the integral of dropped rate samples), never a discrete action.
+    /// - `GamepadMotion{slot}`: gyro rate fields (gx/gy/gz) are SUMMED per slot in
+    ///   the run; the accelerometer fields (ax/ay/az) are latest-wins. gx/gy/gz are
+    ///   angular-RATE samples the host integrates into relative cursor motion with a
+    ///   per-sample delta LINEAR in the rate and no dt term (`GyroMouse::delta` =
+    ///   `-gz*sensitivity` per sample), so summing N coalesced rates yields the exact
+    ///   same integrated pan as N separate samples — no aim rotation is lost. ax/ay/az
+    ///   are an absolute orientation/gravity reading (not a rate), so summing them
+    ///   would be wrong; latest-wins is correct (the host uses them only for tilt).
     /// - `PointerRel` / `Scroll`: accumulative; deltas are SUMMED into the run's
     ///   existing sample so no cursor distance / scroll amount is lost.
     fn fold(&mut self, ev: core_proto::InputEvent) {
@@ -4791,9 +4841,13 @@ impl Staging {
                 (GamepadMotion { slot: s, gx, gy, gz, ax, ay, az }, GamepadMotion { slot: ns, gx: ngx, gy: ngy, gz: ngz, ax: nax, ay: nay, az: naz })
                     if *s == *ns =>
                 {
-                    *gx = *ngx;
-                    *gy = *ngy;
-                    *gz = *ngz;
+                    // Gyro rates SUM: the host integrates them into cursor pan with a
+                    // per-sample delta linear in the rate and no dt, so the sum of the
+                    // coalesced rates integrates to the identical rotation.
+                    *gx += *ngx;
+                    *gy += *ngy;
+                    *gz += *ngz;
+                    // Accel is an absolute orientation reading, not a rate: latest wins.
                     *ax = *nax;
                     *ay = *nay;
                     *az = *naz;
@@ -4936,6 +4990,44 @@ mod tests {
             }
         );
 
+        // Gyro motion coalesces the RATE fields (gx/gy/gz) by SUMMING so the host's
+        // dt-free per-sample integration reproduces the same total pan, while the
+        // accelerometer (an absolute orientation reading) stays latest-wins.
+        for _ in 0..10 {
+            s.fold(GamepadMotion {
+                slot: 0,
+                gx: 0.0,
+                gy: 0.0,
+                gz: 0.1,
+                ax: 0.0,
+                ay: 0.0,
+                az: 9.8,
+            });
+        }
+        // Ten 0.1 rate samples collapse to ONE item with gz summed to 1.0; accel
+        // is the latest reading, not a sum.
+        assert_eq!(s.items.len(), 8, "gyro burst coalesces to one item");
+        match s.items[7] {
+            GamepadMotion { slot, gx, gy, gz, ax, ay, az } => {
+                assert_eq!(slot, 0);
+                assert_eq!(gx, 0.0);
+                assert_eq!(gy, 0.0);
+                assert!(
+                    (gz - 1.0).abs() < 1e-6,
+                    "gyro rate must SUM (0.1 x10 -> 1.0), got {gz}"
+                );
+                assert_eq!(ax, 0.0);
+                assert_eq!(ay, 0.0);
+                assert!(
+                    (az - 9.8).abs() < 1e-6,
+                    "accel must be latest-wins, not summed, got {az}"
+                );
+            }
+            ref other => panic!("expected GamepadMotion, got {other:?}"),
+        }
+        // Drop the coalesced gyro so the FIFO assertions below stay unchanged.
+        s.items.pop_back();
+
         // Every transition folded so far (one) is still counted; draining pops
         // them in FIFO order and the position lands before the click.
         assert_eq!(s.pending_transitions, 1);
@@ -4964,6 +5056,50 @@ mod tests {
             "exceeding the transition cap must request teardown"
         );
         assert!(s2.shutdown, "shutdown flag set for the writer to observe");
+    }
+
+    /// Issue #13 stuck detection (pure state machine). The transition CAP is a
+    /// strict `>` bound (exactly at the cap is fine; one past it trips), and the
+    /// AGE bound trips once the oldest staged item ages past `INPUT_MAX_STAGE_AGE`.
+    /// When either trips, the coalescer closes the connection with
+    /// `INPUT_STUCK_CLOSE_CODE`; because that code is NOT one of the host's stop
+    /// codes, `app_close_error` maps it to `None`, so the read loops surface an
+    /// ordinary error and the client reconnects (see the network-chain reasoning
+    /// in the commit message).
+    #[test]
+    fn input_stuck_trips_at_cap_and_age_bounds() {
+        use core_proto::InputEvent::*;
+        use core_proto::Modifiers;
+        let mods = Modifiers::default();
+
+        // Exactly AT the cap is not stuck; one past it is.
+        let mut at_cap = super::Staging::new();
+        for i in 0..super::INPUT_MAX_PENDING_TRANSITIONS {
+            at_cap.fold(Key { scancode: i as u32, pressed: true, mods });
+        }
+        assert!(!at_cap.check_stuck(), "exactly at the cap must NOT trip");
+        at_cap.fold(Key {
+            scancode: super::INPUT_MAX_PENDING_TRANSITIONS as u32,
+            pressed: true,
+            mods,
+        });
+        assert!(at_cap.check_stuck(), "one past the cap must trip");
+
+        // The AGE bound: force the oldest-staged clock past the bound and confirm a
+        // single staged (non-transition) item trips shutdown even under the cap.
+        let mut aged = super::Staging::new();
+        aged.fold(PointerRel { dx: 1.0, dy: 0.0 });
+        assert!(!aged.check_stuck(), "fresh staged item is not stuck");
+        aged.oldest_at =
+            Some(std::time::Instant::now() - super::INPUT_MAX_STAGE_AGE - std::time::Duration::from_millis(1));
+        assert!(aged.check_stuck(), "an item aged past the bound must trip");
+        assert!(aged.shutdown, "shutdown flag set for the writer to observe");
+
+        // The stuck close code must NOT collide with the host's special stop codes,
+        // so the client treats it as an ordinary drop → reconnect (not a refusal).
+        assert_ne!(super::INPUT_STUCK_CLOSE_CODE, super::RESERVED_CLOSE_CODE);
+        assert_ne!(super::INPUT_STUCK_CLOSE_CODE, super::UNPAIRED_CLOSE_CODE);
+        assert_ne!(super::INPUT_STUCK_CLOSE_CODE, super::PREEMPT_CLOSE_CODE);
     }
 
     /// The client-side `DG_STREAM_HDR` colorimetry state (issue #16): unknown until
