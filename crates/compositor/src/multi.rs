@@ -937,6 +937,80 @@ static STREAMING: AtomicBool = AtomicBool::new(false);
 static MIRROR_ENABLED: std::sync::LazyLock<std::sync::Arc<AtomicBool>> =
     std::sync::LazyLock::new(|| std::sync::Arc::new(AtomicBool::new(false)));
 
+/// Host input backstop (issue #13): release EVERY piece of held input state on
+/// the seat + pads when the connected client changes or a stale backlog is
+/// purged. A departed client's key-up / button-up / stick-return events can never
+/// arrive, so without this a held key, mouse button, or gamepad control sticks in
+/// the live host session and fights the physical console user.
+///
+/// Releases: (1) every currently-pressed KEYBOARD key (from smithay's own
+/// `pressed_keys()`, so it catches any held key, not just ones we remember);
+/// (2) every POINTER button we injected and still hold (`held_ptr_buttons`,
+/// since smithay's public `PointerHandle` exposes no held-button list); (3) all
+/// virtual gamepad state via `host_input` (`release_all_pads`). Best-effort and
+/// off the hot timing path (only fires on a client change / backlog, not per
+/// frame). Idempotent: releasing an already-up control is harmless.
+fn release_all_held(
+    data: &mut CalloopData,
+    host_input: &mut crate::host_input::HostInput,
+    held_ptr_buttons: &mut std::collections::HashSet<u8>,
+) {
+    use smithay::backend::input::ButtonState;
+    use smithay::input::pointer::ButtonEvent;
+
+    let time = data.state.start_time.elapsed().as_millis() as u32;
+
+    // (1) Held keyboard keys → Released. smithay tracks these in the keyboard's
+    // internal `pressed_keys`; feed each back as a release through the same
+    // `input()` path so xkb state + client focus stay consistent.
+    if let Some(keyboard) = data.state.seat.get_keyboard() {
+        let held = keyboard.pressed_keys();
+        if !held.is_empty() {
+            tracing::info!("input: releasing {} held keyboard key(s)", held.len());
+        }
+        for keycode in held {
+            let serial = SERIAL_COUNTER.next_serial();
+            keyboard.input::<(), _>(
+                &mut data.state,
+                keycode,
+                KeyState::Released,
+                serial,
+                time,
+                |_, _, _| FilterResult::Forward,
+            );
+        }
+    }
+
+    // (2) Held pointer buttons → Released. We only ever inject evdev codes
+    // 0x110 + button; release exactly the ones we still hold.
+    if let Some(pointer) = data.state.seat.get_pointer() {
+        if !held_ptr_buttons.is_empty() {
+            tracing::info!(
+                "input: releasing {} held pointer button(s)",
+                held_ptr_buttons.len()
+            );
+        }
+        let buttons: Vec<u8> = held_ptr_buttons.drain().collect();
+        for button in buttons {
+            let serial = SERIAL_COUNTER.next_serial();
+            pointer.button(
+                &mut data.state,
+                &ButtonEvent {
+                    button: 0x110u32 + u32::from(button),
+                    state: ButtonState::Released,
+                    serial,
+                    time,
+                },
+            );
+            pointer.frame(&mut data.state);
+        }
+    }
+
+    // (3) Gamepad state → neutral on every live virtual pad, plus drop any
+    // undrained gyro motion.
+    host_input.release_all_pads();
+}
+
 /// Set the desired mirror mode (see [`MIRROR_ENABLED`]). Called from the panel
 /// control handler; takes effect on the transport's next accept boundary + the
 /// next status push.
@@ -2127,6 +2201,14 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
         .flatten()
         .filter_map(|p| p.streamer.as_ref())
         .find_map(|s| s.take_input_rx());
+    // Index of the pipeline whose streamer owns `input_rx` (the FIRST with a
+    // streamer — `find_map` above takes it from that same one). We poll its
+    // `connected_addr()` each frame so the input drain can detect a client CHANGE
+    // and purge/release the departed client's stale state (issue #13 host
+    // backstop). `None` when no streamer exists (file-sink only).
+    let input_streamer_idx = pipelines
+        .iter()
+        .position(|p| p.as_ref().is_some_and(|p| p.streamer.is_some()));
     // App launcher: push the catalog (with box art) to every client's relay
     // stream so the Trireme grid populates, and drain launch requests (tile taps)
     // from the primary client into the virtual display.
@@ -2217,6 +2299,18 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
         smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
     > = None;
     let mut last_win_count = 0usize;
+    // Issue #13 host backstop state. `last_input_conn` mirrors the input
+    // streamer's `connected_addr()` so we can spot a client CHANGE (disconnect or
+    // preemption) ~4 Hz and release the departed client's held state; a lost
+    // key-up / button-up / stick-return would otherwise stick in the live host
+    // session. `held_ptr_buttons` tracks the pointer buttons WE injected (smithay's
+    // public PointerHandle exposes no pressed-button list) so we release exactly
+    // those. Held KEYBOARD keys come from smithay's own `pressed_keys()`; pads via
+    // `host_input`. `INPUT_BACKLOG_BURST` mirrors the Windows stall-replay proxy.
+    const INPUT_BACKLOG_BURST: usize = 256;
+    let mut last_input_conn: Option<String> = None;
+    let mut last_input_conn_check = std::time::Instant::now();
+    let mut held_ptr_buttons: std::collections::HashSet<u8> = std::collections::HashSet::new();
     let (input_w, input_h) = (cfg.outputs[0].w, cfg.outputs[0].h);
     // USB/IP-imported keyboards (vhci) → seat. Reads only vhci devices, so the
     // host's own keyboard is untouched. Always on; idle when none are imported.
@@ -3115,6 +3209,37 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
             key_idx += 1;
         }
 
+        // Host input backstop (issue #13): if the connected client CHANGED
+        // (disconnect / preemption), the departed client's key-ups, button-ups,
+        // and stick-returns can never arrive; a held key/button/pad would stick in
+        // the live host session and interfere with the physical console user. So
+        // ~4 Hz we compare the input streamer's `connected_addr()` and, on a
+        // change, PURGE its still-queued events (no stale replay) and RELEASE all
+        // held state. Same purge+release also trips below on a large backlog burst.
+        // This is the Linux parity to the Windows injector's client-change path.
+        if last_input_conn_check.elapsed() >= std::time::Duration::from_millis(250) {
+            last_input_conn_check = std::time::Instant::now();
+            let conn = input_streamer_idx
+                .and_then(|idx| pipelines[idx].as_ref())
+                .and_then(|p| p.streamer.as_ref())
+                .and_then(|s| s.connected_addr());
+            if conn != last_input_conn {
+                last_input_conn = conn;
+                let mut purged = 0u64;
+                if let Some(rx) = input_rx.as_mut() {
+                    while rx.try_recv().is_ok() {
+                        purged += 1;
+                    }
+                }
+                release_all_held(&mut data, &mut host_input, &mut held_ptr_buttons);
+                if purged > 0 {
+                    tracing::info!(
+                        "input: purged {purged} queued events on client change (issue #13)"
+                    );
+                }
+            }
+        }
+
         // Drain network input → keyboard/mouse to the seat. Focus the newest
         // toplevel first, so an app launched after startup (e.g. the media
         // player) receives keyboard input.
@@ -3136,7 +3261,23 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                     focus_surface = Some(s);
                 }
             }
+            // Drain in a bounded burst so a stall-replay dump (a departed client's
+            // queue arriving en masse) is caught: a human tops out at a few events
+            // per frame, so a pass past `INPUT_BACKLOG_BURST` is a queued dump.
+            // On that we stop injecting, purge the remainder, and release held
+            // state (issue #13), mirroring the Windows backlog backstop.
+            let mut this_pass = 0usize;
+            let mut backlog = false;
             while let Ok(ev) = rx.try_recv() {
+                // Track the pointer buttons WE inject so the backstop can release
+                // exactly those (smithay's PointerHandle exposes no held list).
+                if let core_proto::InputEvent::PointerButton { button, pressed } = &ev {
+                    if *pressed {
+                        held_ptr_buttons.insert(*button);
+                    } else {
+                        held_ptr_buttons.remove(button);
+                    }
+                }
                 // Gamepad/gyro/controller-tuning variants are owned by
                 // `HostInput`; every other variant falls through to the
                 // seat-dispatch closure (the keyboard/pointer path).
@@ -3155,6 +3296,22 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                             other,
                         );
                     },
+                );
+                this_pass += 1;
+                if this_pass >= INPUT_BACKLOG_BURST {
+                    backlog = true;
+                    break;
+                }
+            }
+            if backlog {
+                let mut purged = 0u64;
+                while rx.try_recv().is_ok() {
+                    purged += 1;
+                }
+                release_all_held(&mut data, &mut host_input, &mut held_ptr_buttons);
+                tracing::warn!(
+                    "input: backlog burst ({this_pass} injected, {purged} purged); \
+                     released all held state (issue #13)"
                 );
             }
         }

@@ -261,6 +261,20 @@ impl HostInput {
         }
     }
 
+    /// Host input backstop (issue #13): release ALL held gamepad state to neutral
+    /// on every live virtual pad. Called when the connected client changes (its
+    /// button-up / stick-return events can never arrive) or when a stale input
+    /// backlog is purged, mirroring the Windows injector's `release_all` pad path.
+    /// Also drops any pending gyro motion so a departed client's last aim-rate
+    /// sample doesn't leak into the next session's cursor. The pads stay up (a new
+    /// client re-sends `GamepadConnect`); this only zeroes their held controls.
+    pub fn release_all_pads(&mut self) {
+        self.pads.neutral_all();
+        // Discard accumulated-but-undrained gyro motion (aim-rate integral) so it
+        // can't snap the cursor when the next client connects.
+        let _ = self.gyro_imu.take();
+    }
+
     /// Open / close the gyro IMU reader's master gate. The compositor calls
     /// this every render frame with the OR of every connected streamer's
     /// per-client `wants_gyro` flag (set during the v2 auth handshake). When

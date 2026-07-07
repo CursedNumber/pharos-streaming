@@ -529,17 +529,44 @@ fn run_stream(
                 let mut last_rate = Instant::now();
                 let mut last_conn_check = Instant::now();
                 let mut last_conn: Option<String> = None;
+                // Backstop for a DEPARTED client whose stale input replays in bulk
+                // (issue #13): the client fix bounds a same-client stall, but a
+                // client that queued and then dropped can still dump a batch. If a
+                // single drain pass yields more than this many events it's not a
+                // human's input rate; treat it as a stall-replay and purge the rest
+                // + release_all, matching the client-change intent.
+                const INPUT_BACKLOG_BURST: u64 = 256;
                 loop {
-                    match rx.try_recv() {
-                        Ok(ev) => {
-                            seen += 1;
-                            window += 1;
-                            if seen <= 20 {
-                                tracing::info!("input[{seen}]: {ev:?}");
-                            }
-                            injector.dispatch(&ev);
+                    // Drain in a burst so we can spot a stall-replay: a healthy
+                    // human tops out at a few events per millisecond, so a pass
+                    // that keeps yielding past the burst cap is a queued dump.
+                    let mut this_pass: u64 = 0;
+                    while let Ok(ev) = rx.try_recv() {
+                        seen += 1;
+                        window += 1;
+                        this_pass += 1;
+                        if seen <= 20 {
+                            tracing::info!("input[{seen}]: {ev:?}");
                         }
-                        Err(_) => std::thread::sleep(Duration::from_millis(1)),
+                        injector.dispatch(&ev);
+                        if this_pass >= INPUT_BACKLOG_BURST {
+                            // Sustained backlog: stop injecting the dump, purge the
+                            // remainder, and release held state so no stale
+                            // key/button/pad is left down.
+                            let mut purged = 0u64;
+                            while rx.try_recv().is_ok() {
+                                purged += 1;
+                            }
+                            injector.release_all();
+                            tracing::warn!(
+                                "input: backlog burst ({this_pass} injected, {purged} \
+                                 purged); released all held state (issue #13)"
+                            );
+                            break;
+                        }
+                    }
+                    if this_pass == 0 {
+                        std::thread::sleep(Duration::from_millis(1));
                     }
                     // Client change (disconnect, or preemption by a new one),
                     // checked ~4 Hz by peer addr: purge whatever the departed

@@ -232,6 +232,29 @@ impl PadManager {
             p.axis(axis, value);
         }
     }
+
+    /// Release EVERY live pad to neutral: all buttons up, sticks/triggers/hat
+    /// centered. Used by the host input backstop (issue #13) when the connected
+    /// client changes or a stale backlog is purged; a departed client's button-up
+    /// / stick-return events can never arrive, so a held A or a pinned stick would
+    /// otherwise stick in the game. Emitting a release for an already-neutral
+    /// control is harmless, so we blanket-neutralize without tracking held state.
+    /// The pads themselves stay up (a new client re-sends `GamepadConnect`), which
+    /// avoids churning /dev/uinput or disturbing any USB/IP-attached real pad.
+    pub fn neutral_all(&mut self) {
+        let slots: Vec<u8> = self.pads.keys().copied().collect();
+        for slot in slots {
+            if let Some(p) = self.pads.get_mut(&slot) {
+                for b in 0..=10u8 {
+                    p.button(b, false);
+                }
+                // Sticks + hat center at 0; triggers rest at 0 too.
+                for a in 0..=7u8 {
+                    p.axis(a, 0.0);
+                }
+            }
+        }
+    }
 }
 
 /// Apply independent face-button swaps: A↔B (0↔1) when `swap_ab`, X↔Y (2↔3) when

@@ -3551,28 +3551,124 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
         // Open the input bidi stream up front (when requested) so the server
         // sees it before the first event needs to flow. The read half stays
         // open but idle — we never receive from the host on this stream.
+        //
+        // Under backpressure (a wedged client present or a network stall) we must
+        // NOT let the unbounded `input_rx` grow for minutes and later replay stale
+        // input into the live session (#13). So a COALESCER drains `input_rx`
+        // promptly into a bounded `Staging` buffer (motion coalesced, transitions
+        // kept in order), and a separate WRITER pops compacted items and
+        // `write_all`s them uninterrupted. `write_all` is not cancel-safe, so the
+        // two are split across tasks rather than `select!`ed against a `recv()` —
+        // a partial length-prefix write must never be dropped. If the writer stays
+        // stuck (transition cap or age bound), the coalescer trips shutdown and the
+        // writer errors, tearing the session down to reconnect. `_input_send` is an
+        // abort-on-drop guard so this inner task never leaks across a reconnect.
+        let mut _input_send: Option<AbortOnDrop> = None;
         if let Some(mut input_rx) = input_rx {
             let (mut send, _recv) = conn.open_bi().await?;
             // Nudge the stream open so accept_bi() fires on the server even
             // before the first real event (writes are buffered until needed).
             send.write_all(&[]).await.ok();
-            tokio::spawn(async move {
-                while let Some(ev) = input_rx.recv().await {
-                    let buf = match core_proto::encode_input(&ev) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            tracing::warn!("encode input: {e}");
-                            continue;
+            let conn_input = conn.clone();
+            let handle = tokio::spawn(async move {
+                let staging = Arc::new(tokio::sync::Mutex::new(Staging::new()));
+                let notify = Arc::new(tokio::sync::Notify::new());
+
+                // Coalescer: owns `input_rx`, never touches the network, so the
+                // channel is always drained promptly (invariant 4). Folds each
+                // event (plus a non-blocking `try_recv` burst drain) into the
+                // shared staging, then wakes the writer.
+                let co_staging = staging.clone();
+                let co_notify = notify.clone();
+                let coalescer = async move {
+                    while let Some(ev) = input_rx.recv().await {
+                        let mut s = co_staging.lock().await;
+                        s.fold(ev);
+                        // Drain whatever else is already queued in one shot so a
+                        // burst collapses into the staging before we ever wake the
+                        // writer; keeps `input_rx` from backing up under a stall.
+                        while let Ok(ev) = input_rx.try_recv() {
+                            s.fold(ev);
                         }
-                    };
-                    let len_be = (buf.len() as u32).to_be_bytes();
-                    if send.write_all(&len_be).await.is_err() || send.write_all(&buf).await.is_err()
-                    {
-                        return;
+                        let stuck = s.check_stuck();
+                        drop(s);
+                        co_notify.notify_one();
+                        if stuck {
+                            // Link is genuinely dead; wake the writer to observe
+                            // the shutdown flag and error out, then stop draining.
+                            return;
+                        }
                     }
+                    // `input_rx` closed (client tearing down): let the writer flush
+                    // and finish the stream.
+                };
+
+                // Writer: pops one compacted item under the lock, releases it, then
+                // `write_all`s uninterrupted (never inside a `select!`, so a partial
+                // length-prefix write is never cancelled). Observes the shutdown flag
+                // and returns so the session reconnects. Owns `send` and `finish()`es
+                // it on a clean exit; a shutdown/error just drops it (the stream is
+                // being torn down anyway).
+                let wr_staging = staging.clone();
+                let wr_notify = notify.clone();
+                let writer = async move {
+                    let mut send = send;
+                    loop {
+                        let next = {
+                            let mut s = wr_staging.lock().await;
+                            if s.shutdown {
+                                // Genuinely-stuck link: drop the stream so the whole
+                                // session tears down and reconnects rather than
+                                // replaying minutes-late input.
+                                tracing::warn!(
+                                    "input send stuck (backlog/age bound); tearing down"
+                                );
+                                return;
+                            }
+                            s.pop_front()
+                        };
+                        let Some(ev) = next else {
+                            // Nothing staged: park until the coalescer wakes us. If
+                            // the coalescer has already exited (channel closed), the
+                            // outer select's `coalescer` arm ends the pair, so this
+                            // never parks forever.
+                            wr_notify.notified().await;
+                            continue;
+                        };
+                        let buf = match core_proto::encode_input(&ev) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                tracing::warn!("encode input: {e}");
+                                continue;
+                            }
+                        };
+                        let len_be = (buf.len() as u32).to_be_bytes();
+                        if send.write_all(&len_be).await.is_err()
+                            || send.write_all(&buf).await.is_err()
+                        {
+                            return; // stream/connection gone
+                        }
+                    }
+                };
+
+                // Both run on this one spawned task; whichever finishes first ends
+                // the pair (coalescer: channel closed or shutdown tripped; writer:
+                // stream died or shutdown observed). A watcher on the connection
+                // stops the coalescer even when `input_rx` never closes but the link
+                // dropped. The writer owns `send` and finishes it on its own clean
+                // exit; if the select cancels a partial `write_all` here it is only
+                // because the link is already dying, and we never reuse the stream.
+                let watch_conn = conn_input.clone();
+                let conn_closed = async move {
+                    watch_conn.closed().await;
+                };
+                tokio::select! {
+                    _ = coalescer => {}
+                    _ = writer => {}
+                    _ = conn_closed => {}
                 }
-                send.finish().ok();
             });
+            _input_send = Some(AbortOnDrop(handle));
         }
 
         // App relay + clipboard relay: the host opens TWO dedicated bidi streams,
@@ -4553,9 +4649,322 @@ pub async fn pair_connect(server_addrs: &[SocketAddr]) -> Result<PairLink> {
     })
 }
 
+/// Aborts a spawned task when the guard drops, so an inner task tied to one
+/// connection never leaks across a reconnect. Used for the input send task: when
+/// `run_video_client_with_input` returns (session over), the guard drops and the
+/// coalescer/writer are aborted rather than lingering on a dead connection.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+// --- Client input coalescing (issue #13) -----------------------------------
+//
+// The client's input send task rides a RELIABLE ordered bidi QUIC stream. If the
+// client's present/decode wedges or the network stalls, a naive `while recv() {
+// write_all() }` blocks in `write_all`, the unbounded `input_rx` grows for
+// minutes, and old motion/clicks later replay IN ORDER into the LIVE host session
+// (stale input landing under the cursor NOW; interfering with the physical
+// console user). That is a correctness AND safety bug.
+//
+// Fix: a COALESCER/WRITER split sharing a `Staging` buffer. The coalescer owns
+// `input_rx`, drains it PROMPTLY (so memory stays bounded), and folds each event
+// into `Staging`; consecutive motion is merged in place. The writer pops the
+// compacted front item and `write_all`s it UNINTERRUPTED (never cancelled
+// mid-write; quinn's `write_all` is not cancel-safe). On a genuinely stuck link
+// (too many un-drained transitions, or the staging aging past a bound) we tear
+// the session down so it reconnects, rather than delivering minutes-late input.
+
+/// Max un-written TRANSITIONS (Key/Button/Connect/etc.) we let pile up before we
+/// treat the link as dead and tear the session down. Transitions are never
+/// coalesced (each is a discrete state change the host must see), so an unbounded
+/// backlog here is the real "stuck writer" signal. 256 is generous for any human
+/// burst yet trips well before a minutes-long queue can form.
+const INPUT_MAX_PENDING_TRANSITIONS: usize = 256;
+
+/// If the oldest staged item has waited longer than this without the writer
+/// making progress, the link is stuck (a wedged present blocks `write_all`
+/// indefinitely). Tear down rather than let input age into a stale replay. A
+/// couple seconds is far beyond any healthy write latency but far below the
+/// minutes-long queue #13 describes.
+const INPUT_MAX_STAGE_AGE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// True for the discrete state-change variants that must NEVER be dropped or
+/// coalesced (invariant 1). Everything else is motion, which is safe to coalesce.
+fn input_is_transition(ev: &core_proto::InputEvent) -> bool {
+    use core_proto::InputEvent::*;
+    matches!(
+        ev,
+        Key { .. }
+            | PointerButton { .. }
+            | GamepadButton { .. }
+            | GamepadConnect { .. }
+            | GamepadDisconnect { .. }
+            | ControllerTuning { .. }
+    )
+}
+
+/// The ordered, already-compacted queue of pending input the writer drains. Only
+/// CONSECUTIVE same-kind motion (no transition in between) is merged, which
+/// preserves position-before-click ordering (invariant 3) automatically: a
+/// transition seals the trailing motion run, so a later motion sample can never
+/// hop ahead of an earlier click.
+struct Staging {
+    /// Front = oldest = next to write. Motion within the trailing run (the tail
+    /// after the last transition) is folded in place; transitions are appended
+    /// verbatim and never merged.
+    items: std::collections::VecDeque<core_proto::InputEvent>,
+    /// Count of TRANSITIONS currently queued (the teardown trigger; motion is
+    /// bounded by coalescing so it can't be the thing that grows).
+    pending_transitions: usize,
+    /// When the current front item was first staged, for the age bound. `None`
+    /// when the queue is empty. Set when we push onto an empty queue; cleared
+    /// when the queue drains empty.
+    oldest_at: Option<std::time::Instant>,
+    /// Set when the coalescer decides the link is dead (transition cap or age
+    /// bound). The writer observes it and returns an error so the session tears
+    /// down and reconnects.
+    shutdown: bool,
+}
+
+impl Staging {
+    fn new() -> Self {
+        Staging {
+            items: std::collections::VecDeque::new(),
+            pending_transitions: 0,
+            oldest_at: None,
+            shutdown: false,
+        }
+    }
+
+    /// Fold one event into the queue. Pure (no I/O) so it is unit-testable.
+    ///
+    /// - Transitions: appended verbatim (never merged, never dropped).
+    /// - `PointerAbs`: latest wins; replaces any `PointerAbs` in the trailing run.
+    /// - `GamepadAxis{slot,axis}`: latest wins per distinct channel in the run.
+    /// - `GamepadMotion{slot}`: latest wins per slot in the run. This is a gyro
+    ///   AIM-RATE sample, so latest-wins under a stall only loses aim resolution
+    ///   (the integral of dropped rate samples), never a discrete action.
+    /// - `PointerRel` / `Scroll`: accumulative; deltas are SUMMED into the run's
+    ///   existing sample so no cursor distance / scroll amount is lost.
+    fn fold(&mut self, ev: core_proto::InputEvent) {
+        use core_proto::InputEvent::*;
+        if self.oldest_at.is_none() {
+            self.oldest_at = Some(std::time::Instant::now());
+        }
+        if input_is_transition(&ev) {
+            self.pending_transitions += 1;
+            self.items.push_back(ev);
+            return;
+        }
+        // Motion: try to merge into the TRAILING run (walk back from the tail,
+        // stopping at the first transition — never cross it, that would reorder).
+        for slot in self.items.iter_mut().rev() {
+            if input_is_transition(slot) {
+                break; // sealed run; the new sample starts a fresh trailing item
+            }
+            match (&mut *slot, &ev) {
+                (PointerAbs { x, y }, PointerAbs { x: nx, y: ny }) => {
+                    *x = *nx;
+                    *y = *ny;
+                    return;
+                }
+                (PointerRel { dx, dy }, PointerRel { dx: ndx, dy: ndy }) => {
+                    *dx += *ndx;
+                    *dy += *ndy;
+                    return;
+                }
+                (Scroll { dx, dy }, Scroll { dx: ndx, dy: ndy }) => {
+                    *dx += *ndx;
+                    *dy += *ndy;
+                    return;
+                }
+                (
+                    GamepadAxis { slot: s, axis: a, value },
+                    GamepadAxis { slot: ns, axis: na, value: nv },
+                ) if *s == *ns && *a == *na => {
+                    *value = *nv;
+                    return;
+                }
+                (GamepadMotion { slot: s, gx, gy, gz, ax, ay, az }, GamepadMotion { slot: ns, gx: ngx, gy: ngy, gz: ngz, ax: nax, ay: nay, az: naz })
+                    if *s == *ns =>
+                {
+                    *gx = *ngx;
+                    *gy = *ngy;
+                    *gz = *ngz;
+                    *ax = *nax;
+                    *ay = *nay;
+                    *az = *naz;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // No mergeable same-kind sample in the trailing run: append fresh.
+        self.items.push_back(ev);
+    }
+
+    /// Pop the next compacted item to write. Refreshes the age clock for the new
+    /// front (the writer is making progress) and clears it when the queue empties.
+    fn pop_front(&mut self) -> Option<core_proto::InputEvent> {
+        let ev = self.items.pop_front()?;
+        if input_is_transition(&ev) {
+            self.pending_transitions = self.pending_transitions.saturating_sub(1);
+        }
+        self.oldest_at = if self.items.is_empty() {
+            None
+        } else {
+            Some(std::time::Instant::now())
+        };
+        Some(ev)
+    }
+
+    /// Trip the teardown flag if the writer is genuinely stuck: too many pending
+    /// transitions, or the front item has aged past the bound. Returns true when
+    /// it (newly or already) wants shutdown. Called by the coalescer after each
+    /// fold so a stall is caught even while `write_all` is blocked.
+    fn check_stuck(&mut self) -> bool {
+        if self.pending_transitions > INPUT_MAX_PENDING_TRANSITIONS {
+            self.shutdown = true;
+        } else if let Some(t) = self.oldest_at {
+            if t.elapsed() > INPUT_MAX_STAGE_AGE {
+                self.shutdown = true;
+            }
+        }
+        self.shutdown
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
+
+    /// Issue #13: the pure input-coalescing logic. Under backpressure motion is
+    /// coalesced (absolute=latest, accumulative=summed) but transitions are never
+    /// dropped or reordered, and the latest position always lands BEFORE a
+    /// following click. Also proves the transition cap trips a teardown rather
+    /// than growing unbounded.
+    #[test]
+    fn input_coalescing_drops_motion_keeps_transitions() {
+        use core_proto::InputEvent::*;
+        use core_proto::Modifiers;
+
+        let mods = Modifiers::default();
+        let mut s = super::Staging::new();
+
+        // A burst of absolute motion collapses to ONE item (latest wins).
+        for i in 0..100u32 {
+            s.fold(PointerAbs {
+                x: i as f32 / 100.0,
+                y: i as f32 / 100.0,
+            });
+        }
+        assert_eq!(s.items.len(), 1, "PointerAbs burst must coalesce to one");
+        assert_eq!(
+            s.items[0],
+            PointerAbs { x: 0.99, y: 0.99 },
+            "only the latest absolute sample survives"
+        );
+
+        // A click after the aimed position: the position must be staged BEFORE
+        // the button (position-before-click), and the button must survive.
+        s.fold(PointerButton {
+            button: 0,
+            pressed: true,
+        });
+        assert_eq!(s.items.len(), 2);
+        assert_eq!(s.items[0], PointerAbs { x: 0.99, y: 0.99 });
+        assert_eq!(
+            s.items[1],
+            PointerButton {
+                button: 0,
+                pressed: true
+            }
+        );
+
+        // Motion AFTER the transition starts a fresh trailing run — it must NOT
+        // merge back into the pre-click PointerAbs (that would reorder past the
+        // click). So we now have abs, button, abs.
+        s.fold(PointerAbs { x: 0.5, y: 0.5 });
+        assert_eq!(s.items.len(), 3);
+        assert_eq!(s.items[2], PointerAbs { x: 0.5, y: 0.5 });
+
+        // Accumulative motion SUMS (no cursor distance / scroll lost).
+        s.fold(PointerRel { dx: 1.0, dy: 2.0 });
+        s.fold(PointerRel { dx: 3.0, dy: -1.0 });
+        s.fold(Scroll { dx: 0.0, dy: 1.0 });
+        s.fold(Scroll { dx: 0.0, dy: 2.0 });
+        // items now: abs, button, abs, rel(4,1), scroll(0,3)
+        assert_eq!(s.items.len(), 5);
+        assert_eq!(s.items[3], PointerRel { dx: 4.0, dy: 1.0 });
+        assert_eq!(s.items[4], Scroll { dx: 0.0, dy: 3.0 });
+
+        // Distinct gamepad axes stay separate; same axis coalesces to latest.
+        s.fold(GamepadAxis {
+            slot: 0,
+            axis: 0,
+            value: 0.1,
+        });
+        s.fold(GamepadAxis {
+            slot: 0,
+            axis: 1,
+            value: 0.2,
+        });
+        s.fold(GamepadAxis {
+            slot: 0,
+            axis: 0,
+            value: 0.9,
+        });
+        // axis0 replaced to 0.9, axis1 kept: two new items.
+        assert_eq!(s.items.len(), 7);
+        assert_eq!(
+            s.items[5],
+            GamepadAxis {
+                slot: 0,
+                axis: 0,
+                value: 0.9
+            }
+        );
+        assert_eq!(
+            s.items[6],
+            GamepadAxis {
+                slot: 0,
+                axis: 1,
+                value: 0.2
+            }
+        );
+
+        // Every transition folded so far (one) is still counted; draining pops
+        // them in FIFO order and the position lands before the click.
+        assert_eq!(s.pending_transitions, 1);
+        assert_eq!(s.pop_front(), Some(PointerAbs { x: 0.99, y: 0.99 }));
+        assert_eq!(
+            s.pop_front(),
+            Some(PointerButton {
+                button: 0,
+                pressed: true
+            })
+        );
+        assert_eq!(s.pending_transitions, 0);
+
+        // The transition CAP trips a shutdown rather than growing unbounded: a
+        // wedged writer that never drains would otherwise queue forever.
+        let mut s2 = super::Staging::new();
+        for i in 0..(super::INPUT_MAX_PENDING_TRANSITIONS + 1) {
+            s2.fold(Key {
+                scancode: i as u32,
+                pressed: true,
+                mods,
+            });
+        }
+        assert!(
+            s2.check_stuck(),
+            "exceeding the transition cap must request teardown"
+        );
+        assert!(s2.shutdown, "shutdown flag set for the writer to observe");
+    }
 
     /// The client-side `DG_STREAM_HDR` colorimetry state (issue #16): unknown until
     /// the first announce, then SDR/HDR, representable as three distinct states so
