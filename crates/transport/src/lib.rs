@@ -681,6 +681,12 @@ pub struct QuicStreamer {
     /// to the client as `DG_STREAM_GEOMETRY` so the client sizes its decoder to
     /// the real resolution (and re-announces on change for the res actuator).
     geom: Arc<std::sync::atomic::AtomicU64>,
+    /// Whether the CURRENT encode is HDR (true = 10-bit Main10/BT.2020/PQ, false =
+    /// SDR/BT.709). The host sets it via [`Self::set_hdr`] alongside the geometry;
+    /// the stream loop announces it as `DG_STREAM_HDR` so the client only inserts
+    /// its HDR→SDR tonemap when the stream is truly HDR (issue #16). Re-announced on
+    /// change + ~1×/s on the same cadence as the geometry.
+    hdr: Arc<AtomicBool>,
     /// Forward-path packet loss permille over the last ~1s, from quinn's PathStats.
     /// Read by the compositor as a host-side congestion signal (works even when the
     /// client sends no QoS). See [`Self::loss_permille`].
@@ -835,6 +841,8 @@ impl QuicStreamer {
         let client_fps_pref_thread = client_fps_pref.clone();
         let geom = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let geom_thread = geom.clone();
+        let hdr = Arc::new(AtomicBool::new(false));
+        let hdr_thread = hdr.clone();
         let loss_permille = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let loss_thread = loss_permille.clone();
         // P-frame drop counter, shared with the serve thread so its connection
@@ -891,6 +899,7 @@ impl QuicStreamer {
                     clipboard_in_tx,
                     authorizer,
                     geom_thread,
+                    hdr_thread,
                     loss_thread,
                     drops_thread,
                     request_idr_thread,
@@ -926,6 +935,7 @@ impl QuicStreamer {
             clipboard_out_tx,
             clipboard_in_rx: std::sync::Mutex::new(Some(clipboard_in_rx)),
             geom,
+            hdr,
             loss_permille,
             clients,
         })
@@ -948,6 +958,16 @@ impl QuicStreamer {
             ((w as u64) << 32) | h as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
+    }
+
+    /// Tell the streamer whether the CURRENT encode is HDR (true = 10-bit
+    /// Main10/BT.2020/PQ, false = SDR/BT.709). Announced to the connected client as
+    /// `DG_STREAM_HDR` (at stream open + on change), so the client only inserts its
+    /// HDR→SDR tonemap when the stream is truly HDR (issue #16). Safe to call before
+    /// any client connects (latched, sent on the next connect) and at every pipeline
+    /// (re)build so a mid-session SDR↔HDR flip at a respawn boundary re-announces.
+    pub fn set_hdr(&self, hdr: bool) {
+        self.hdr.store(hdr, Ordering::Relaxed);
     }
 
     /// Queue an encoded video chunk for delivery. Non-blocking. Picture type
@@ -1333,6 +1353,13 @@ pub struct LatencyTaps {
     /// reader to size NV12 frames to the real resolution. Deliberately NOT cleared
     /// by [`Self::reset`] — it's session geometry, not a per-bench-window stat.
     geometry: std::sync::atomic::AtomicU64,
+    /// Host-announced stream colorimetry (issue #16): 0 = unknown (not yet
+    /// announced), 1 = SDR, 2 = HDR. Set from the `DG_STREAM_HDR` datagram; read by
+    /// the desktop player's decode chain to insert the HDR→SDR tonemap ONLY when the
+    /// stream is truly HDR. The "unknown" state lets the client default to plain
+    /// decode until the first announce (the crash-safe default). Like `geometry`,
+    /// NOT cleared by [`Self::reset`] — it's session colorimetry, not a bench stat.
+    stream_hdr: std::sync::atomic::AtomicU8,
 }
 
 impl Default for LatencyTaps {
@@ -1344,6 +1371,7 @@ impl Default for LatencyTaps {
             present_sum_ns: std::sync::atomic::AtomicU64::new(0),
             present_count: std::sync::atomic::AtomicU32::new(0),
             geometry: std::sync::atomic::AtomicU64::new(0),
+            stream_hdr: std::sync::atomic::AtomicU8::new(0),
         }
     }
 }
@@ -1441,6 +1469,29 @@ impl LatencyTaps {
             Some(((v >> 32) as u32, (v & 0xffff_ffff) as u32))
         }
     }
+
+    /// Record the host-announced stream colorimetry (decoded from a `DG_STREAM_HDR`
+    /// datagram): `true` = HDR, `false` = SDR. Stored as 2 = HDR / 1 = SDR so the
+    /// still-unset state (0) stays distinguishable from a genuine SDR announce.
+    pub fn set_stream_hdr(&self, hdr: bool) {
+        self.stream_hdr
+            .store(if hdr { 2 } else { 1 }, Ordering::Relaxed);
+    }
+
+    /// The host-announced stream colorimetry, or `None` until the first
+    /// `DG_STREAM_HDR` arrives (issue #16). `Some(true)` = HDR, `Some(false)` = SDR.
+    /// The desktop player inserts its HDR→SDR tonemap only for `Some(true)` — plain
+    /// decode for `Some(false)` or `None` (the crash-safe default: forcing the
+    /// tonemap onto an SDR stream fails zscale and blacks the window, whereas
+    /// plain-decoding a genuinely-HDR stream merely looks washed-out until the next
+    /// rebuild).
+    pub fn stream_hdr(&self) -> Option<bool> {
+        match self.stream_hdr.load(Ordering::Relaxed) {
+            2 => Some(true),
+            1 => Some(false),
+            _ => None,
+        }
+    }
 }
 
 // Datagram type tags (first byte). Audio and gyro both ride unreliable
@@ -1495,6 +1546,16 @@ const DG_CLIENT_BITRATEPREF: u8 = 0x0b;
 // (min_fps, max_fps; max=0=Auto/panel) — caps the encode pace + adaptation floor.
 // Same continuous ~1×/s self-healing send as DG_CLIENT_RESPREF. Additive.
 const DG_CLIENT_FPSPREF: u8 = 0x0c;
+// Host→client, additive (older clients ignore unknown tags): the colorimetry of
+// the CURRENT encode as a 1-byte flag — `1` = HDR (10-bit HEVC Main10, BT.2020/PQ),
+// `0` = SDR (8-bit BT.709). Sent at stream open and re-sent on change / ~1×/s, on
+// the same cadence + burst as DG_STREAM_GEOMETRY. The client conditions its decode
+// chain on it: the HDR→SDR tonemap filter runs ONLY when this says HDR, so a client
+// with the HDR capability opted in (TRIREME_HDR) doesn't force the tonemap onto a
+// genuinely-SDR stream (which fails zscale `no path between colorspaces` → black
+// window; issue #16). Modeled on DG_STREAM_GEOMETRY; room to grow (issue #15) but
+// minimal now — 1 byte. A lost datagram self-heals on the ~1×/s resend.
+const DG_STREAM_HDR: u8 = 0x0d;
 
 /// UNIX-epoch nanoseconds from the wall clock. Used for every timestamp that
 /// crosses the link (ClockPing/Pong t0..t3, FrameStageMeta stamps): a monotonic
@@ -1805,6 +1866,14 @@ fn announce_geom_to(g: u64, conn: &quinn::Connection) {
     }
 }
 
+/// Send the current colorimetry to one client as a `DG_STREAM_HDR` datagram — a
+/// single-byte flag (`1` = HDR, `0` = SDR). Always sent (unlike geometry there's no
+/// "unset" sentinel: SDR is the honest default), so the client learns SDR promptly
+/// and defaults its decode chain to plain decode.
+fn announce_hdr_to(hdr: bool, conn: &quinn::Connection) {
+    let _ = conn.send_datagram(tagged_datagram(DG_STREAM_HDR, &[hdr as u8]));
+}
+
 /// Video queue depth (frames) — same `PHAROS_QUEUE_FRAMES` knob as the single
 /// path, applied per mirrored client.
 fn video_qdepth() -> usize {
@@ -1840,6 +1909,7 @@ async fn run_mirror_loop(
     wants_gyro: &Arc<AtomicBool>,
     wants_hdr: &Arc<AtomicBool>,
     geom: &Arc<std::sync::atomic::AtomicU64>,
+    hdr: &Arc<AtomicBool>,
     input_tx: &mpsc::UnboundedSender<core_proto::InputEvent>,
 ) {
     tracing::info!("mirror: entering keep-N fan-out loop");
@@ -1860,6 +1930,7 @@ async fn run_mirror_loop(
         wants_gyro,
         wants_hdr,
         geom,
+        hdr,
         input_tx,
         mirror,
     );
@@ -1899,6 +1970,7 @@ async fn run_mirror_loop(
                     let wants_gyro = wants_gyro.clone();
                     let wants_hdr = wants_hdr.clone();
                     let geom = geom.clone();
+                    let hdr = hdr.clone();
                     let input_tx = input_tx.clone();
                     let mirror = mirror.clone();
                     tokio::spawn(async move {
@@ -1929,7 +2001,7 @@ async fn run_mirror_loop(
                             conn.close(MODE_SWITCH_CLOSE_CODE.into(), b"mode switch");
                             return;
                         }
-                        admit_mirror_client(conn, cid, cwg, cwh, &clients, &next_id, &connected, &wants_gyro, &wants_hdr, &geom, &input_tx, &mirror);
+                        admit_mirror_client(conn, cid, cwg, cwh, &clients, &next_id, &connected, &wants_gyro, &wants_hdr, &geom, &hdr, &input_tx, &mirror);
                     });
                 }
             }
@@ -1995,6 +2067,7 @@ fn admit_mirror_client(
     wants_gyro: &Arc<AtomicBool>,
     wants_hdr: &Arc<AtomicBool>,
     geom: &Arc<std::sync::atomic::AtomicU64>,
+    hdr: &Arc<AtomicBool>,
     input_tx: &mpsc::UnboundedSender<core_proto::InputEvent>,
     mirror: &Arc<AtomicBool>,
 ) {
@@ -2056,6 +2129,7 @@ fn admit_mirror_client(
     let wants_gyro_actor = wants_gyro.clone();
     let wants_hdr_actor = wants_hdr.clone();
     let geom_actor = geom.clone();
+    let hdr_actor = hdr.clone();
     let conn_actor = conn.clone();
     tokio::spawn(async move {
         // RAII: removes the slot + updates gates on ANY exit path.
@@ -2079,6 +2153,13 @@ fn admit_mirror_client(
         // Frames left in a dense re-send burst armed on a geometry change (mirror
         // shares one coded size across clients; the ladder can still move it).
         let mut geom_change_resend: u32 = 0;
+        // Colorimetry announce (DG_STREAM_HDR), same cadence as the geometry above:
+        // sent at open so each mirror client's decode chain defaults correctly
+        // (issue #16), re-sent on change + ~1×/s. Mirror shares one encode, so all
+        // clients see the same flag.
+        let mut last_hdr_m = hdr_actor.load(Ordering::Relaxed);
+        announce_hdr_to(last_hdr_m, &conn_actor);
+        let mut hdr_change_resend: u32 = 0;
         let mut n: u64 = 0;
         let mut win_start = tokio::time::Instant::now();
         let mut win_frames: u32 = 0;
@@ -2116,6 +2197,16 @@ fn admit_mirror_client(
                         announce_geom_to(g, &conn_actor);
                     }
                     geom_change_resend = geom_change_resend.saturating_sub(1);
+                    // Colorimetry re-announce, mirroring the geometry logic above.
+                    let h = hdr_actor.load(Ordering::Relaxed);
+                    if h != last_hdr_m {
+                        hdr_change_resend = 8;
+                        last_hdr_m = h;
+                    }
+                    if hdr_change_resend > 0 || n.is_multiple_of(60) {
+                        announce_hdr_to(h, &conn_actor);
+                    }
+                    hdr_change_resend = hdr_change_resend.saturating_sub(1);
                 }
                 // Window tick: publish this client's measured wire fps every 1s
                 // — INCLUDING zero-frame windows, so a stalled client decays to 0
@@ -2360,6 +2451,7 @@ async fn serve_stream(
     clipboard_in_tx: mpsc::UnboundedSender<core_proto::ClipboardMsg>,
     authorizer: ClientAuthorizer,
     geom: Arc<std::sync::atomic::AtomicU64>,
+    hdr: Arc<AtomicBool>,
     loss: Arc<std::sync::atomic::AtomicU32>,
     drops: Arc<std::sync::atomic::AtomicU64>,
     request_idr: Arc<AtomicBool>,
@@ -2535,6 +2627,7 @@ async fn serve_stream(
                 &wants_gyro,
                 &wants_hdr,
                 &geom,
+                &hdr,
                 &input_tx,
             )
             .await;
@@ -2889,6 +2982,17 @@ async fn serve_stream(
             announce_geom(g, &conn);
             g
         };
+        // Colorimetry announce (DG_STREAM_HDR), on the same cadence as the geometry:
+        // sent up front so the client's decode chain defaults correctly (issue #16),
+        // re-sent densely on a mid-session SDR↔HDR flip, and ~1×/s as a backstop
+        // against a lost datagram. Unlike geometry there's no "unset" sentinel; SDR
+        // (false) is the honest default the announce always carries.
+        let mut hdr_change_resend: u32 = 0;
+        let mut last_hdr = {
+            let h = hdr.load(Ordering::Relaxed);
+            announce_hdr_to(h, &conn);
+            h
+        };
 
         // Link-health heartbeat: every ~500ms tell the client whether we've shed any
         // video AU since the last beat (the bounded queue dropped → reference loss →
@@ -2983,6 +3087,23 @@ async fn serve_stream(
                         announce_geom(g, &conn);
                     }
                     geom_change_resend = geom_change_resend.saturating_sub(1);
+                    // Colorimetry, same cadence as geometry (reusing `geom_resend` as
+                    // the shared frame counter): arm a dense burst on a CHANGE so a
+                    // respawn-boundary SDR↔HDR flip reaches the client promptly under
+                    // loss, and back it up ~1×/s. The client rebuilds its decode chain
+                    // when the announced flag flips (issue #16).
+                    let h = hdr.load(Ordering::Relaxed);
+                    if h != last_hdr {
+                        hdr_change_resend = 8;
+                        last_hdr = h;
+                    }
+                    if hdr_change_resend > 0
+                        || geom_resend <= 8
+                        || geom_resend.is_multiple_of(120)
+                    {
+                        announce_hdr_to(h, &conn);
+                    }
+                    hdr_change_resend = hdr_change_resend.saturating_sub(1);
                     // Step 0 congestion observability: surface quinn's path stats
                     // (RTT, cwnd, packet loss) ~1×/s. The pacer's network term is
                     // driven by client-reported delivered fps; these localise WHERE
@@ -3697,6 +3818,17 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
                                 let h = u32::from_be_bytes([dg[5], dg[6], dg[7], dg[8]]);
                                 if let Some(t) = &geom_taps {
                                     t.set_geometry(w, h);
+                                }
+                            }
+                            Some(DG_STREAM_HDR) if dg.len() >= 2 => {
+                                // Host colorimetry announce (issue #16): 1 = HDR,
+                                // 0 = SDR. Stash it in the shared taps; the desktop
+                                // player reads it to decide whether to run the
+                                // HDR→SDR tonemap, and rebuilds its decode chain on a
+                                // flip. Stored in the SAME taps as the geometry (it
+                                // reuses `geom_taps`, kept for exactly this).
+                                if let Some(t) = &geom_taps {
+                                    t.set_stream_hdr(dg[1] != 0);
                                 }
                             }
                             Some(DG_LINK_HEALTH) if dg.len() >= 2 => {
@@ -4424,6 +4556,35 @@ pub async fn pair_connect(server_addrs: &[SocketAddr]) -> Result<PairLink> {
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
+
+    /// The client-side `DG_STREAM_HDR` colorimetry state (issue #16): unknown until
+    /// the first announce, then SDR/HDR, representable as three distinct states so
+    /// the decoder can default to plain decode while unknown. Also proves `reset()`
+    /// does NOT clear it — colorimetry is session state, matching the geometry's
+    /// lifetime exactly.
+    #[test]
+    fn stream_hdr_unknown_sdr_hdr_transitions() {
+        let taps = super::LatencyTaps::new();
+        // Fresh taps: not yet announced → None (the crash-safe "plain decode" state).
+        assert_eq!(taps.stream_hdr(), None);
+        // First announce says SDR.
+        taps.set_stream_hdr(false);
+        assert_eq!(taps.stream_hdr(), Some(false));
+        // Flip to HDR.
+        taps.set_stream_hdr(true);
+        assert_eq!(taps.stream_hdr(), Some(true));
+        // Flip back to SDR (a respawn-boundary HDR→SDR downgrade).
+        taps.set_stream_hdr(false);
+        assert_eq!(taps.stream_hdr(), Some(false));
+        // reset() clears the bench accumulators but MUST leave colorimetry latched
+        // (same as geometry) — otherwise a bench window would wrongly revert the
+        // decoder to "unknown" mid-session.
+        taps.set_stream_hdr(true);
+        taps.set_geometry(1920, 1080);
+        taps.reset();
+        assert_eq!(taps.stream_hdr(), Some(true));
+        assert_eq!(taps.geometry(), Some((1920, 1080)));
+    }
 
     /// IDNA + host:port splitting. The IDN case is the whole point — a Unicode
     /// domain must ToASCII to punycode before it ever reaches the resolver.

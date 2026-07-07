@@ -491,6 +491,12 @@ fn run_stream(
         coded.store(pack_wh(w, h), Ordering::Relaxed);
         info!("capture geometry {w}x{h} (output_idx {output_idx}); announcing to clients");
     }
+    // Colorimetry announce (issue #16): SDR until a pipeline actually builds an HDR
+    // encode. The wgc-zc path re-announces the real value each generation build
+    // below; the ffmpeg path is always SDR. This connect-time SDR default keeps the
+    // client on plain decode (the crash-safe choice) if it connects before the first
+    // pipeline, and matches this project's "HDR is a per-build property" rule.
+    streamer.set_hdr(false);
 
     // Optional MQTT / Home-Assistant telemetry — off unless enabled in config.toml.
     let mqtt = start_mqtt(encoder, capture, fps);
@@ -875,6 +881,10 @@ fn run_stream(
                 };
             let (w, h) = pipeline.size;
             streamer.set_geometry(w, h);
+            // Colorimetry: announce THIS generation's real HDR-ness so the client
+            // conditions its tonemap correctly, and a mid-session HDR↔SDR flip at a
+            // respawn boundary re-announces here (issue #16).
+            streamer.set_hdr(pipeline.hdr);
             coded.store(pack_wh(w, h), Ordering::Relaxed);
             if let Ok(mut g) = hdr_label.lock() {
                 *g = pipeline.hdr.then(|| "HEVC Main10 BT.2020/PQ".to_string());
@@ -963,6 +973,11 @@ fn run_stream(
             streamer.set_geometry(w, h);
             coded.store(pack_wh(w, h), Ordering::Relaxed);
         }
+        // The ffmpeg capture path (this branch) is always SDR — only the wgc-zc
+        // pipeline builds a 10-bit Main10 encode. Announce SDR so a client that had
+        // seen an HDR generation from a prior wgc-zc build drops its tonemap (issue
+        // #16); transport only re-announces on change, so a steady SDR run is quiet.
+        streamer.set_hdr(false);
 
         let sig = FaultSignal::new(generation);
         let scanner = spawn_stderr_scanner(stderr, sig.clone());

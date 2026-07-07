@@ -1693,6 +1693,31 @@ type InputSender = tokio::sync::mpsc::UnboundedSender<core_proto::InputEvent>;
 /// sources only) the live latency-benchmark taps to stash on the `Source`.
 type SpawnedSource = (Option<InputSender>, Option<Arc<transport::LatencyTaps>>);
 
+/// The HDR→SDR tonemap `-vf` chain: 10-bit HDR10 (BT.2020/PQ) → 8-bit SDR
+/// (BT.709), via zscale/tonemap (zimg is in the standard ffmpeg builds). Output is
+/// NV12 so it drops straight into the renderer's existing 8-bit path. Run ONLY when
+/// the stream is truly HDR: tonemapping an SDR source fails zscale with `no path
+/// between colorspaces` and blacks the window (issue #16).
+const HDR_TONEMAP_VF: &str =
+    "zscale=t=linear:npl=203,tonemap=hable,zscale=p=bt709:t=bt709:m=bt709:r=tv,format=nv12";
+
+/// Decide whether the decode ffmpeg should insert the HDR→SDR tonemap `-vf`.
+///
+/// `wants_hdr` is the client's CAPABILITY opt-in (`TRIREME_HDR`): it asks the host
+/// for a 10-bit stream, but does NOT by itself force the tonemap. `announced` is the
+/// host's `DG_STREAM_HDR` colorimetry: `Some(true)` = HDR, `Some(false)` = SDR,
+/// `None` = not yet learned.
+///
+/// The tonemap runs only when we opted in AND the stream is confirmed HDR. When the
+/// announce is SDR or not-yet-known we default to PLAIN DECODE: forcing the tonemap
+/// onto an SDR stream is the crash (zscale `no path between colorspaces` → black
+/// window), whereas plain-decoding a genuinely-HDR stream merely looks washed-out
+/// and self-corrects on the next rebuild once the announce lands. So the safe
+/// default is always plain decode (issue #16).
+fn should_tonemap_hdr(wants_hdr: bool, announced: Option<bool>) -> bool {
+    wants_hdr && announced == Some(true)
+}
+
 /// Spawn the right pipeline for a source and return its input back-channel.
 /// Pharos sources (the default) get a QUIC/HEVC decode pipeline; VNC and SPICE
 /// sources decode client-side and bridge full RGBA frames through a shared
@@ -2072,20 +2097,56 @@ fn spawn_decode(
     args.extend(media_decode::input_args_for(codec));
     args.push("-f".into());
     args.push(codec.ffmpeg_format());
-    // HDR (TRIREME_HDR): the host streams 10-bit HEVC Main10 (BT.2020/PQ). The
-    // desktop render path is 8-bit NV12 / BT.709, so tonemap HDR10 → SDR BT.709 in
-    // ffmpeg (zscale/tonemap; zimg is in the standard builds) — a correct image on
-    // any SDR display without a 10-bit render rewrite. The standalone HW decoders
-    // here (hevc_cuvid / hevc_qsv) emit system-memory frames, so the CPU filter
-    // runs. A true HDR-passthrough swapchain is a follow-up. Set TRIREME_HDR only
-    // when actually streaming HDR (tonemapping an SDR source would darken it).
-    if std::env::var_os("TRIREME_HDR").is_some() {
+
+    // Live-benchmark latency taps, shared across the three threads below. The
+    // encoder is IPPP (1 AU in → 1 NV12 out, in order), so a plain FIFO of
+    // submit instants matches each decoded frame to the AU that produced it. Also
+    // carries the host's DG_STREAM_HDR colorimetry announce, which decides the
+    // `-vf` below — so it must exist before the args are built. Created here (fresh
+    // per spawn), fed by the QUIC thread once it connects.
+    let taps = Arc::new(transport::LatencyTaps::new());
+    // Submit instants pushed by the on_frame closure (QUIC thread) as it writes
+    // each AU to ffmpeg stdin, popped oldest-first by the reader thread when a
+    // decoded frame emerges. A tiny deque; never blocks the render path.
+    let submit_times: Arc<Mutex<VecDeque<Instant>>> = Arc::new(Mutex::new(VecDeque::new()));
+
+    // HDR (TRIREME_HDR): the flag is a CAPABILITY opt-in — it asks the host for a
+    // 10-bit HEVC Main10 (BT.2020/PQ) stream (the `wants_hdr` handshake below) — but
+    // it does NOT force the HDR→SDR tonemap. The tonemap runs only when the host's
+    // DG_STREAM_HDR announce CONFIRMS the stream is HDR, because forcing it onto an
+    // SDR stream fails zscale (`no path between colorspaces`) and blacks the window
+    // (issue #16). The desktop render path is 8-bit NV12 / BT.709, so when HDR is
+    // confirmed we tonemap HDR10 → SDR BT.709 in ffmpeg (the standalone HW decoders
+    // here — hevc_cuvid / hevc_qsv — emit system-memory frames, so the CPU filter
+    // runs); a true HDR-passthrough swapchain is a follow-up.
+    let wants_hdr = std::env::var_os("TRIREME_HDR").is_some();
+    // Give the announce a brief window to arrive before we commit the chain (the
+    // host sends DG_STREAM_HDR before any AU, same as the geometry). If it hasn't
+    // landed we default to PLAIN DECODE — the crash-safe choice; a genuinely-HDR
+    // stream that slips through merely looks washed-out until the reader thread sees
+    // the flip and triggers a rebuild. Only worth waiting for at all when we opted
+    // in; an SDR-only client never blocks.
+    let announced_hdr = if wants_hdr {
+        let mut a = taps.stream_hdr();
+        let mut waited_ms = 0u32;
+        while a.is_none() && waited_ms < 500 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            waited_ms += 10;
+            a = taps.stream_hdr();
+        }
+        a
+    } else {
+        None
+    };
+    let tonemap = should_tonemap_hdr(wants_hdr, announced_hdr);
+    if tonemap {
+        tracing::info!("source[{idx}] HDR stream announced; inserting HDR→SDR tonemap");
         args.extend(
             [
                 "-i",
                 "pipe:0",
                 "-vf",
-                "zscale=t=linear:npl=203,tonemap=hable,zscale=p=bt709:t=bt709:m=bt709:r=tv,format=nv12",
+                HDR_TONEMAP_VF,
                 "-f",
                 "rawvideo",
                 "-pix_fmt",
@@ -2096,6 +2157,15 @@ fn spawn_decode(
             .map(|s| s.to_string()),
         );
     } else {
+        if wants_hdr {
+            tracing::info!(
+                "source[{idx}] HDR requested but stream is {} — plain decode (no tonemap)",
+                match announced_hdr {
+                    Some(false) => "SDR",
+                    _ => "not-yet-announced",
+                }
+            );
+        }
         args.extend(
             [
                 "-i", "pipe:0", "-f", "rawvideo", "-pix_fmt", "nv12", "pipe:1",
@@ -2114,19 +2184,13 @@ fn spawn_decode(
     let mut stdin = ff.stdin.take().context("ffmpeg stdin")?;
     let mut stdout = ff.stdout.take().context("ffmpeg stdout")?;
 
-    // Live-benchmark latency taps, shared across the three threads below. The
-    // encoder is IPPP (1 AU in → 1 NV12 out, in order), so a plain FIFO of
-    // submit instants matches each decoded frame to the AU that produced it.
-    let taps = Arc::new(transport::LatencyTaps::new());
-    // Submit instants pushed by the on_frame closure (QUIC thread) as it writes
-    // each AU to ffmpeg stdin, popped oldest-first by the reader thread when a
-    // decoded frame emerges. A tiny deque; never blocks the render path.
-    let submit_times: Arc<Mutex<VecDeque<Instant>>> = Arc::new(Mutex::new(VecDeque::new()));
-
     let frames_r = frames.clone();
     let proxy_r = proxy.clone();
     let taps_dec = taps.clone();
     let submit_dec = submit_times.clone();
+    // Colorimetry the current ffmpeg chain was built for; the reader watches for a
+    // mid-session flip (host toggled HDR at a respawn boundary) and rebuilds.
+    let chain_tonemap = tonemap;
     std::thread::Builder::new()
         .name(format!("trireme-raw-{idx}"))
         .spawn(move || {
@@ -2157,6 +2221,23 @@ fn spawn_decode(
             let mut buf = vec![0u8; (fw as usize) * (fh as usize) * 3 / 2];
             let mut count: u64 = 0;
             loop {
+                // Colorimetry flip (issue #16): the host toggled HDR↔SDR at a respawn
+                // boundary and re-announced via DG_STREAM_HDR. The `-vf` is fixed at
+                // ffmpeg-spawn time, so a flip relative to what THIS chain was built
+                // for (`chain_tonemap`) needs a full rebuild — route it through the
+                // existing Reconnect path, which respawns the source with a freshly
+                // evaluated `-vf`. Break out so this ffmpeg drains + the detached
+                // waiter reaps it; the QUIC thread's later writes hit a closed pipe
+                // (ignored) and it exits when the reconnect tears the session down.
+                if should_tonemap_hdr(wants_hdr, taps_dec.stream_hdr()) != chain_tonemap {
+                    tracing::info!(
+                        "source[{idx}] stream colorimetry flipped (tonemap {chain_tonemap} → \
+                         {}); rebuilding decode chain",
+                        !chain_tonemap
+                    );
+                    let _ = proxy_r.send_event(UserEvent::Reconnect(idx));
+                    break;
+                }
                 // Re-derive the frame size if the host (re-)announced geometry that
                 // differs from what we're slicing at — covers the resolution actuator's
                 // live changes and a late/lost connect-time datagram. ffmpeg switches
@@ -2238,11 +2319,11 @@ fn spawn_decode(
                 None,            // desktop player: no app-catalog relay yet
                 None,            // desktop player: no app-launch relay yet
                 false, // desktop player: no controller gyro (no IMU on the desktop client)
-                // wants_hdr: the desktop client pipes the raw HEVC to its player
-                // (mpv/ffmpeg), which decodes Main10 HDR10 natively — so requesting
-                // HDR just means asking the host for a 10-bit stream. Opt in with
-                // TRIREME_HDR=1 (Linux + Windows). Off by default (SDR).
-                std::env::var_os("TRIREME_HDR").is_some(),
+                // wants_hdr: the CAPABILITY opt-in (TRIREME_HDR). It asks the host for
+                // a 10-bit stream; the tonemap `-vf` is decided separately, from the
+                // host's DG_STREAM_HDR announce (issue #16). Keep sending it so an
+                // HDR-capable host still streams HDR. Off by default (SDR).
+                wants_hdr,
                 Some(Box::new({
                     // Log link-health edges. The desktop player has no on-screen
                     // overlay facility yet, so this is log-only (the Android client
@@ -2395,6 +2476,27 @@ pub fn run(cfg: PlayerCfg) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `-vf` branch decision (issue #16): the HDR→SDR tonemap runs ONLY when the
+    /// client opted into HDR AND the host's announce CONFIRMS the stream is HDR.
+    /// Every other combination is plain decode — critically the crash-prone ones
+    /// (opted-in but stream SDR, or announce not-yet-known) default safely to plain
+    /// decode, never forcing the tonemap onto an SDR stream.
+    #[test]
+    fn tonemap_only_on_confirmed_hdr() {
+        // Opted in + confirmed HDR → tonemap. The one true case.
+        assert!(should_tonemap_hdr(true, Some(true)));
+        // Opted in but the stream is SDR → plain decode (this is the black-window
+        // crash the whole fix prevents).
+        assert!(!should_tonemap_hdr(true, Some(false)));
+        // Opted in but the announce hasn't arrived → plain decode (crash-safe
+        // default; a real HDR stream self-corrects on the next rebuild).
+        assert!(!should_tonemap_hdr(true, None));
+        // Not opted in → plain decode regardless of what the host announces.
+        assert!(!should_tonemap_hdr(false, Some(true)));
+        assert!(!should_tonemap_hdr(false, Some(false)));
+        assert!(!should_tonemap_hdr(false, None));
+    }
 
     #[test]
     fn source_rotates_through_candidate_addresses() {

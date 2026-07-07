@@ -1777,9 +1777,13 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
         };
 
         // Announce the encode geometry so the client sizes its decoder to the real
-        // resolution (vs. guessing 1080p and shearing every NV12 frame).
+        // resolution (vs. guessing 1080p and shearing every NV12 frame), and the
+        // colorimetry so the client only runs its HDR→SDR tonemap on a real HDR
+        // stream (issue #16). HDR is fixed per process here (PHAROS_HDR at startup),
+        // so this one announce holds for the session.
         if let Some(s) = &streamer {
             s.set_geometry(oc.w, oc.h);
+            s.set_hdr(hdr);
         }
 
         info!(
