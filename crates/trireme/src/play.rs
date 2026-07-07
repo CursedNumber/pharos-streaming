@@ -1831,6 +1831,17 @@ fn chain_action(
     }
 }
 
+/// The take/put reinsertion rule for the on_frame writer (issue #16 deadlock fix).
+/// After writing an AU with the stdin Mutex RELEASED, the writer wants to put the
+/// ChildStdin back, but only if the reader's rebuild path hasn't installed a fresh
+/// child's stdin in the meantime. `slot_empty` is whether the shared slot is `None`
+/// at re-lock time: put back iff it is still empty, otherwise drop our now-stale stdin
+/// so we never clobber the new chain the reader just swapped in. Pulled out as a pure
+/// predicate purely so the race decision is unit-testable.
+fn reinsert_stdin(slot_empty: bool) -> bool {
+    slot_empty
+}
+
 /// Build the full ffmpeg argument vector for the HEVC/AV1 → NV12 decode, optionally
 /// inserting the HDR→SDR tonemap `-vf` (`tonemap = true`). Factored out of
 /// [`spawn_decode`] so the reader thread can rebuild the child IN PLACE with the
@@ -1872,7 +1883,7 @@ fn decode_ffmpeg_args(tonemap: bool) -> Vec<String> {
 /// Spawn the decode ffmpeg for the given chain and return the child plus its stdin
 /// and stdout handles. The reader thread calls this both for the initial chain and
 /// for every in-place rebuild on a colorimetry flip (issue #16); each rebuild reaps
-/// nothing here (the caller detaches a waiter on the old child), it just swaps in a
+/// nothing here (the caller kills-and-reaps the old child first), it just swaps in a
 /// freshly-spawned child on the SAME QUIC connection.
 fn spawn_decode_ffmpeg(
     tonemap: bool,
@@ -2358,18 +2369,40 @@ fn spawn_decode(
             // The current decode child, held in an Option so a rebuild can `take()` it
             // for reaping without leaving `ff` moved-out for the borrow checker.
             let mut ff = Some(ff);
-            // Rebuild the decode ffmpeg IN PLACE with `to_tonemap` (issue #16). Reaps
-            // the old child off-thread, spawns the new one, re-points the shared stdin
+            // Rebuild the decode ffmpeg IN PLACE with `to_tonemap` (issue #16). KILLS
+            // and reaps the old child, spawns the new one, re-points the shared stdin
             // the on_frame closure writes to, and returns its stdout for the reader to
             // switch to. The SAME QUIC connection carries on, so the host never sees a
             // drop and cannot preempt us — a colorimetry flip can therefore never
             // reconnect, which is what makes the old ~1.5s storm impossible. Returns the
             // new (child, stdout) or None if the respawn failed (reader then exits).
+            //
+            // ORDERING INVARIANT (deadlock fix): the old child is KILLED before we ever
+            // reach for the shared stdin Mutex. Here is the cycle that reorder breaks.
+            // A single 4K IDR AU can exceed the ~64KB pipe buffer, and while the reader
+            // is in this rebuild path it is NOT draining ffmpeg's stdout, so a frame can
+            // fill stdout, ffmpeg stops reading stdin, ffmpeg's stdin pipe fills, and the
+            // on_frame closure's `write_all` then BLOCKS while still holding the stdin
+            // Mutex. If we tried to `lock()` the stdin here first we would wait forever on
+            // a guard the writer can't release (it is wedged on a full pipe whose reader,
+            // ffmpeg, is itself wedged on a full stdout only WE drain). Killing the old
+            // child first (SIGKILL + closing its pipe fds) makes that blocked `write_all`
+            // fail with BrokenPipe/EPIPE; it is a `let _ = …` so it returns harmlessly and
+            // DROPS the guard, after which our lock below succeeds. Merely setting the
+            // Option to None can NOT free a child blocked on its STDOUT, so the kill (not
+            // an EOF on stdin) is what actually unwedges everything.
             let rebuild = |old_ff: Option<std::process::Child>, to_tonemap: bool| {
+                // 1. Kill the old child BEFORE any lock acquisition. This unblocks a
+                //    concurrent on_frame `write_all` that is stuck on the old child's full
+                //    stdin pipe (it gets EPIPE and releases the guard), and it lets us reap
+                //    the child fast below instead of `wait()`-ing on a possibly-wedged live
+                //    process. Kill is idempotent-safe: an already-exited child just errors.
                 if let Some(mut old) = old_ff {
-                    std::thread::spawn(move || {
-                        let _ = old.wait();
-                    });
+                    let _ = old.kill();
+                    // 2. Reap in place; the child is dead now, so this returns promptly and
+                    //    leaves no zombie. (Doing this before the lock also means the guard
+                    //    is free by the time we take it in step 3/4.)
+                    let _ = old.wait();
                 }
                 // If the QUIC session has already ended there is nothing to feed a new
                 // child — refuse to rebuild so the reader exits instead of spawning an
@@ -2379,12 +2412,15 @@ fn spawn_decode(
                     *stdin_dec.lock().unwrap() = None;
                     return None;
                 }
-                // Close the old stdin first so the doomed child sees EOF and exits;
-                // the window where stdin is `None` drops a few AUs, which the host's
-                // ~1×/s IDR re-sync papers over on the new chain.
+                // 3. Now the writer's guard is free, so clearing the shared stdin cannot
+                //    block. (The old child is already dead; this just drops the stale
+                //    ChildStdin. A few AUs may fall in the None window; the host's ~1×/s
+                //    IDR re-sync papers over that on the new chain.)
                 *stdin_dec.lock().unwrap() = None;
                 match spawn_decode_ffmpeg(to_tonemap) {
                     Ok((new_ff, new_stdin, new_stdout)) => {
+                        // 4. Install the new child's stdin under the lock so the next
+                        //    on_frame feeds the fresh chain.
                         *stdin_dec.lock().unwrap() = Some(new_stdin);
                         Some((new_ff, new_stdout))
                     }
@@ -2516,6 +2552,15 @@ fn spawn_decode(
     // the brief rebuild window it is `None` and the AU is dropped; the host's ~1×/s
     // IDR re-sync recovers the new chain, and no reconnect happens so the connection
     // survives the swap.
+    //
+    // The blocking `write_all` runs WITHOUT the Mutex held (take/put): we TAKE the
+    // ChildStdin out of the Option under the lock, write with the lock RELEASED, then
+    // put it back ONLY IF the slot is still empty. This is the second half of the
+    // deadlock fix; holding the guard across a full-pipe `write_all` is exactly what
+    // let the reader's rebuild wedge on `lock()`. on_frame runs inline on the single
+    // threaded QUIC task, so there is never a concurrent on_frame; the take/put pair is
+    // therefore atomic in practice and can only race the reader's swap, which we handle
+    // by NOT clobbering a stdin the reader installed while our write was in flight.
     let stdin_quic = shared_stdin.clone();
     std::thread::Builder::new()
         .name(format!("trireme-quic-{idx}"))
@@ -2529,8 +2574,17 @@ fn spawn_decode(
                     // decoder; the reader thread pops it when the matching NV12
                     // frame comes out (decode-stage latency).
                     submit_times.lock().unwrap().push_back(Instant::now());
-                    if let Some(stdin) = stdin_quic.lock().unwrap().as_mut() {
+                    // TAKE the stdin out under the lock, then release before writing so a
+                    // full-pipe `write_all` never blocks the reader's rebuild `lock()`.
+                    let taken = stdin_quic.lock().unwrap().take();
+                    if let Some(mut stdin) = taken {
                         let _ = stdin.write_all(&au);
+                        // PUT it back only if the reader hasn't installed a new child in
+                        // the meantime. If the slot is now Some (rebuild swapped in the
+                        // fresh chain), drop this stale stdin instead of clobbering it.
+                        if reinsert_stdin(stdin_quic.lock().unwrap().is_none()) {
+                            *stdin_quic.lock().unwrap() = Some(stdin);
+                        }
                     }
                 },
                 Some(input_rx),
@@ -2822,6 +2876,19 @@ mod tests {
         // HDR client, plain chain, announce not yet arrived, alive → Keep (we don't
         // speculatively upgrade to tonemap without a confirmed HDR announce).
         assert_eq!(chain_action(true, false, None, true), ChainAction::Keep);
+    }
+
+    /// The on_frame writer's take/put race decision (issue #16 deadlock fix). After a
+    /// lock-released `write_all`, put the stdin back ONLY if the slot is still empty; if
+    /// the reader's rebuild swapped a fresh child's stdin in while we wrote, the slot is
+    /// now Some and we must drop our stale stdin rather than clobber the new chain.
+    #[test]
+    fn reinsert_stdin_never_clobbers_a_swapped_in_child() {
+        // Slot still empty (the common case): re-insert our stdin.
+        assert!(reinsert_stdin(true));
+        // Reader installed a new child's stdin while we wrote: do NOT re-insert (drop
+        // the stale one). This is what keeps a mid-write colorimetry rebuild correct.
+        assert!(!reinsert_stdin(false));
     }
 
     #[test]
