@@ -1758,6 +1758,142 @@ fn should_tonemap_hdr(wants_hdr: bool, announced: Option<bool>) -> bool {
     wants_hdr && announced == Some(true)
 }
 
+/// What the decode reader should do about the current ffmpeg chain's colorimetry
+/// (issue #16). The reader owns the ffmpeg child and can restart it IN PLACE on the
+/// same QUIC connection, so a colorimetry flip never reconnects (no host preempt, no
+/// storm). This is the pure decision it makes each time it needs to (re)evaluate:
+///
+/// - `wants_hdr`: the client's `TRIREME_HDR` capability opt-in.
+/// - `chain_tonemap`: whether the CURRENTLY RUNNING ffmpeg chain has the HDR→SDR
+///   tonemap `-vf` inserted.
+/// - `announced`: the host's `DG_STREAM_HDR` colorimetry (`None` = not-yet-known).
+/// - `ffmpeg_alive`: whether the current decode ffmpeg is still emitting frames.
+///   When it has died after producing nothing on an HDR-built chain, that is itself
+///   evidence the stream is really SDR (zscale `no path between colorspaces`), so we
+///   force a rebuild to plain even if the announce hasn't (yet) said SDR.
+///
+/// The rule is: rebuild only when the chain we WANT (`should_tonemap_hdr`) actually
+/// differs from the one we HAVE, or when a tonemap chain has died on us (the
+/// SDR-masquerading-as-HDR case). Otherwise keep the chain. Because a rebuild always
+/// moves the chain to exactly what the (stable) stream needs, re-evaluating after the
+/// rebuild returns `Keep`: the decision is a fixed point, so it cannot loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainAction {
+    /// The chain matches the stream; do nothing.
+    Keep,
+    /// Restart ffmpeg WITH the HDR→SDR tonemap `-vf`.
+    RebuildToTonemap,
+    /// Restart ffmpeg WITHOUT the tonemap (plain NV12 decode).
+    RebuildToPlain,
+}
+
+fn chain_action(
+    wants_hdr: bool,
+    chain_tonemap: bool,
+    announced: Option<bool>,
+    ffmpeg_alive: bool,
+) -> ChainAction {
+    // A never-opted-in (SDR) client must NEVER carry a tonemap chain — forcing the
+    // tonemap onto an SDR stream is the original black-window crash (#16). This is the
+    // one case where we rebuild a still-alive chain: back to plain, unconditionally.
+    if !wants_hdr {
+        return if chain_tonemap {
+            ChainAction::RebuildToPlain
+        } else {
+            ChainAction::Keep
+        };
+    }
+    // From here the client opted into HDR. We rebuild only on POSITIVE contrary
+    // evidence, never merely because the announce hasn't landed — otherwise the
+    // request-based optimistic tonemap chain would be torn down on the first idle
+    // iterations and rebuilt when the HDR announce arrived, i.e. a spurious flip on the
+    // happy path.
+    //
+    // A tonemap chain that DIED without ever confirming HDR is such evidence: the
+    // stream was really SDR, zscale had `no path between colorspaces`, and ffmpeg
+    // exited (the request/stream mismatch — BUG 3). Force it back to plain.
+    if !ffmpeg_alive && chain_tonemap && announced != Some(true) {
+        return ChainAction::RebuildToPlain;
+    }
+    // With no confirmed announce yet, hold an alive chain as-is (the storm-free
+    // branch). Once the announce lands, `should_tonemap_hdr` is the canonical target
+    // chain for the (now steady) stream; rebuild toward it if we differ, else keep.
+    // This is a FIXED POINT: after the rebuild the chain equals the target, so a
+    // re-evaluation returns Keep and the reader cannot loop.
+    let Some(_) = announced else {
+        return ChainAction::Keep;
+    };
+    let target_tonemap = should_tonemap_hdr(wants_hdr, announced);
+    match (target_tonemap, chain_tonemap) {
+        (true, false) => ChainAction::RebuildToTonemap,
+        (false, true) => ChainAction::RebuildToPlain,
+        _ => ChainAction::Keep,
+    }
+}
+
+/// Build the full ffmpeg argument vector for the HEVC/AV1 → NV12 decode, optionally
+/// inserting the HDR→SDR tonemap `-vf` (`tonemap = true`). Factored out of
+/// [`spawn_decode`] so the reader thread can rebuild the child IN PLACE with the
+/// other chain on a mid-session colorimetry flip (issue #16), reusing the exact same
+/// decoder/codec/loglevel setup rather than reconnecting.
+fn decode_ffmpeg_args(tonemap: bool) -> Vec<String> {
+    let ff_debug = std::env::var_os("TRIREME_FFMPEG_DEBUG").is_some();
+    let lead: &[&str] = if ff_debug {
+        &["-hide_banner", "-loglevel", "info", "-stats"]
+    } else {
+        &["-hide_banner", "-loglevel", "warning"]
+    };
+    let mut args: Vec<String> = lead.iter().map(|s| s.to_string()).collect();
+    let codec = media_decode::codec_from_env(media_decode::StreamCodec::Hevc);
+    args.extend(media_decode::input_args_for(codec));
+    args.push("-f".into());
+    args.push(codec.ffmpeg_format());
+    if tonemap {
+        args.extend(
+            [
+                "-i", "pipe:0", "-vf", HDR_TONEMAP_VF, "-f", "rawvideo", "-pix_fmt", "nv12",
+                "pipe:1",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
+    } else {
+        args.extend(
+            [
+                "-i", "pipe:0", "-f", "rawvideo", "-pix_fmt", "nv12", "pipe:1",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
+    }
+    args
+}
+
+/// Spawn the decode ffmpeg for the given chain and return the child plus its stdin
+/// and stdout handles. The reader thread calls this both for the initial chain and
+/// for every in-place rebuild on a colorimetry flip (issue #16); each rebuild reaps
+/// nothing here (the caller detaches a waiter on the old child), it just swaps in a
+/// freshly-spawned child on the SAME QUIC connection.
+fn spawn_decode_ffmpeg(
+    tonemap: bool,
+) -> Result<(
+    std::process::Child,
+    std::process::ChildStdin,
+    std::process::ChildStdout,
+)> {
+    let args = decode_ffmpeg_args(tonemap);
+    let mut ff = Command::new(ffmpeg_program())
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("spawn ffmpeg (HEVC/AV1 decode)")?;
+    let stdin = ff.stdin.take().context("ffmpeg stdin")?;
+    let stdout = ff.stdout.take().context("ffmpeg stdout")?;
+    Ok((ff, stdin, stdout))
+}
+
 /// Spawn the right pipeline for a source and return its input back-channel.
 /// Pharos sources (the default) get a QUIC/HEVC decode pipeline; VNC and SPICE
 /// sources decode client-side and bridge full RGBA frames through a shared
@@ -2116,34 +2252,20 @@ fn spawn_decode(
     // pixel format, and a periodic `frame= N fps=…` line on stderr (ffmpeg
     // flushes stats, so they survive even a force-kill). Indispensable for
     // confirming HW decode actually emits frames at line rate.
-    let ff_debug = std::env::var_os("TRIREME_FFMPEG_DEBUG").is_some();
-    let lead: &[&str] = if ff_debug {
-        &["-hide_banner", "-loglevel", "info", "-stats"]
-    } else {
-        &["-hide_banner", "-loglevel", "warning"]
-    };
-    let mut args: Vec<String> = lead.iter().map(|s| s.to_string()).collect();
-    // Pick the box's best HEVC HW decoder at runtime — NVDEC (`hevc_cuvid`),
-    // Quick Sync (`hevc_qsv`), Rockchip MPP (`hevc_rkmpp`), V4L2 stateless
-    // (`-hwaccel drm`, e.g. Raspberry Pi 5), … — probed + logged once per process
-    // (override with `TRIREME_DECODER`). Output is forced to system-memory NV12,
-    // so whichever decoder wins, its frames arrive in exactly the format the
-    // renderer's R8+Rg8 textures and BT.709 shader already consume — the rest of
-    // the pipeline is decoder-agnostic.
-    // Codec: HEVC by default; AV1 when the host streams it (set TRIREME_CODEC=av1
-    // to follow a host switched to AV1 — over-the-wire negotiation is the next
-    // step). `input_args_for` retargets the probed HW decoder to its AV1 sibling.
-    let codec = media_decode::codec_from_env(media_decode::StreamCodec::Hevc);
-    args.extend(media_decode::input_args_for(codec));
-    args.push("-f".into());
-    args.push(codec.ffmpeg_format());
+    // The HW decoder is chosen at runtime by `media_decode` (probe + test-decode,
+    // logged once; override with `TRIREME_DECODER`). Output is forced to
+    // system-memory NV12, so whichever decoder wins, its frames arrive in exactly the
+    // format the renderer's R8+Rg8 textures and BT.709 shader already consume — the
+    // rest of the pipeline is decoder-agnostic. Codec: HEVC by default; AV1 when the
+    // host streams it (`TRIREME_CODEC=av1`). The full ffmpeg arg vector (with or
+    // without the HDR→SDR tonemap `-vf`) is built by `decode_ffmpeg_args`, so the
+    // reader thread can rebuild the child IN PLACE with the other chain on a flip.
 
-    // Live-benchmark latency taps, shared across the three threads below. The
-    // encoder is IPPP (1 AU in → 1 NV12 out, in order), so a plain FIFO of
-    // submit instants matches each decoded frame to the AU that produced it. Also
-    // carries the host's DG_STREAM_HDR colorimetry announce, which decides the
-    // `-vf` below — so it must exist before the args are built. Created here (fresh
-    // per spawn), fed by the QUIC thread once it connects.
+    // Live-benchmark latency taps, shared across the threads below. The encoder is
+    // IPPP (1 AU in → 1 NV12 out, in order), so a plain FIFO of submit instants
+    // matches each decoded frame to the AU that produced it. Also carries the host's
+    // DG_STREAM_HDR colorimetry announce, which the reader watches to rebuild the
+    // chain. Created here (fresh per spawn), fed by the QUIC thread once it connects.
     let taps = Arc::new(transport::LatencyTaps::new());
     // Submit instants pushed by the on_frame closure (QUIC thread) as it writes
     // each AU to ffmpeg stdin, popped oldest-first by the reader thread when a
@@ -2151,89 +2273,58 @@ fn spawn_decode(
     let submit_times: Arc<Mutex<VecDeque<Instant>>> = Arc::new(Mutex::new(VecDeque::new()));
 
     // HDR (TRIREME_HDR): the flag is a CAPABILITY opt-in — it asks the host for a
-    // 10-bit HEVC Main10 (BT.2020/PQ) stream (the `wants_hdr` handshake below) — but
-    // it does NOT force the HDR→SDR tonemap. The tonemap runs only when the host's
-    // DG_STREAM_HDR announce CONFIRMS the stream is HDR, because forcing it onto an
-    // SDR stream fails zscale (`no path between colorspaces`) and blacks the window
-    // (issue #16). The desktop render path is 8-bit NV12 / BT.709, so when HDR is
-    // confirmed we tonemap HDR10 → SDR BT.709 in ffmpeg (the standalone HW decoders
-    // here — hevc_cuvid / hevc_qsv — emit system-memory frames, so the CPU filter
-    // runs); a true HDR-passthrough swapchain is a follow-up.
+    // 10-bit HEVC Main10 (BT.2020/PQ) stream (the `wants_hdr` handshake below). The
+    // desktop render path is 8-bit NV12 / BT.709, so a genuinely-HDR stream must be
+    // tonemapped HDR10 → SDR BT.709 in ffmpeg; an SDR stream must NOT (zscale fails
+    // `no path between colorspaces` and blacks the window — issue #16).
     let wants_hdr = std::env::var_os("TRIREME_HDR").is_some();
-    // Give the announce a brief window to arrive before we commit the chain (the
-    // host sends DG_STREAM_HDR before any AU, same as the geometry). If it hasn't
-    // landed we default to PLAIN DECODE — the crash-safe choice; a genuinely-HDR
-    // stream that slips through merely looks washed-out until the reader thread sees
-    // the flip and triggers a rebuild. Only worth waiting for at all when we opted
-    // in; an SDR-only client never blocks.
-    let announced_hdr = if wants_hdr {
-        let mut a = taps.stream_hdr();
-        let mut waited_ms = 0u32;
-        while a.is_none() && waited_ms < 500 {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            waited_ms += 10;
-            a = taps.stream_hdr();
-        }
-        a
-    } else {
-        None
-    };
-    let tonemap = should_tonemap_hdr(wants_hdr, announced_hdr);
-    if tonemap {
-        tracing::info!("source[{idx}] HDR stream announced; inserting HDR→SDR tonemap");
-        args.extend(
-            [
-                "-i",
-                "pipe:0",
-                "-vf",
-                HDR_TONEMAP_VF,
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "nv12",
-                "pipe:1",
-            ]
-            .iter()
-            .map(|s| s.to_string()),
-        );
-    } else {
-        if wants_hdr {
-            tracing::info!(
-                "source[{idx}] HDR requested but stream is {} — plain decode (no tonemap)",
-                match announced_hdr {
-                    Some(false) => "SDR",
-                    _ => "not-yet-announced",
-                }
-            );
-        }
-        args.extend(
-            [
-                "-i", "pipe:0", "-f", "rawvideo", "-pix_fmt", "nv12", "pipe:1",
-            ]
-            .iter()
-            .map(|s| s.to_string()),
+
+    // Initial chain from the CLIENT REQUEST, not a host announce (issue #16). The
+    // old code waited up to 500ms for `taps.stream_hdr()` HERE, but nothing feeds the
+    // taps until the QUIC thread (spawned further down) connects — so that wait ALWAYS
+    // timed out to plain, and against a real HDR host the reader instantly detected a
+    // flip and reconnected, which the single-client host preempts → a ~1.5s
+    // reconnect/preempt storm. Instead: if we opted into HDR we assume the stream we
+    // ASKED for is HDR and tonemap optimistically. The happy path (HDR client + HDR
+    // host) then builds the correct chain FIRST → no flip, no storm. If the host
+    // actually serves SDR, the reader rebuilds to plain in place (same QUIC
+    // connection) the moment ffmpeg dies with 0 frames or the announce says SDR.
+    let initial_tonemap = wants_hdr;
+    if initial_tonemap {
+        tracing::info!(
+            "source[{idx}] HDR requested; building HDR→SDR tonemap chain (adapts if the \
+             stream is actually SDR)"
         );
     }
-    let mut ff = Command::new(ffmpeg_program())
-        .args(&args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .with_context(|| format!("spawn ffmpeg ({} decode)", codec.label()))?;
-    let mut stdin = ff.stdin.take().context("ffmpeg stdin")?;
-    let mut stdout = ff.stdout.take().context("ffmpeg stdout")?;
+    let (ff, stdin0, mut stdout) = spawn_decode_ffmpeg(initial_tonemap)
+        .with_context(|| format!("spawn ffmpeg (source[{idx}] decode)"))?;
+    // The stdin the on_frame closure writes each AU to. Wrapped so the reader thread
+    // can SWAP it for a freshly-rebuilt child's stdin on a colorimetry flip WITHOUT
+    // reconnecting: the QUIC connection (and this closure) stays alive across the
+    // rebuild, so the host never sees a drop and cannot preempt us. `None` briefly
+    // while the reader is mid-rebuild; writes in that window are dropped (the host
+    // re-sends an IDR ~1×/s so the new chain resyncs).
+    let shared_stdin: Arc<Mutex<Option<std::process::ChildStdin>>> =
+        Arc::new(Mutex::new(Some(stdin0)));
+    // Set by the QUIC thread when the session ends (drop / host refusal / error) so the
+    // reader can tell a genuine end-of-session from a colorimetry-rebuild window: once
+    // the session is over there is nothing feeding a new decode child, so the reader
+    // must EXIT rather than rebuild (which would otherwise spawn an unfed child).
+    let quic_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let frames_r = frames.clone();
     let proxy_r = proxy.clone();
     let taps_dec = taps.clone();
     let submit_dec = submit_times.clone();
-    // Colorimetry the current ffmpeg chain was built for; the reader watches for a
-    // mid-session flip (host toggled HDR at a respawn boundary) and rebuilds.
-    let chain_tonemap = tonemap;
+    let stdin_dec = shared_stdin.clone();
+    let quic_done_dec = quic_done.clone();
     std::thread::Builder::new()
         .name(format!("trireme-raw-{idx}"))
         .spawn(move || {
+            // Colorimetry the CURRENTLY RUNNING ffmpeg chain was built for. Starts at
+            // the request-based initial choice and moves only when THIS thread rebuilds
+            // the child, so it always reflects the live `-vf`.
+            let mut chain_tonemap = initial_tonemap;
             // Size the NV12 reader to the host's TRUE geometry. The host announces
             // it over the wire (DG_STREAM_GEOMETRY → stashed in the taps); wait
             // briefly so the very first read is aligned — the host sends it before
@@ -2260,23 +2351,73 @@ fn spawn_decode(
             }
             let mut buf = vec![0u8; (fw as usize) * (fh as usize) * 3 / 2];
             let mut count: u64 = 0;
+            // Frames THIS ffmpeg child has emitted. Reset on every rebuild so a chain
+            // that dies without producing anything is recognisable as the
+            // wrong-colorimetry case (`chain_action`'s `ffmpeg_alive=false` path).
+            let mut frames_this_chain: u64 = 0;
+            // The current decode child, held in an Option so a rebuild can `take()` it
+            // for reaping without leaving `ff` moved-out for the borrow checker.
+            let mut ff = Some(ff);
+            // Rebuild the decode ffmpeg IN PLACE with `to_tonemap` (issue #16). Reaps
+            // the old child off-thread, spawns the new one, re-points the shared stdin
+            // the on_frame closure writes to, and returns its stdout for the reader to
+            // switch to. The SAME QUIC connection carries on, so the host never sees a
+            // drop and cannot preempt us — a colorimetry flip can therefore never
+            // reconnect, which is what makes the old ~1.5s storm impossible. Returns the
+            // new (child, stdout) or None if the respawn failed (reader then exits).
+            let rebuild = |old_ff: Option<std::process::Child>, to_tonemap: bool| {
+                if let Some(mut old) = old_ff {
+                    std::thread::spawn(move || {
+                        let _ = old.wait();
+                    });
+                }
+                // If the QUIC session has already ended there is nothing to feed a new
+                // child — refuse to rebuild so the reader exits instead of spawning an
+                // unfed ffmpeg (which would never read a frame). Returning None makes the
+                // caller break.
+                if quic_done_dec.load(std::sync::atomic::Ordering::Relaxed) {
+                    *stdin_dec.lock().unwrap() = None;
+                    return None;
+                }
+                // Close the old stdin first so the doomed child sees EOF and exits;
+                // the window where stdin is `None` drops a few AUs, which the host's
+                // ~1×/s IDR re-sync papers over on the new chain.
+                *stdin_dec.lock().unwrap() = None;
+                match spawn_decode_ffmpeg(to_tonemap) {
+                    Ok((new_ff, new_stdin, new_stdout)) => {
+                        *stdin_dec.lock().unwrap() = Some(new_stdin);
+                        Some((new_ff, new_stdout))
+                    }
+                    Err(e) => {
+                        tracing::error!("source[{idx}] decode-chain rebuild failed: {e:#}");
+                        None
+                    }
+                }
+            };
             loop {
-                // Colorimetry flip (issue #16): the host toggled HDR↔SDR at a respawn
-                // boundary and re-announced via DG_STREAM_HDR. The `-vf` is fixed at
-                // ffmpeg-spawn time, so a flip relative to what THIS chain was built
-                // for (`chain_tonemap`) needs a full rebuild — route it through the
-                // existing Reconnect path, which respawns the source with a freshly
-                // evaluated `-vf`. Break out so this ffmpeg drains + the detached
-                // waiter reaps it; the QUIC thread's later writes hit a closed pipe
-                // (ignored) and it exits when the reconnect tears the session down.
-                if should_tonemap_hdr(wants_hdr, taps_dec.stream_hdr()) != chain_tonemap {
-                    tracing::info!(
-                        "source[{idx}] stream colorimetry flipped (tonemap {chain_tonemap} → \
-                         {}); rebuilding decode chain",
-                        !chain_tonemap
-                    );
-                    let _ = proxy_r.send_event(UserEvent::Reconnect(idx));
-                    break;
+                // Colorimetry flip (issue #16): the host toggled HDR↔SDR (e.g. a wgc-zc
+                // pipeline respawn as the other colorimetry) and re-announced via
+                // DG_STREAM_HDR, OR the initial request-based guess was wrong. If the
+                // chain we WANT differs from the one running, rebuild it in place. The
+                // decision is a fixed point (`chain_action` returns Keep once the chain
+                // matches the stream), so this cannot thrash.
+                match chain_action(wants_hdr, chain_tonemap, taps_dec.stream_hdr(), true) {
+                    ChainAction::Keep => {}
+                    action => {
+                        let to_tonemap = matches!(action, ChainAction::RebuildToTonemap);
+                        tracing::info!(
+                            "source[{idx}] colorimetry: rebuilding decode chain (tonemap \
+                             {chain_tonemap} → {to_tonemap})"
+                        );
+                        let Some((new_ff, new_stdout)) = rebuild(ff.take(), to_tonemap) else {
+                            break;
+                        };
+                        ff = Some(new_ff);
+                        stdout = new_stdout;
+                        chain_tonemap = to_tonemap;
+                        frames_this_chain = 0;
+                        continue;
+                    }
                 }
                 // Re-derive the frame size if the host (re-)announced geometry that
                 // differs from what we're slicing at — covers the resolution actuator's
@@ -2294,7 +2435,36 @@ fn spawn_decode(
                     }
                 }
                 if stdout.read_exact(&mut buf).is_err() {
-                    break;
+                    // The current ffmpeg died. If it was a tonemap chain that produced
+                    // nothing, the stream was really SDR (zscale `no path between
+                    // colorspaces`) — the request/stream mismatch or an HDR→SDR flip we
+                    // hadn't yet seen the announce for. `chain_action` with
+                    // `ffmpeg_alive=false` folds that into a RebuildToPlain even when the
+                    // announce is still unknown, so we rebuild to plain IN PLACE rather
+                    // than leaving a permanently black window (issue #16 BUG 3).
+                    // Otherwise (a genuine EOF/decoder crash on an already-correct chain)
+                    // fall through to the plain break and let the session end normally.
+                    let alive = frames_this_chain > 0;
+                    match chain_action(wants_hdr, chain_tonemap, taps_dec.stream_hdr(), alive) {
+                        ChainAction::Keep => break,
+                        action => {
+                            let to_tonemap = matches!(action, ChainAction::RebuildToTonemap);
+                            tracing::info!(
+                                "source[{idx}] decode ffmpeg exited after {frames_this_chain} \
+                                 frames on a {}-colorimetry chain; rebuilding to tonemap={}",
+                                if chain_tonemap { "tonemap" } else { "plain" },
+                                to_tonemap
+                            );
+                            let Some((new_ff, new_stdout)) = rebuild(ff.take(), to_tonemap) else {
+                                break;
+                            };
+                            ff = Some(new_ff);
+                            stdout = new_stdout;
+                            chain_tonemap = to_tonemap;
+                            frames_this_chain = 0;
+                            continue;
+                        }
+                    }
                 }
                 // Decode stage: this frame corresponds to the oldest AU still
                 // outstanding (IPPP, in order). Pop it and fold the elapsed time
@@ -2307,6 +2477,7 @@ fn spawn_decode(
                     tracing::info!("source[{idx}] first decoded frame ({fw}x{fh})");
                 }
                 count += 1;
+                frames_this_chain += 1;
                 if count.is_multiple_of(120) {
                     tracing::info!("source[{idx}] decoded {count} frames");
                 }
@@ -2318,12 +2489,15 @@ fn spawn_decode(
                 });
                 let _ = proxy_r.send_event(UserEvent::FrameReady(idx));
             }
+            // Reap whatever child is current when the reader exits (normal EOF; a
+            // failed rebuild already `take()`-consumed and reaped its old child).
+            if let Some(mut ff) = ff {
+                std::thread::spawn(move || {
+                    let _ = ff.wait();
+                });
+            }
             tracing::info!("source[{idx}] decode reader exited after {count} frames");
         })?;
-
-    std::thread::spawn(move || {
-        let _ = ff.wait();
-    });
 
     let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<core_proto::InputEvent>();
     let proxy_n = proxy.clone();
@@ -2337,6 +2511,12 @@ fn spawn_decode(
         }
     };
     let taps_quic = taps.clone();
+    // The on_frame closure writes each AU to whichever decode child is CURRENTLY
+    // installed (the reader swaps this on a colorimetry rebuild — issue #16). During
+    // the brief rebuild window it is `None` and the AU is dropped; the host's ~1×/s
+    // IDR re-sync recovers the new chain, and no reconnect happens so the connection
+    // survives the swap.
+    let stdin_quic = shared_stdin.clone();
     std::thread::Builder::new()
         .name(format!("trireme-quic-{idx}"))
         .spawn(move || {
@@ -2349,7 +2529,9 @@ fn spawn_decode(
                     // decoder; the reader thread pops it when the matching NV12
                     // frame comes out (decode-stage latency).
                     submit_times.lock().unwrap().push_back(Instant::now());
-                    let _ = stdin.write_all(&au);
+                    if let Some(stdin) = stdin_quic.lock().unwrap().as_mut() {
+                        let _ = stdin.write_all(&au);
+                    }
                 },
                 Some(input_rx),
                 on_audio,
@@ -2390,7 +2572,12 @@ fn spawn_decode(
                 None, // on_clipboard: desktop player clipboard sync is a follow-up
                 None, // clipboard_rx: ditto
             );
-            drop(stdin);
+            // Mark the session done BEFORE closing stdin so a reader that wakes on the
+            // resulting EOF sees the flag and exits instead of trying to rebuild an
+            // unfed decode child (issue #16). Then close stdin so ffmpeg sees EOF and
+            // the reader's `read_exact` returns; the reader reaps the child.
+            quic_done.store(true, std::sync::atomic::Ordering::Relaxed);
+            *stdin_quic.lock().unwrap() = None;
             if let Err(e) = res {
                 tracing::error!("source[{idx}] video client: {e:?}");
                 // Deliberate host refusals (issue #19) carry stable messages —
@@ -2537,6 +2724,104 @@ mod tests {
         assert!(!should_tonemap_hdr(false, Some(true)));
         assert!(!should_tonemap_hdr(false, Some(false)));
         assert!(!should_tonemap_hdr(false, None));
+    }
+
+    /// The reader's in-place rebuild decision (issue #16). The three bugs all stem
+    /// from mis-handling a colorimetry mismatch; `chain_action` is the single pure
+    /// rule the reader uses, and its key property is that it is a FIXED POINT — once
+    /// the chain matches the stream it returns `Keep`, so the reader cannot loop
+    /// (the old reconnect/preempt storm is structurally impossible here).
+    #[test]
+    fn chain_action_adapts_without_storming() {
+        use ChainAction::*;
+        // HAPPY PATH (the storm case, now fixed): HDR client, tonemap chain built
+        // optimistically from the request, host really is HDR, ffmpeg alive → KEEP.
+        // No rebuild means no reconnect means no preempt means no storm.
+        assert_eq!(chain_action(true, true, Some(true), true), Keep);
+
+        // Initial guess was plain (or host flipped SDR→HDR mid-session): HDR client,
+        // plain chain, host announces HDR → rebuild to tonemap, exactly once.
+        assert_eq!(chain_action(true, false, Some(true), true), RebuildToTonemap);
+
+        // HDR→SDR flip with the announce landed: tonemap chain but host now SDR →
+        // rebuild to plain (whether ffmpeg is still alive or already died).
+        assert_eq!(chain_action(true, true, Some(false), true), RebuildToPlain);
+        assert_eq!(chain_action(true, true, Some(false), false), RebuildToPlain);
+
+        // BUG 3 core: request/stream mismatch. HDR client, tonemap chain, the announce
+        // hasn't said anything yet, but ffmpeg DIED with no frames (zscale `no path
+        // between colorspaces`) → treat as SDR and rebuild to plain, no black window.
+        assert_eq!(chain_action(true, true, None, false), RebuildToPlain);
+        // ...but a tonemap chain that is STILL ALIVE with the announce merely unknown
+        // must be kept — we don't tear down a working HDR stream on a missing announce.
+        assert_eq!(chain_action(true, true, None, true), Keep);
+
+        // SDR client never tonemaps: a plain chain is always kept regardless of what
+        // the (ignored) announce says (preserves the #16 safety win).
+        assert_eq!(chain_action(false, false, Some(true), true), Keep);
+        assert_eq!(chain_action(false, false, None, true), Keep);
+        assert_eq!(chain_action(false, false, Some(false), true), Keep);
+        // And an SDR client that somehow has a tonemap chain rebuilds back to plain.
+        assert_eq!(chain_action(false, true, Some(true), true), RebuildToPlain);
+    }
+
+    /// Idempotence / anti-loop proof: against a STEADY stream (a live ffmpeg and a
+    /// confirmed announce) `chain_action` converges to `Keep` in at most one rebuild
+    /// and then stays there forever. This is the property that makes the reconnect
+    /// storm impossible; encode it so a future refactor can't reintroduce it.
+    #[test]
+    fn chain_action_converges_to_keep() {
+        for &wants_hdr in &[false, true] {
+            // Only CONFIRMED announces have a definite target chain. (An unknown
+            // announce deliberately holds an alive chain as-is; covered separately.)
+            for &stream_hdr in &[false, true] {
+                let announced = Some(stream_hdr);
+                let target = should_tonemap_hdr(wants_hdr, announced);
+                // Start deliberately on the opposite chain, ffmpeg alive, then iterate.
+                let mut chain = !target;
+                let mut rebuilds = 0;
+                for _ in 0..8 {
+                    match chain_action(wants_hdr, chain, announced, true) {
+                        ChainAction::Keep => break,
+                        ChainAction::RebuildToTonemap => {
+                            chain = true;
+                            rebuilds += 1;
+                        }
+                        ChainAction::RebuildToPlain => {
+                            chain = false;
+                            rebuilds += 1;
+                        }
+                    }
+                }
+                assert!(
+                    rebuilds <= 1,
+                    "wants_hdr={wants_hdr} announced={announced:?}: {rebuilds} rebuilds (want ≤1)"
+                );
+                assert_eq!(chain, target);
+                // Fixed point: re-evaluating the settled chain returns Keep.
+                assert_eq!(
+                    chain_action(wants_hdr, chain, announced, true),
+                    ChainAction::Keep
+                );
+            }
+        }
+    }
+
+    /// The happy path is storm-free specifically because an unknown announce never
+    /// tears down an ALIVE, request-built tonemap chain: both chains are fixed points
+    /// while the announce is `None` and ffmpeg is running, so nothing rebuilds until
+    /// real evidence (a confirmed announce, or ffmpeg dying) arrives.
+    #[test]
+    fn chain_action_holds_alive_chain_until_announce() {
+        // HDR client, optimistic tonemap chain, announce not yet arrived, alive → Keep.
+        assert_eq!(
+            chain_action(true, true, None, true),
+            ChainAction::Keep,
+            "an alive optimistic tonemap chain must not be rebuilt before the announce"
+        );
+        // HDR client, plain chain, announce not yet arrived, alive → Keep (we don't
+        // speculatively upgrade to tonemap without a confirmed HDR announce).
+        assert_eq!(chain_action(true, false, None, true), ChainAction::Keep);
     }
 
     #[test]
