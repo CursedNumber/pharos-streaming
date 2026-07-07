@@ -34,3 +34,5 @@ rand = "0.8"
 bytes = "1"
 # IDNA (ToASCII / punycode) so Unicode host names like `bücher.example` resolve.
 idna = "1"
+# Dual-stack UDP socket construction (IPV6_V6ONLY off) for optional IPv6 binding.
+socket2 = "0.6"

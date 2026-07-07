@@ -2266,6 +2266,8 @@ fn spawn_decode(
                 None, // res_pref: desktop player has no resolution selector yet
                 None, // bitrate_pref: ditto
                 None, // fps_pref: ditto
+                None, // on_clipboard: desktop player clipboard sync is a follow-up
+                None, // clipboard_rx: ditto
             );
             drop(stdin);
             if let Err(e) = res {

@@ -104,6 +104,21 @@ pub trait AppCatalogSink: Send + Sync {
     fn on_catalog(&self, apps: Vec<AppInfo>);
 }
 
+/// Sink for the host's clipboard: fires when a host app copied text, so the client
+/// mirrors it into its OS clipboard (Android `ClipboardManager`). An empty string
+/// means the host cleared its clipboard. Passing `None` to [`start_video_stream`]
+/// drops host→client sync. The client sends its own copies back with
+/// [`GamepadInput::set_clipboard`].
+///
+/// The shell MUST suppress the OS clipboard-changed listener it would otherwise
+/// use to drive `set_clipboard` while applying this text, or record the applied
+/// text and skip re-sending it — else host→client→host echoes.
+#[uniffi::export(callback_interface)]
+pub trait ClipboardSink: Send + Sync {
+    /// Host clipboard text (empty = cleared). Never block (called from the QUIC loop).
+    fn on_clipboard(&self, text: String);
+}
+
 /// Handle for forwarding the client's gamepad to the host, returned by
 /// [`start_video_stream`]. The platform shell captures its local controller
 /// (Android `KeyEvent`/`MotionEvent`, …), maps each to the **canonical** index
@@ -117,6 +132,10 @@ pub struct GamepadInput {
     /// QUIC client task and written on the app relay stream. Exposed via
     /// [`GamepadInput::launch_app`] / [`switch_to`] / [`end_process`].
     app_tx: tokio::sync::mpsc::UnboundedSender<core_proto::AppMsg>,
+    /// Client→host clipboard: the shell pushes text the user copied locally here;
+    /// the QUIC client task writes it on the clipboard relay stream and the host
+    /// becomes the Wayland selection owner. Exposed via [`GamepadInput::set_clipboard`].
+    clipboard_tx: tokio::sync::mpsc::UnboundedSender<core_proto::ClipboardMsg>,
     /// Flip to tear down the underlying connection (e.g. a short-lived gyro
     /// calibration session). Exposed via [`GamepadInput::stop`].
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -237,6 +256,24 @@ impl GamepadInput {
     /// Call from the Apps grid's context menu on a running tile.
     pub fn end_process(&self, id: String) {
         let _ = self.app_tx.send(core_proto::AppMsg::EndProcess { id });
+    }
+
+    /// Push text the user copied on the client to the host clipboard (empty string
+    /// clears it). The host becomes the Wayland selection owner so host apps paste
+    /// it. Drive from the OS clipboard-changed listener; to avoid a host→client→host
+    /// echo, skip calling this for text the client just applied from [`ClipboardSink`].
+    /// Cheap, non-blocking; no-op once the stream ends. Text is capped at
+    /// [`core_proto::MAX_CLIPBOARD_BYTES`] (truncated on a char boundary) so an
+    /// oversized OS clipboard can't produce a frame that trips the host reader.
+    pub fn set_clipboard(&self, mut text: String) {
+        if text.len() > core_proto::MAX_CLIPBOARD_BYTES {
+            let mut end = core_proto::MAX_CLIPBOARD_BYTES;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+        }
+        let _ = self.clipboard_tx.send(core_proto::ClipboardMsg::Text(text));
     }
 
     /// Tear down the connection this handle drives. Used by the gyro calibration
@@ -470,6 +507,7 @@ pub fn start_video_stream(
     audio_sink: Option<Box<dyn AudioSink>>,
     gyro_sink: Option<Box<dyn GyroSink>>,
     app_catalog_sink: Option<Box<dyn AppCatalogSink>>,
+    clipboard_sink: Option<Box<dyn ClipboardSink>>,
     wants_gyro: bool,
     requested_mode: StreamMode,
 ) -> std::sync::Arc<GamepadInput> {
@@ -481,6 +519,12 @@ pub fn start_video_stream(
     // launched even without a catalog sink; the QUIC task accepts the host's app
     // relay stream and writes these.
     let (app_tx, app_rx) = tokio::sync::mpsc::unbounded_channel::<core_proto::AppMsg>();
+    // Client→host clipboard channel. Always created so [`GamepadInput::set_clipboard`]
+    // works; the QUIC task writes these on the clipboard relay stream. The client
+    // syncs clipboard only when it registered a `clipboard_sink` (host→client) — but
+    // it can still SEND copies regardless, so we always keep the sender.
+    let (clipboard_tx, clipboard_rx) =
+        tokio::sync::mpsc::unbounded_channel::<core_proto::ClipboardMsg>();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cancel_thread = cancel.clone();
     // Client→host IDR request flag: the handle's request_keyframe() sets it; the
@@ -559,6 +603,11 @@ pub fn start_video_stream(
                 });
                 cb
             });
+        // Host clipboard → the platform OS clipboard (when a sink is provided).
+        let on_clipboard: Option<Box<dyn FnMut(String) + Send>> = clipboard_sink.map(|s| {
+            let cb: Box<dyn FnMut(String) + Send> = Box::new(move |text| s.on_clipboard(text));
+            cb
+        });
         // Share the FrameSink across the per-frame and link-health callbacks (both
         // take &self): an Arc lets each closure own a clone — a closure that borrowed
         // `sink` couldn't be the 'static Box<dyn FnMut> the transport wants for
@@ -595,12 +644,15 @@ pub fn start_video_stream(
             Some(res_pref_thread),
             Some(bitrate_pref_thread),
             Some(fps_pref_thread),
+            on_clipboard,
+            Some(clipboard_rx),
         );
         sink.on_end(result.err().map(|e| e.to_string()));
     });
     std::sync::Arc::new(GamepadInput {
         tx: input_tx,
         app_tx,
+        clipboard_tx,
         cancel,
         idr_request,
         res_pref,

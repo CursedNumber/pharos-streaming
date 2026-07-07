@@ -48,7 +48,7 @@ use smithay::{
                 set_data_device_focus, ClientDndGrabHandler, DataDeviceHandler, DataDeviceState,
                 ServerDndGrabHandler,
             },
-            SelectionHandler,
+            SelectionHandler, SelectionSource, SelectionTarget,
         },
         shell::xdg::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
@@ -149,6 +149,21 @@ pub struct State {
     /// [`State::switch_to_app`] to raise + focus a running app on request. Stale
     /// entries (surface gone) are pruned on lookup.
     pub app_surfaces: std::collections::HashMap<String, WlSurface>,
+
+    // --- clipboard sync (host ⇄ client) ---
+    /// Master gate for clipboard sync (both directions). `PHAROS_CLIPBOARD=0`
+    /// disables it; default on. Clipboard can carry secrets, so this is the kill
+    /// switch until a per-direction/per-device policy lands. Read by
+    /// [`SelectionHandler::new_selection`] and the render-loop drain.
+    pub clipboard_enabled: bool,
+    /// Mime flavors offered by a just-changed CLIENT clipboard selection (a host app
+    /// copied), stashed by [`SelectionHandler::new_selection`] for the render loop
+    /// to read on a LATER turn — smithay commits the new selection AFTER the
+    /// callback, so we must not read it synchronously. `Some(vec)` = a read is
+    /// pending; `Some(empty)` = the host CLEARED its clipboard (propagate an empty
+    /// text to the client). The render loop `take()`s it. The host→client sender,
+    /// echo-guard hashes, and pipe-read plumbing all live as render-loop locals.
+    pub pending_clipboard_read: Option<Vec<String>>,
 }
 
 impl State {
@@ -192,6 +207,10 @@ impl State {
             placed_toplevels: 0,
             pending_app_launch: None,
             app_surfaces: std::collections::HashMap::new(),
+            clipboard_enabled: std::env::var("PHAROS_CLIPBOARD")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("off"))
+                .unwrap_or(true),
+            pending_clipboard_read: None,
         }
     }
 
@@ -401,7 +420,62 @@ impl SeatHandler for State {
 delegate_seat!(State);
 
 impl SelectionHandler for State {
-    type SelectionUserData = ();
+    /// A compositor-owned clipboard carries its bytes here so [`Self::send_selection`]
+    /// can hand them to a pasting host app. `Arc<Vec<u8>>` is `Clone + Send + Sync`.
+    type SelectionUserData = std::sync::Arc<Vec<u8>>;
+
+    /// A focused client set (or cleared) the CLIPBOARD selection — i.e. a host app
+    /// copied something. We only *record* it here; the actual pipe read happens on
+    /// the next render-loop turn ([`crate::multi`] drains `pending_clipboard_read`),
+    /// because smithay commits the new selection AFTER this callback returns, so a
+    /// synchronous read would see the previous selection.
+    fn new_selection(
+        &mut self,
+        ty: SelectionTarget,
+        source: Option<SelectionSource>,
+        _seat: Seat<Self>,
+    ) {
+        if ty != SelectionTarget::Clipboard || !self.clipboard_enabled {
+            return;
+        }
+        match source {
+            // A host app owns a new selection: stash its offered mime flavors; the
+            // render loop requests the data after the commit.
+            Some(src) => self.pending_clipboard_read = Some(src.mime_types()),
+            // The host app cleared the clipboard: propagate an empty text. An empty
+            // mime list is our sentinel for "clear" (no read needed).
+            None => self.pending_clipboard_read = Some(Vec::new()),
+        }
+    }
+
+    /// A host app is pasting from a COMPOSITOR-owned selection (one we set from the
+    /// client's clipboard). Write the stored bytes to the client's pipe `fd`. The
+    /// write can block if the pasting app reads slowly, so hand it to a detached
+    /// thread — this callback runs on the calloop/render thread.
+    fn send_selection(
+        &mut self,
+        _ty: SelectionTarget,
+        _mime_type: String,
+        fd: std::os::fd::OwnedFd,
+        _seat: Seat<Self>,
+        user_data: &Self::SelectionUserData,
+    ) {
+        let bytes = user_data.clone();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let mut f = std::fs::File::from(fd);
+            let _ = f.write_all(&bytes);
+            // Drop closes the pipe → the pasting app sees EOF.
+        });
+    }
+}
+
+/// Cheap content hash for clipboard echo de-dup (not security-sensitive).
+pub(crate) fn clipboard_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
 }
 impl DataDeviceHandler for State {
     fn data_device_state(&self) -> &DataDeviceState {

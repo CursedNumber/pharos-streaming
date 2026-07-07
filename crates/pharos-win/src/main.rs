@@ -471,6 +471,8 @@ fn run_stream(
         host_core::pair::client_authorizer(),
         // The Windows host is single-client only — a never-set mirror flag.
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // `[network] ipv6` — bind dual-stack when enabled (shared cross-platform config).
+        host_core::config::load().network.ipv6,
     )?);
     info!("QUIC video host on {bind}; waiting for Trireme to connect…");
 

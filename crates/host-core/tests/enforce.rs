@@ -37,6 +37,7 @@ fn enforces_peers_toml_over_real_transport() {
             host_id,
             authorizer,
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            false, // dual_stack
         )
         .unwrap(),
     );

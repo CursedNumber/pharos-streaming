@@ -12,12 +12,16 @@ use thiserror::Error;
 
 pub mod apps;
 pub mod chord;
+pub mod clipboard;
 pub mod controllers;
 pub mod latency;
 pub mod ports;
 pub mod profile;
 
 pub use apps::{decode_app, encode_app, AppInfo, AppMsg};
+pub use clipboard::{
+    decode_clipboard, encode_clipboard, ClipboardMsg, MAX_CLIPBOARD_BYTES, MAX_CLIPBOARD_FRAME,
+};
 pub use latency::{
     ClientBitratePref, ClientFpsPref, ClientQos, ClientResPref, ClockPing, ClockPong,
     FrameStageMeta, WireLatencyReport,

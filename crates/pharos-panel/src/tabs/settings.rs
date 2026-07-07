@@ -478,6 +478,17 @@ fn network_section(ui: &mut egui::Ui, state: &mut PanelState) {
             ui.add_space(4.0);
             ui.colored_label(theme::warn(), tr("settings.network.no_nics"));
         }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+        if ui
+            .checkbox(&mut state.host_config.ipv6, tr("settings.network.ipv6"))
+            .describe(tr("settings.network.ipv6_desc"))
+            .changed()
+        {
+            state.dirty_host = true;
+        }
     });
 }
 

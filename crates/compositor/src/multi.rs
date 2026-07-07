@@ -1370,6 +1370,77 @@ fn log_top_surface_buffer_format(space: &smithay::desktop::Space<smithay::deskto
     });
 }
 
+/// Read a Wayland selection pipe (a host app's clipboard) to EOF with a total
+/// `timeout`, off the render thread. `read_fd` is consumed (closed on return). The
+/// timeout stops a stuck/forked app that keeps the write end open from leaking this
+/// thread forever. Returns the valid UTF-8 prefix (an invalid tail — e.g. a
+/// multi-byte char split by the 1 MiB cap — is dropped), or `None` on empty/no data.
+fn read_selection_text(read_fd: libc::c_int, timeout: std::time::Duration) -> Option<String> {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    // Non-blocking so poll(2) drives the deadline instead of a read() that can hang.
+    unsafe {
+        let flags = libc::fcntl(read_fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(read_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+    let mut f = unsafe { std::fs::File::from_raw_fd(read_fd) }; // closes read_fd on drop
+    let deadline = std::time::Instant::now() + timeout;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    'outer: loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let mut pfd = libc::pollfd {
+            fd: read_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Cap the poll wait at 1s so the outer deadline is re-checked periodically.
+        let tmo = remaining.as_millis().min(1000) as libc::c_int;
+        let pr = unsafe { libc::poll(&mut pfd, 1, tmo) };
+        if pr < 0 {
+            break; // poll error
+        }
+        if pr == 0 {
+            continue; // timeout tick; re-check the deadline
+        }
+        loop {
+            match f.read(&mut chunk) {
+                Ok(0) => break 'outer, // EOF: the app closed its write end
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.len() >= core_proto::MAX_CLIPBOARD_BYTES {
+                        buf.truncate(core_proto::MAX_CLIPBOARD_BYTES);
+                        break 'outer;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break, // drained; re-poll
+                Err(_) => break 'outer,
+            }
+        }
+    }
+    if buf.is_empty() {
+        return None;
+    }
+    match std::str::from_utf8(&buf) {
+        Ok(s) => Some(s.to_string()),
+        // Deliver the valid prefix (handles a codepoint split by the byte cap)
+        // rather than dropping the whole clipboard.
+        Err(e) => {
+            let valid = e.valid_up_to();
+            if valid == 0 {
+                None
+            } else {
+                Some(String::from_utf8_lossy(&buf[..valid]).into_owned())
+            }
+        }
+    }
+}
+
 pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
     // Load (or generate) the host's long-term Ed25519 identity once; share
     // it with every per-output streamer so clients can pin the same key
@@ -1517,6 +1588,12 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
     // can take ownership for a session-rebuild on reconnect (a fresh NVENC
     // session means the new client's first encoded frame is automatically
     // its session's opening IDR — no garbage frames).
+    // `[network] ipv6` from config.toml: bind each QUIC listener dual-stack so it
+    // accepts IPv6 + IPv4. Read once for all outputs. Default off (IPv4 wildcard).
+    let ipv6 = host_core::config::load().network.ipv6;
+    if ipv6 {
+        info!("[network] ipv6 = true → binding QUIC listeners dual-stack ([::], IPv4-mapped)");
+    }
     let mut pipelines: Vec<Option<Pipeline>> = Vec::with_capacity(cfg.outputs.len());
     for (i, oc) in cfg.outputs.iter().enumerate() {
         // Phase 3c (restart-into-panel-res): a prior run may have grown the primary
@@ -1691,6 +1768,7 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                     identity.clone(),
                     crate::pair::client_authorizer(),
                     mirror_flag(),
+                    ipv6,
                 )?),
                 None,
             )
@@ -2062,6 +2140,46 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
         .flatten()
         .filter_map(|p| p.streamer.as_ref())
         .find_map(|s| s.take_app_launch_rx());
+    // Clipboard sync (host ⇄ client). Client→host copies arrive on each streamer's
+    // receiver; a host app's copy is read on a DETACHED thread (never the render
+    // loop) which posts the text back via `clip_read_rx`; the render loop echo-gates
+    // it before relaying. The two hashes break the copy↔paste feedback loop
+    // (belt-and-braces to the client's own last-applied guard).
+    //
+    // Drain EVERY streamer's client→host receiver, not just the first: in extend
+    // mode each output is its own streamer with its own unbounded queue, and an
+    // undrained one grows without bound (OOM). Host→client goes to the first
+    // (primary) streamer only — mirror/extend viewers don't get the host clipboard.
+    let mut clipboard_in_rxs: Vec<_> = pipelines
+        .iter()
+        .flatten()
+        .filter_map(|p| p.streamer.as_ref())
+        .filter_map(|s| s.take_clipboard_in_rx())
+        .collect();
+    let clipboard_out = pipelines
+        .iter()
+        .flatten()
+        .filter_map(|p| p.streamer.as_ref())
+        .map(|s| s.clipboard_sender())
+        .next();
+    // Bound the per-frame client→host work: clipboard is last-writer-wins, so we
+    // coalesce a burst to the newest text and touch the Wayland selection at most
+    // once per frame. Without this an authenticated client flooding tiny messages
+    // could stall the render loop into the P4 watchdog kill.
+    const CLIPBOARD_MAX_DRAIN_PER_FRAME: usize = 256;
+    let (clip_read_tx, clip_read_rx) = std::sync::mpsc::channel::<String>();
+    // Last text pushed host→client / applied client→host (content hashes), for
+    // echo suppression.
+    let mut clip_last_sent: Option<u64> = None;
+    let mut clip_last_recv: Option<u64> = None;
+    // Text mime flavors: the order we REQUEST when reading a host selection, and
+    // (as a set) what we OFFER on a compositor-owned selection from client text.
+    const CLIPBOARD_TEXT_MIMES: [&str; 4] = [
+        "text/plain;charset=utf-8",
+        "text/plain",
+        "UTF8_STRING",
+        "STRING",
+    ];
     // Running-state + apps.toml are probed on a BACKGROUND thread, never the render
     // loop: running_app_slugs walks all of /proc and load_with_builtins parses
     // apps.toml — a ~2ms+ hitch (worse on a D-state process) that
@@ -2679,6 +2797,123 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                 }
             }
         }
+
+        // --- Clipboard sync (host ⇄ client) ---
+        // All Wayland selection calls run HERE on the render/calloop thread (they
+        // just post wayland events / update seat state — non-blocking); only the fd
+        // reads/writes are moved to detached threads (lesson-render-loop-no-block).
+        if data.state.clipboard_enabled {
+            // (a) A host app changed the clipboard: new_selection stashed the offered
+            // mimes and the selection is now committed, so read it (off-thread) and
+            // relay host→client. Empty mimes = the host CLEARED → push empty text.
+            if let Some(mimes) = data.state.pending_clipboard_read.take() {
+                if mimes.is_empty() {
+                    if let Some(tx) = clipboard_out.as_ref() {
+                        let _ = tx.send(core_proto::ClipboardMsg::Text(String::new()));
+                    }
+                    clip_last_sent = Some(crate::clipboard_hash(""));
+                } else if let Some(mime) = CLIPBOARD_TEXT_MIMES
+                    .iter()
+                    .find(|m| mimes.iter().any(|o| o == **m))
+                {
+                    use std::os::fd::FromRawFd;
+                    let mut fds = [0 as libc::c_int; 2];
+                    if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
+                        let read_fd = fds[0];
+                        let write_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
+                        match smithay::wayland::selection::data_device::request_data_device_client_selection::<State>(
+                            &data.state.seat,
+                            mime.to_string(),
+                            write_fd,
+                        ) {
+                            Ok(()) => {
+                                let tx = clip_read_tx.clone();
+                                let _ = std::thread::Builder::new()
+                                    .name("pharos-clip-read".into())
+                                    .spawn(move || {
+                                        if let Some(s) = read_selection_text(
+                                            read_fd,
+                                            Duration::from_secs(5),
+                                        ) {
+                                            let _ = tx.send(s);
+                                        }
+                                    });
+                            }
+                            Err(e) => {
+                                // Selection went server-side / mime vanished: close
+                                // our read end so it doesn't leak.
+                                unsafe { libc::close(read_fd) };
+                                tracing::debug!("host clipboard read skipped: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+            // (b) A detached reader posted host clipboard text: relay host→client,
+            // unless it's an echo of what we just applied from the client.
+            while let Ok(text) = clip_read_rx.try_recv() {
+                let h = crate::clipboard_hash(&text);
+                if clip_last_recv == Some(h) {
+                    continue;
+                }
+                clip_last_sent = Some(h);
+                if let Some(tx) = clipboard_out.as_ref() {
+                    let _ = tx.send(core_proto::ClipboardMsg::Text(text));
+                }
+            }
+            // (c) The client copied something: become the Wayland selection owner so
+            // host apps can paste it. Clipboard is last-writer-wins, so coalesce a
+            // burst (across ALL streamers) to the newest text and touch the Wayland
+            // selection at most once per frame — a per-frame drain cap keeps a
+            // flooding client from stalling the render loop. Skip an echo of our own
+            // host→client push.
+            let mut latest: Option<String> = None;
+            let mut drained = 0usize;
+            'drain: for rx in clipboard_in_rxs.iter_mut() {
+                loop {
+                    if drained >= CLIPBOARD_MAX_DRAIN_PER_FRAME {
+                        break 'drain;
+                    }
+                    match rx.try_recv() {
+                        Ok(core_proto::ClipboardMsg::Text(t)) => {
+                            latest = Some(t);
+                            drained += 1;
+                        }
+                        Err(_) => break, // this receiver drained; try the next
+                    }
+                }
+            }
+            if let Some(text) = latest {
+                let h = crate::clipboard_hash(&text);
+                if clip_last_sent != Some(h) {
+                    clip_last_recv = Some(h);
+                    if text.is_empty() {
+                        smithay::wayland::selection::data_device::clear_data_device_selection(
+                            &data.display_handle,
+                            &data.state.seat,
+                        );
+                    } else {
+                        let mimes: Vec<String> =
+                            CLIPBOARD_TEXT_MIMES.iter().map(|s| s.to_string()).collect();
+                        smithay::wayland::selection::data_device::set_data_device_selection::<State>(
+                            &data.display_handle,
+                            &data.state.seat,
+                            mimes,
+                            std::sync::Arc::new(text.into_bytes()),
+                        );
+                    }
+                }
+            }
+        } else {
+            // Disabled: drain + discard (capped per receiver) so queues can't grow.
+            for rx in clipboard_in_rxs.iter_mut() {
+                let mut n = 0usize;
+                while n < CLIPBOARD_MAX_DRAIN_PER_FRAME && rx.try_recv().is_ok() {
+                    n += 1;
+                }
+            }
+        }
+
         // Re-push the catalog to every client when the background probe reports a
         // change (apps.toml edited, or an app started/exited) — so the client's
         // running highlight + Switch-To/End menu track reality live. The render

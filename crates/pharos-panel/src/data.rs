@@ -202,6 +202,8 @@ impl Default for MqttToml {
 struct NetworkToml {
     #[serde(default)]
     bind_mac: Option<String>,
+    #[serde(default)]
+    ipv6: bool,
 }
 
 fn default_mqtt_host() -> String {
@@ -273,6 +275,7 @@ pub fn load_host_config() -> HostConfigUi {
         mqtt_discovery_prefix: cfg.mqtt.discovery_prefix,
         mqtt_publish_interval_secs: cfg.mqtt.publish_interval_secs,
         bind_mac: cfg.network.bind_mac.unwrap_or_default(),
+        ipv6: cfg.network.ipv6,
     }
 }
 
@@ -329,6 +332,11 @@ fn merge_host_config_toml(existing: &str, c: &HostConfigUi) -> Result<String> {
     let mut network = toml::Table::new();
     if let Some(m) = opt(&c.bind_mac) {
         network.insert("bind_mac".into(), m.to_string().into());
+    }
+    // Off is the default (host reads a missing key as false); only write it when on
+    // so a default config keeps an empty [network] table.
+    if c.ipv6 {
+        network.insert("ipv6".into(), true.into());
     }
     root.insert("network".into(), network.into());
 

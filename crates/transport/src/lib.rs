@@ -8,7 +8,7 @@
 //! Host↔compositor wiring (an mpsc of encoded frames) and the Android client
 //! follow.
 
-use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -89,6 +89,69 @@ fn server_config() -> Result<ServerConfig> {
     let mut cfg = ServerConfig::with_single_cert(vec![cert_der], key.into())?;
     cfg.transport_config(transport_config()?);
     Ok(cfg)
+}
+
+/// Build a **dual-stack** QUIC server endpoint bound to `[::]:port` with
+/// `IPV6_V6ONLY` off, so one socket accepts both IPv6 and IPv4 (v4-mapped) clients.
+/// Used when `[network] ipv6 = true`. On any error the caller falls back to the
+/// plain IPv4 `Endpoint::server` bind.
+fn dualstack_server_endpoint(server_config: ServerConfig, port: u16) -> Result<Endpoint> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    sock.set_only_v6(false)?; // dual-stack: also accept IPv4 as v4-mapped
+    let bind: SocketAddr = (Ipv6Addr::UNSPECIFIED, port).into();
+    sock.bind(&bind.into())?;
+    let udp: std::net::UdpSocket = sock.into();
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| anyhow::anyhow!("no compatible async runtime for quinn"))?;
+    Ok(Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        udp,
+        runtime,
+    )?)
+}
+
+/// Build the client endpoint. When `dual_stack`, bind `[::]:0` (V6ONLY off) so a
+/// single socket can dial both families (IPv6 natively, IPv4 via v4-mapped — see
+/// [`to_dialable`]); on failure it falls back to the IPv4 wildcard. When not
+/// `dual_stack`, it's the proven `0.0.0.0:0` bind unchanged.
+fn client_endpoint(dual_stack: bool) -> Result<Endpoint> {
+    if dual_stack {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let build = || -> Result<Endpoint> {
+            let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+            sock.set_only_v6(false)?;
+            let bind: SocketAddr = (Ipv6Addr::UNSPECIFIED, 0).into();
+            sock.bind(&bind.into())?;
+            let udp: std::net::UdpSocket = sock.into();
+            let runtime = quinn::default_runtime()
+                .ok_or_else(|| anyhow::anyhow!("no compatible async runtime for quinn"))?;
+            Ok(Endpoint::new(
+                quinn::EndpointConfig::default(),
+                None,
+                udp,
+                runtime,
+            )?)
+        };
+        match build() {
+            Ok(ep) => return Ok(ep),
+            Err(e) => tracing::warn!("dual-stack client socket failed ({e}); using IPv4"),
+        }
+    }
+    Ok(Endpoint::client((Ipv4Addr::UNSPECIFIED, 0).into())?)
+}
+
+/// Map an IPv4 target to its v4-mapped IPv6 form so a dual-stack client socket can
+/// reach it (a v6 socket can only `sendto` v6 addresses); IPv6 targets and the
+/// non-dual-stack case pass through unchanged.
+fn to_dialable(addr: SocketAddr, dual_stack: bool) -> SocketAddr {
+    match addr {
+        SocketAddr::V4(v4) if dual_stack => {
+            SocketAddr::V6(SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0))
+        }
+        other => other,
+    }
 }
 
 /// Shared QUIC transport tuning for both ends.
@@ -602,6 +665,17 @@ pub struct QuicStreamer {
     /// stream. Taken out once via [`Self::take_app_launch_rx`]; the compositor
     /// drains it and launches into the virtual display.
     app_launch_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<core_proto::AppMsg>>>,
+    /// Latest host clipboard text to push to the client on the clipboard relay
+    /// stream (host→client). `watch` so a late-joining client resyncs to the
+    /// current value and each host copy re-sends. Set via [`Self::send_clipboard`];
+    /// a Clone of the sender is handed to the compositor via [`Self::clipboard_sender`]
+    /// so a detached selection-reader thread can push without borrowing the streamer.
+    clipboard_out_tx: tokio::sync::watch::Sender<core_proto::ClipboardMsg>,
+    /// Clipboard text the client copied and sent on the clipboard relay stream
+    /// (client→host). Taken out once via [`Self::take_clipboard_in_rx`]; the
+    /// compositor drains it and becomes the Wayland selection owner so host apps
+    /// can paste it.
+    clipboard_in_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<core_proto::ClipboardMsg>>>,
     /// Current encoder output geometry, packed `(w<<32)|h` (0 = unset). The
     /// compositor sets it via [`Self::set_geometry`]; the stream loop announces it
     /// to the client as `DG_STREAM_GEOMETRY` so the client sizes its decoder to
@@ -654,11 +728,14 @@ impl QuicStreamer {
     /// restrict streaming to paired peers.
     pub fn start(addr: SocketAddr, identity: Arc<core_crypto::Identity>) -> Result<Self> {
         // No mirror flag wired → always single-client (a fresh always-false flag).
+        // IPv4-only bind (dual_stack=false) — the default; `start_with_authorizer`
+        // takes the flag for the config-driven host path.
         Self::start_with_authorizer(
             addr,
             identity,
             allow_any_client(),
             Arc::new(AtomicBool::new(false)),
+            false,
         )
     }
 
@@ -674,6 +751,9 @@ impl QuicStreamer {
         identity: Arc<core_crypto::Identity>,
         authorizer: ClientAuthorizer,
         mirror: Arc<AtomicBool>,
+        // Bind the QUIC listener dual-stack (`[::]` V6ONLY off) so it accepts IPv6
+        // + IPv4 on one socket. From `[network] ipv6`. `false` = IPv4 wildcard.
+        dual_stack: bool,
     ) -> Result<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         // Bounded video queue: cap the in-flight frames so latency can't grow
@@ -709,6 +789,16 @@ impl QuicStreamer {
         let (app_catalog_tx, app_catalog_rx) =
             tokio::sync::watch::channel::<Vec<core_proto::AppInfo>>(Vec::new());
         let (app_launch_tx, app_launch_rx) = mpsc::unbounded_channel::<core_proto::AppMsg>();
+        // Clipboard relay channels (host↔client). `clipboard_out` is a watch (latest
+        // host clipboard wins; a reconnecting client resyncs); `clipboard_in` is an
+        // mpsc of client→host copies the compositor drains. Empty initial value is
+        // skipped by the relay writer so a fresh streamer doesn't push a blank clip.
+        let (clipboard_out_tx, clipboard_out_rx) =
+            tokio::sync::watch::channel::<core_proto::ClipboardMsg>(
+                core_proto::ClipboardMsg::Text(String::new()),
+            );
+        let (clipboard_in_tx, clipboard_in_rx) =
+            mpsc::unbounded_channel::<core_proto::ClipboardMsg>();
         let connected = Arc::new(AtomicBool::new(false));
         let connected_thread = connected.clone();
         // Verified pubkey of whoever's connected (None when idle). Set/cleared
@@ -797,6 +887,8 @@ impl QuicStreamer {
                     qos_tx,
                     app_catalog_rx,
                     app_launch_tx,
+                    clipboard_out_rx,
+                    clipboard_in_tx,
                     authorizer,
                     geom_thread,
                     loss_thread,
@@ -804,6 +896,7 @@ impl QuicStreamer {
                     request_idr_thread,
                     mirror,
                     clients_thread,
+                    dual_stack,
                 )) {
                     tracing::error!("quic streamer: {e:?}");
                 }
@@ -830,6 +923,8 @@ impl QuicStreamer {
             qos_rx: std::sync::Mutex::new(Some(qos_rx)),
             app_catalog_tx,
             app_launch_rx: std::sync::Mutex::new(Some(app_launch_rx)),
+            clipboard_out_tx,
+            clipboard_in_rx: std::sync::Mutex::new(Some(clipboard_in_rx)),
             geom,
             loss_permille,
             clients,
@@ -1147,6 +1242,31 @@ impl QuicStreamer {
     /// virtual display (the client-tile path, mirroring the panel/CLI `LaunchApp`).
     pub fn take_app_launch_rx(&self) -> Option<mpsc::UnboundedReceiver<core_proto::AppMsg>> {
         self.app_launch_rx.lock().ok().and_then(|mut g| g.take())
+    }
+
+    /// Publish host clipboard text to push to the client (host→client). Latest
+    /// value is retained and (re-)sent to each connected + future client. Empty
+    /// string clears the client's clipboard. Non-blocking; safe with no client.
+    pub fn send_clipboard(&self, text: String) {
+        let _ = self
+            .clipboard_out_tx
+            .send(core_proto::ClipboardMsg::Text(text));
+    }
+
+    /// A Clone of the host→client clipboard sender. Handed to the compositor so a
+    /// detached Wayland-selection reader thread can push clipboard text without
+    /// borrowing the (non-Clone, render-stack-owned) [`QuicStreamer`]. Mirrors the
+    /// [`Self::audio_handle`] carve-off. `watch::Sender` is `Clone + Send`.
+    pub fn clipboard_sender(&self) -> tokio::sync::watch::Sender<core_proto::ClipboardMsg> {
+        self.clipboard_out_tx.clone()
+    }
+
+    /// Take the client→host clipboard receiver — call exactly once. The compositor
+    /// drains it and sets the Wayland selection so host apps can paste.
+    pub fn take_clipboard_in_rx(
+        &self,
+    ) -> Option<mpsc::UnboundedReceiver<core_proto::ClipboardMsg>> {
+        self.clipboard_in_rx.lock().ok().and_then(|mut g| g.take())
     }
 }
 
@@ -2122,6 +2242,98 @@ fn spawn_challenger_vet(
     });
 }
 
+/// Per-connection clipboard relay: the bidirectional clipboard sync stream the
+/// host opens (server-initiated bidi #2, right after the app relay). Symmetric to
+/// the app relay's read/write, framed `u32 BE len || postcard ClipboardMsg`:
+///
+/// - read (client → host): the client copied something; forward it to the
+///   compositor which becomes the Wayland selection owner (host apps can paste).
+/// - write (host → client): a host app copied; push the text so the client mirrors
+///   it into its OS clipboard. Latest-wins `watch`; an empty first value (fresh
+///   streamer) is skipped, but a later empty (a genuine host clear) IS sent.
+///
+/// Both halves cap a frame at [`core_proto::MAX_CLIPBOARD_FRAME`] (the text cap plus
+/// the postcard envelope). A client that never accepts this stream simply leaves the
+/// writer parked in flow control.
+async fn clipboard_relay(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    mut out_rx: tokio::sync::watch::Receiver<core_proto::ClipboardMsg>,
+    in_tx: mpsc::UnboundedSender<core_proto::ClipboardMsg>,
+) {
+    // Reader: client → host copies. Zero-length frames are the host/peer's
+    // stream-open nudge (see the writer) — skip them.
+    let read = async move {
+        let mut len_buf = [0u8; 4];
+        loop {
+            if recv.read_exact(&mut len_buf).await.is_err() {
+                return;
+            }
+            let len = u32::from_be_bytes(len_buf) as usize;
+            if len == 0 {
+                continue;
+            }
+            if len > core_proto::MAX_CLIPBOARD_FRAME {
+                tracing::warn!("clipboard frame too large ({len} bytes); dropping stream");
+                return;
+            }
+            let mut buf = vec![0u8; len];
+            if recv.read_exact(&mut buf).await.is_err() {
+                return;
+            }
+            match core_proto::decode_clipboard(&buf) {
+                Ok(msg) => {
+                    if in_tx.send(msg).is_err() {
+                        return;
+                    }
+                }
+                Err(e) => tracing::warn!("decode clipboard msg: {e}"),
+            }
+        }
+    };
+    // Writer: host → client. First NUDGE the stream open with a zero-length frame
+    // so the client's accept_bi() resolves immediately even with an idle host
+    // clipboard — without it the client can't accept the stream and its client→host
+    // writer never starts (client→host would be dead until the first host copy).
+    // Then forward every host clipboard CHANGE during this session. We deliberately
+    // do NOT resync the retained watch value on connect: a freshly-joined client
+    // must not auto-receive whatever the host copied before it connected (could be a
+    // secret) — only live, in-session copies flow.
+    let write = async move {
+        let send_frame = |msg: &core_proto::ClipboardMsg| core_proto::encode_clipboard(msg);
+        if send.write_all(&0u32.to_be_bytes()).await.is_err() {
+            return;
+        }
+        // Mark the current value as seen without sending it.
+        out_rx.borrow_and_update();
+        loop {
+            if out_rx.changed().await.is_err() {
+                break;
+            }
+            let cur = out_rx.borrow_and_update().clone();
+            match send_frame(&cur) {
+                Ok(buf) => {
+                    let len_be = (buf.len() as u32).to_be_bytes();
+                    if send.write_all(&len_be).await.is_err() || send.write_all(&buf).await.is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(e) => tracing::warn!("encode clipboard: {e}"),
+            }
+        }
+        send.finish().ok();
+    };
+    // `select!`, not `join!`: when the client disconnects the read half returns at
+    // once; biasing on either half tears the writer down promptly instead of
+    // leaving it parked on `changed()` (the watch sender lives for the whole
+    // streamer, so it never errors on a per-client disconnect).
+    tokio::select! {
+        _ = read => {}
+        _ = write => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn serve_stream(
     addr: SocketAddr,
@@ -2144,6 +2356,8 @@ async fn serve_stream(
     qos_tx: mpsc::UnboundedSender<core_proto::ClientQos>,
     app_catalog_rx: tokio::sync::watch::Receiver<Vec<core_proto::AppInfo>>,
     app_launch_tx: mpsc::UnboundedSender<core_proto::AppMsg>,
+    clipboard_out_rx: tokio::sync::watch::Receiver<core_proto::ClipboardMsg>,
+    clipboard_in_tx: mpsc::UnboundedSender<core_proto::ClipboardMsg>,
     authorizer: ClientAuthorizer,
     geom: Arc<std::sync::atomic::AtomicU64>,
     loss: Arc<std::sync::atomic::AtomicU32>,
@@ -2151,11 +2365,29 @@ async fn serve_stream(
     request_idr: Arc<AtomicBool>,
     mirror: Arc<AtomicBool>,
     clients: Arc<std::sync::Mutex<Vec<ClientSlot>>>,
+    dual_stack: bool,
 ) -> Result<()> {
     // Retry on EADDRINUSE: a host Relaunch re-execs in place, and the previous
     // image's UDP socket can still be releasing when the new one rebinds — so
     // wait it out (up to ~3s) instead of failing the whole host.
-    let endpoint = {
+    let endpoint = 'bind: {
+        // Dual-stack: one `[::]:port` socket serves IPv6 + IPv4. On any failure fall
+        // through to the IPv4 bind below (never leave the host dead for it).
+        if dual_stack {
+            match dualstack_server_endpoint(server_config()?, addr.port()) {
+                Ok(ep) => {
+                    tracing::info!(
+                        "QUIC dual-stack (IPv6+IPv4) listener on [::]:{}",
+                        addr.port()
+                    );
+                    break 'bind ep;
+                }
+                Err(e) => tracing::warn!(
+                    "dual-stack bind [::]:{} failed ({e}); falling back to IPv4 {addr}",
+                    addr.port()
+                ),
+            }
+        }
         let mut attempt = 0u32;
         loop {
             let cfg = server_config()?;
@@ -2419,11 +2651,30 @@ async fn serve_stream(
         let conn_app = conn.clone();
         let mut cat_rx = app_catalog_rx.clone();
         let launch_tx_conn = app_launch_tx.clone();
+        let clip_out_rx = clipboard_out_rx.clone();
+        let clip_in_tx = clipboard_in_tx.clone();
         tokio::spawn(async move {
             let (mut send, mut recv) = match conn_app.open_bi().await {
                 Ok(s) => s,
                 Err(_) => return, // connection ended
             };
+            // Open the CLIPBOARD RELAY as the second server-initiated bidi, right
+            // after the app relay (idx0) — sequential in THIS task so the ordering
+            // is deterministic (quinn yields accepts in ascending stream-id = open
+            // order). The client demuxes: 1st server-bidi = app, 2nd = clipboard.
+            // An old client that only accepts the app stream never accepts this one
+            // (our writes just park in flow control — harmless).
+            match conn_app.open_bi().await {
+                Ok((clip_send, clip_recv)) => {
+                    tokio::spawn(clipboard_relay(
+                        clip_send,
+                        clip_recv,
+                        clip_out_rx,
+                        clip_in_tx,
+                    ));
+                }
+                Err(_) => return, // connection ended
+            }
             tracing::info!("apprelay-host: app stream opened to client");
             // Reader: client → host launch requests.
             let read = async move {
@@ -3141,15 +3392,31 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
     // (max=0 = Auto/panel). Mutated from the settings UI; re-sent each QoS tick as
     // `DG_CLIENT_FPSPREF`. `None` = never send.
     fps_pref: Option<Arc<std::sync::atomic::AtomicU64>>,
+    // Host→client clipboard: invoked with the text a host app just copied so the
+    // client mirrors it into its OS clipboard (empty string = the host cleared its
+    // clipboard). `None` = the client doesn't sync host→client.
+    on_clipboard: Option<Box<dyn FnMut(String) + Send>>,
+    // Client→host clipboard: the client pushes text it copied here; the loop writes
+    // it on the clipboard relay stream and the host becomes the Wayland selection
+    // owner. `None` = the client doesn't sync client→host.
+    clipboard_rx: Option<mpsc::UnboundedReceiver<core_proto::ClipboardMsg>>,
 ) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     rt.block_on(async move {
-        let mut client = Endpoint::client((Ipv4Addr::UNSPECIFIED, 0).into())?;
+        // Bind dual-stack only when a candidate is IPv6, so IPv4-only sessions keep
+        // the proven `0.0.0.0:0` socket. v4 candidates are v4-mapped for the
+        // dual-stack socket; v6 candidates dial natively.
+        let need_v6 = server_addrs.iter().any(|a| a.is_ipv6());
+        let mut client = client_endpoint(need_v6)?;
         client.set_default_client_config(client_config()?);
-        let conn = connect_first(&client, &server_addrs).await?;
+        let dial_addrs: Vec<SocketAddr> = server_addrs
+            .iter()
+            .map(|a| to_dialable(*a, need_v6))
+            .collect();
+        let conn = connect_first(&client, &dial_addrs).await?;
         do_video_auth(
             &conn,
             expected_pubkey.as_ref(),
@@ -3187,16 +3454,90 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
             });
         }
 
-        // App relay: the host opens a dedicated bidi stream; accept it to receive
-        // the catalog (host→client) and to send launch requests (client→host).
-        // Skipped entirely for clients that want neither.
-        if on_catalog.is_some() || app_launch_rx.is_some() {
+        // App relay + clipboard relay: the host opens TWO dedicated bidi streams,
+        // the app relay first (server-bidi idx0) then the clipboard relay (idx1).
+        // We accept them IN THAT ORDER inside one task (quinn yields accepts in
+        // ascending stream-id = open order) so the clipboard stream is demuxed
+        // correctly. The app relay is always accepted first — even by a client that
+        // only wants clipboard — so the ordering holds; its handlers just idle when
+        // no catalog/launch is wired. An old host never opens idx1, so the clipboard
+        // accept simply parks (harmless).
+        let want_clipboard = on_clipboard.is_some() || clipboard_rx.is_some();
+        if on_catalog.is_some() || app_launch_rx.is_some() || want_clipboard {
             let conn_app = conn.clone();
             tokio::spawn(async move {
                 let (send, recv) = match conn_app.accept_bi().await {
                     Ok(s) => s,
                     Err(_) => return, // host never opened it / connection ended
                 };
+                // Accept the clipboard relay (idx1) right after the app relay (idx0),
+                // in this same task, then run it as a sub-task. Only when this client
+                // syncs clipboard; otherwise we never accept it (an app-only client).
+                if want_clipboard {
+                    let conn_clip = conn_app.clone();
+                    let mut on_clipboard = on_clipboard;
+                    let mut clipboard_rx = clipboard_rx;
+                    tokio::spawn(async move {
+                        let (clip_send, clip_recv) = match conn_clip.accept_bi().await {
+                            Ok(s) => s,
+                            Err(_) => return, // old host never opened it
+                        };
+                        // Writer: client → host copies.
+                        let write = async move {
+                            let mut clip_send = clip_send;
+                            if let Some(mut rx) = clipboard_rx.take() {
+                                while let Some(msg) = rx.recv().await {
+                                    let buf = match core_proto::encode_clipboard(&msg) {
+                                        Ok(b) => b,
+                                        Err(e) => {
+                                            tracing::warn!("encode clipboard: {e}");
+                                            continue;
+                                        }
+                                    };
+                                    let len_be = (buf.len() as u32).to_be_bytes();
+                                    if clip_send.write_all(&len_be).await.is_err()
+                                        || clip_send.write_all(&buf).await.is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                            clip_send.finish().ok();
+                        };
+                        // Reader: host → client copies.
+                        let read = async move {
+                            let mut clip_recv = clip_recv;
+                            let mut len_buf = [0u8; 4];
+                            loop {
+                                if clip_recv.read_exact(&mut len_buf).await.is_err() {
+                                    return;
+                                }
+                                let len = u32::from_be_bytes(len_buf) as usize;
+                                if len == 0 {
+                                    continue; // host's stream-open nudge
+                                }
+                                if len > core_proto::MAX_CLIPBOARD_FRAME {
+                                    tracing::warn!(
+                                        "clipboard frame too large ({len} bytes); dropping"
+                                    );
+                                    return;
+                                }
+                                let mut buf = vec![0u8; len];
+                                if clip_recv.read_exact(&mut buf).await.is_err() {
+                                    return;
+                                }
+                                if let Ok(core_proto::ClipboardMsg::Text(t)) =
+                                    core_proto::decode_clipboard(&buf)
+                                {
+                                    if let Some(cb) = on_clipboard.as_mut() {
+                                        cb(t);
+                                    }
+                                }
+                            }
+                        };
+                        tokio::join!(write, read);
+                    });
+                }
                 // Writer: client → host app actions (Launch/SwitchTo/EndProcess).
                 let write = async move {
                     let mut send = send;
@@ -4356,6 +4697,7 @@ mod tests {
                 host_id,
                 authorizer,
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                false, // dual_stack
             )
             .unwrap(),
         );
@@ -4456,6 +4798,7 @@ mod tests {
                 host_id,
                 authorizer,
                 Arc::new(AtomicBool::new(false)),
+                false, // dual_stack
             )
             .unwrap(),
         );
@@ -4617,6 +4960,7 @@ mod tests {
                 host_id,
                 authorizer,
                 Arc::new(AtomicBool::new(false)),
+                false, // dual_stack
             )
             .unwrap(),
         );
@@ -4745,6 +5089,8 @@ mod tests {
                     None,
                     None,
                     None,
+                    None, // on_clipboard
+                    None, // clipboard_rx
                 );
             });
         }
@@ -4834,6 +5180,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_clipboard
+                None, // clipboard_rx
             );
         });
 
@@ -4866,6 +5214,292 @@ mod tests {
             Some("crimson-desert"),
             "host must receive the client's launch request"
         );
+    }
+
+    /// The clipboard relay, both directions on loopback, under simulated video
+    /// load. The host opens the app relay (idx0) then the clipboard relay (idx1);
+    /// the client demuxes them by accept order. host→client: `send_clipboard` must
+    /// surface at the client's `on_clipboard`. client→host: text pushed on the
+    /// client's `clipboard_rx` must surface at the host's `take_clipboard_in_rx`.
+    #[test]
+    fn clipboard_relay_roundtrips_both_ways() {
+        use std::net::{SocketAddr, UdpSocket};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let host_id = Arc::new(core_crypto::Identity::generate());
+        let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+
+        let streamer = Arc::new(super::QuicStreamer::start(addr, host_id).unwrap());
+        let mut clip_in_rx = streamer
+            .take_clipboard_in_rx()
+            .expect("clipboard in rx once");
+        // Publish a catalog so the host opens the app relay (idx0); the clipboard
+        // relay (idx1) opens right after it in the same task.
+        streamer.send_app_catalog(vec![core_proto::AppInfo {
+            id: "x".into(),
+            name: "X".into(),
+            kind: 0,
+            art: Vec::new(),
+            running: false,
+        }]);
+
+        // Keep the video loop busy — the realistic condition for a starved relay.
+        let stop = Arc::new(AtomicBool::new(false));
+        let pusher = {
+            let s = streamer.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    s.send(vec![0u8; 4096]);
+                    std::thread::sleep(Duration::from_millis(8));
+                }
+            })
+        };
+
+        // Client: register an on_catalog (so it accepts idx0) AND a clipboard sink +
+        // clipboard_rx (so it accepts idx1), matching a real clipboard-capable client.
+        let got_host_clip = Arc::new(Mutex::new(None::<String>));
+        let got_host_clip_cb = got_host_clip.clone();
+        let (clip_tx, clip_rx) = tokio::sync::mpsc::unbounded_channel::<core_proto::ClipboardMsg>();
+        let (_input_tx, input_rx) =
+            tokio::sync::mpsc::unbounded_channel::<core_proto::InputEvent>();
+        let on_catalog: Option<Box<dyn FnMut(Vec<core_proto::AppInfo>) + Send>> =
+            Some(Box::new(|_apps| {}));
+        let on_clipboard: Option<Box<dyn FnMut(String) + Send>> = Some(Box::new(move |text| {
+            *got_host_clip_cb.lock().unwrap() = Some(text);
+        }));
+        std::thread::spawn(move || {
+            let _ = super::run_video_client_with_input(
+                vec![addr],
+                None,
+                None,
+                |_| {},
+                Some(input_rx),
+                None,
+                None,
+                None,
+                None,
+                on_catalog,
+                None,
+                false,
+                false, // wants_hdr
+                None,
+                None,
+                core_proto::StreamMode::default(),
+                None,
+                None,
+                None,
+                on_clipboard,
+                Some(clip_rx),
+            );
+        });
+
+        // Wait for connect + the relays to establish.
+        for _ in 0..300 {
+            if streamer.is_connected() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+
+        // host → client: a MAX-size payload, to prove long text flows through the
+        // relay (its frame exceeds the flow-control window AND the text cap, so it
+        // exercises both the frame-cap headroom and reliable-stream chunking).
+        let big = "L".repeat(core_proto::MAX_CLIPBOARD_BYTES);
+        streamer.send_clipboard(big.clone());
+        // client → host
+        clip_tx
+            .send(core_proto::ClipboardMsg::Text(
+                "copied on the client".into(),
+            ))
+            .expect("send client clipboard");
+
+        let mut host_to_client = None;
+        let mut client_to_host = None;
+        for _ in 0..300 {
+            if host_to_client.is_none() {
+                if let Some(t) = got_host_clip.lock().unwrap().clone() {
+                    host_to_client = Some(t);
+                }
+            }
+            if client_to_host.is_none() {
+                if let Ok(core_proto::ClipboardMsg::Text(t)) = clip_in_rx.try_recv() {
+                    client_to_host = Some(t);
+                }
+            }
+            if host_to_client.is_some() && client_to_host.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _ = pusher.join();
+        assert_eq!(
+            host_to_client.as_deref(),
+            Some(big.as_str()),
+            "client must receive the host's FULL {}-byte clipboard (host→client)",
+            big.len()
+        );
+        assert_eq!(
+            client_to_host.as_deref(),
+            Some("copied on the client"),
+            "host must receive the client's clipboard (client→host)"
+        );
+    }
+
+    /// Regression: client→host clipboard must work even when the host NEVER copies
+    /// first. The host opens the clipboard relay but an idle host clipboard means it
+    /// has nothing to send; without the stream-open nudge the client's accept_bi()
+    /// would park forever and its client→host writer would never start, so the copy
+    /// below would never arrive. This test does NOT call send_clipboard on the host.
+    #[test]
+    fn clipboard_client_to_host_without_prior_host_copy() {
+        use std::net::{SocketAddr, UdpSocket};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let host_id = Arc::new(core_crypto::Identity::generate());
+        let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+
+        let streamer = Arc::new(super::QuicStreamer::start(addr, host_id).unwrap());
+        let mut clip_in_rx = streamer
+            .take_clipboard_in_rx()
+            .expect("clipboard in rx once");
+        streamer.send_app_catalog(vec![core_proto::AppInfo {
+            id: "x".into(),
+            name: "X".into(),
+            kind: 0,
+            art: Vec::new(),
+            running: false,
+        }]);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let pusher = {
+            let s = streamer.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    s.send(vec![0u8; 4096]);
+                    std::thread::sleep(Duration::from_millis(8));
+                }
+            })
+        };
+
+        let (clip_tx, clip_rx) = tokio::sync::mpsc::unbounded_channel::<core_proto::ClipboardMsg>();
+        let (_input_tx, input_rx) =
+            tokio::sync::mpsc::unbounded_channel::<core_proto::InputEvent>();
+        let on_catalog: Option<Box<dyn FnMut(Vec<core_proto::AppInfo>) + Send>> =
+            Some(Box::new(|_apps| {}));
+        // Clipboard-capable client (has a clipboard_rx), but NO on_clipboard sink and
+        // the host never sends — so only the nudge can open the stream.
+        std::thread::spawn(move || {
+            let _ = super::run_video_client_with_input(
+                vec![addr],
+                None,
+                None,
+                |_| {},
+                Some(input_rx),
+                None,
+                None,
+                None,
+                None,
+                on_catalog,
+                None,
+                false,
+                false,
+                None,
+                None,
+                core_proto::StreamMode::default(),
+                None,
+                None,
+                None,
+                None, // on_clipboard: intentionally none
+                Some(clip_rx),
+            );
+        });
+
+        for _ in 0..300 {
+            if streamer.is_connected() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        // The host has NOT copied anything. The client copies; the host must get it.
+        clip_tx
+            .send(core_proto::ClipboardMsg::Text("client-first".into()))
+            .expect("send client clipboard");
+
+        let mut got = None;
+        for _ in 0..300 {
+            if let Ok(core_proto::ClipboardMsg::Text(t)) = clip_in_rx.try_recv() {
+                got = Some(t);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _ = pusher.join();
+        assert_eq!(
+            got.as_deref(),
+            Some("client-first"),
+            "client→host clipboard must work without the host copying first (stream-open nudge)"
+        );
+    }
+
+    /// Dual-stack: a `[::]` server endpoint (V6ONLY off) must accept BOTH an IPv6
+    /// client (`::1`) and an IPv4 client (`127.0.0.1`, reached v4-mapped from the
+    /// dual-stack client socket) on the ONE socket. This is the core of the
+    /// `[network] ipv6` toggle — the host-side bind + the client-side dial helpers.
+    #[test]
+    fn dualstack_endpoint_accepts_ipv6_and_ipv4() {
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let server =
+                super::dualstack_server_endpoint(super::server_config().unwrap(), 0).unwrap();
+            let port = server.local_addr().unwrap().port();
+            // Server: accept two connections; each gets a "K" on a uni stream.
+            let srv = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let conn = server.accept().await.unwrap().await.unwrap();
+                    let mut s = conn.open_uni().await.unwrap();
+                    s.write_all(b"K").await.unwrap();
+                    s.finish().unwrap();
+                    conn.closed().await;
+                }
+            });
+            let mut client = super::client_endpoint(true).unwrap();
+            client.set_default_client_config(super::client_config().unwrap());
+            for target in [
+                SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+                super::to_dialable(SocketAddr::from((Ipv4Addr::LOCALHOST, port)), true),
+            ] {
+                let conn = client.connect(target, "localhost").unwrap().await.unwrap();
+                let mut r = conn.accept_uni().await.unwrap();
+                let mut buf = [0u8; 1];
+                r.read_exact(&mut buf).await.unwrap();
+                assert_eq!(&buf, b"K", "dual-stack server must serve {target}");
+                conn.close(0u32.into(), b"done");
+            }
+            srv.await.unwrap();
+        });
     }
 
     /// The on-demand latency benchmark, end to end on loopback. The host pushes a
@@ -4966,6 +5600,8 @@ mod tests {
                     None,  // res_pref
                     None,  // bitrate_pref
                     None,  // fps_pref
+                    None,  // on_clipboard
+                    None,  // clipboard_rx
                 );
                 client_done.store(true, Ordering::Release);
             });

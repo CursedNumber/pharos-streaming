@@ -196,6 +196,14 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
             .hide(WindowInsetsCompat.Type.systemBars())
     }
 
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        // Regained focus (e.g. returned from copying in another app): push the
+        // current phone clipboard to the host, since the change listener only fires
+        // while we're focused and would have missed a copy made elsewhere.
+        if (hasFocus) StreamHub.onClipboardFocusSync()
+    }
+
     // ============================================================
     // Navbar reveal helpers
     // ============================================================

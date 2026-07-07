@@ -67,6 +67,15 @@ pub struct NetworkConfig {
     /// CLI bind and warns. `None` = no MAC pinning. No LAN assumptions.
     #[serde(default)]
     pub bind_mac: Option<String>,
+
+    /// Bind the QUIC listener **dual-stack** (`[::]` with `IPV6_V6ONLY` off) so it
+    /// accepts BOTH IPv4 and IPv6 clients on one socket. Default `false` = the
+    /// existing IPv4 wildcard bind (unchanged). Turn on to reach the host over IPv6
+    /// (e.g. an IPv6-only network, or to sidestep NAT). Ignored when `bind_mac`
+    /// pins a specific IPv4 NIC (that pin wins). Clients dial whichever family the
+    /// host advertises; the Trireme client is already dual-stack-capable.
+    #[serde(default)]
+    pub ipv6: bool,
 }
 
 /// Home Assistant / MQTT integration — **disabled by default**. Many users won't

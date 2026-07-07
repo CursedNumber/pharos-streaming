@@ -6446,6 +6446,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "serde",
+ "socket2",
  "tokio",
  "tracing",
 ]

@@ -3,7 +3,10 @@
 
 package no.aasle.trireme.stream
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -20,6 +23,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import uniffi.core_ffi.AppCatalogSink
 import uniffi.core_ffi.AppInfo
 import uniffi.core_ffi.AudioSink
+import uniffi.core_ffi.ClipboardSink
 import uniffi.core_ffi.FrameSink
 import uniffi.core_ffi.GamepadInput
 import uniffi.core_ffi.GyroSink
@@ -71,6 +75,16 @@ object StreamHub {
     // Main-thread marshaller for the off-main FFI callbacks (FrameSink/AudioSink/
     // AppCatalogSink fire on the QUIC client's threads).
     private val main = Handler(Looper.getMainLooper())
+
+    // --- Clipboard sync (host ⇄ client) ---
+    // The OS clipboard + the two last-seen texts that break the copy↔paste echo:
+    // `lastAppliedClip` is what the HOST pushed to us (skip re-sending it); the
+    // primary-clip listener only fires while the app has focus (Android's own
+    // restriction), which is exactly when a streaming session is foregrounded.
+    private var clipboard: ClipboardManager? = null
+    @Volatile private var lastAppliedClip: String? = null
+    @Volatile private var lastSentClip: String? = null
+    private val clipListener = ClipboardManager.OnPrimaryClipChangedListener { onLocalClipChanged() }
 
     // The single lock guarding [sessions], the live Surface/caps, and the decoder.
     private val lock = Any()
@@ -240,10 +254,64 @@ object StreamHub {
             _appRecency.value = rp.all.entries
                 .mapNotNull { (k, v) -> (v as? Long)?.let { k to it } }
                 .toMap()
+            // Clipboard: mirror the host clipboard into ours (host→client) and push
+            // our local copies to the host (client→host). The listener fires only
+            // while the app is focused (Android policy), i.e. during a live session.
+            clipboard = runCatching {
+                (this.appContext.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager)
+                    ?.also { it.addPrimaryClipChangedListener(clipListener) }
+            }.getOrNull()
             initialized = true
         }
         Log.i(TAG, "StreamHub initialized (identity=$identityPath, gyroEnabled=$gyroEnabled)")
     }
+
+    /** Apply text the host copied to our OS clipboard (host→client). Records it so
+     *  the resulting primary-clip-changed callback isn't echoed back to the host.
+     *  Empty text = the host cleared its clipboard. Main thread. */
+    private fun applyHostClipboard(text: String) {
+        val cb = clipboard ?: return
+        Log.i(TAG, "clipboard host→client: applying ${text.length} chars")
+        lastAppliedClip = text
+        // The host clipboard just changed ours; forget the last text WE sent so the
+        // user re-copying an earlier value still propagates it back to the host.
+        lastSentClip = null
+        runCatching {
+            if (text.isEmpty()) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    cb.clearPrimaryClip()
+                } else {
+                    cb.setPrimaryClip(ClipData.newPlainText("", ""))
+                }
+            } else {
+                cb.setPrimaryClip(ClipData.newPlainText("pharos", text))
+            }
+        }.onFailure { Log.w(TAG, "applyHostClipboard failed: ${it.message}") }
+    }
+
+    /** Our OS clipboard changed: push the new text to the host (client→host) unless
+     *  it's the text the host just gave us (echo) or one we already sent. */
+    private fun onLocalClipChanged() {
+        val cb = clipboard ?: return
+        val text = runCatching {
+            cb.primaryClip
+                ?.takeIf { it.itemCount > 0 }
+                ?.getItemAt(0)
+                ?.coerceToText(appContext)
+                ?.toString()
+        }.getOrNull() ?: return
+        if (text == lastAppliedClip || text == lastSentClip) return
+        lastSentClip = text
+        Log.i(TAG, "clipboard client→host: sending ${text.length} chars")
+        activeGamepad()?.setClipboard(text)
+    }
+
+    /** Re-read the OS clipboard and push it to the host when the stream regains
+     *  focus. The change listener only fires while Trireme is focused, so a copy the
+     *  user made in another app (with Trireme backgrounded) would otherwise be
+     *  missed — reading on focus-gain covers the "copy elsewhere, return to stream,
+     *  paste on host" flow. Echo-guarded via [onLocalClipChanged]. */
+    fun onClipboardFocusSync() = onLocalClipChanged()
 
     /** Record that [appId] was just launched/switched-to: stamp it now + persist,
      *  so the Apps grid floats recently-used apps near the top across sessions. */
@@ -589,6 +657,13 @@ object StreamHub {
                 main.post { onCatalog(s, apps) }
             }
         }
+        // Host clipboard → our OS clipboard, but only for the ACTIVE session (like
+        // audio/frames): a backgrounded/mirror session must not hijack the clipboard.
+        val clipboardSink = object : ClipboardSink {
+            override fun onClipboard(text: String) {
+                if (s.active) main.post { applyHostClipboard(text) }
+            }
+        }
 
         val addr = s.entry.addressLabel()
         val expectedPubkey = s.entry.hostPubkey
@@ -660,6 +735,7 @@ object StreamHub {
                 audioSink,
                 gyroSink,
                 catalogSink,
+                clipboardSink,
                 wantsGyro,
                 // Requested stream mode: the panel-derived encode envelope (Phase 3c,
                 // 0×0 = unknown → host keeps its configured size) + this panel's

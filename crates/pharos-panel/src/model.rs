@@ -538,6 +538,8 @@ pub struct HostConfigUi {
     pub mqtt_publish_interval_secs: u64,
     /// `[network] bind_mac` — empty = no MAC pinning.
     pub bind_mac: String,
+    /// `[network] ipv6` — bind the QUIC listener dual-stack (IPv6 + IPv4). Off by default.
+    pub ipv6: bool,
 }
 
 impl Default for HostConfigUi {
@@ -553,6 +555,7 @@ impl Default for HostConfigUi {
             mqtt_discovery_prefix: "homeassistant".into(),
             mqtt_publish_interval_secs: 10,
             bind_mac: String::new(),
+            ipv6: false,
         }
     }
 }

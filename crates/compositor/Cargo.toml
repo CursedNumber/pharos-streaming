@@ -32,7 +32,8 @@ mdns-sd = "0.20"
 # gethostname(3) for the mDNS host label.
 libc = "0.2"
 # Async runtime for the pairing listener; tokio is already pulled in by transport.
-tokio = { version = "1", features = ["rt", "macros", "time"] }
+# `sync` for the clipboard-out watch::Sender the transport hands us.
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 
 # Smithay + Wayland are Linux-only; the crate compiles to a stub elsewhere so

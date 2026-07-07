@@ -258,6 +258,14 @@ nb = "Ingen nettverkskort (NIC) annonseres av denne verten — skriv inn en MAC 
 en = "⚠ Not a valid MAC (expected aa:bb:cc:dd:ee:ff)."
 nb = "⚠ Ikke en gyldig MAC (forventet aa:bb:cc:dd:ee:ff)."
 
+["settings.network.ipv6"]
+en = "Dual-stack IPv6"
+nb = "Dual-stack IPv6"
+
+["settings.network.ipv6_desc"]
+en = "[network] ipv6 — bind one socket for IPv6 + IPv4 (v4-mapped). Off = IPv4 only. Takes effect on the next host start."
+nb = "[network] ipv6 — bind én socket for IPv6 + IPv4 (v4-mappet). Av = kun IPv4. Trer i kraft ved neste oppstart av verten."
+
 ["settings.network.mac_malformed_desc"]
 en = "This MAC is malformed, so the host can't pin its QUIC listener to a NIC — it would fail to bind on start. Use six colon-separated hex pairs, or clear the field to bind every interface."
 nb = "Denne MAC-en er feilformatert, så verten kan ikke feste QUIC-lytteren til et nettverkskort — den vil ikke kunne binde ved oppstart. Bruk seks kolon-separerte heksadesimale par, eller tøm feltet for å binde alle grensesnitt."

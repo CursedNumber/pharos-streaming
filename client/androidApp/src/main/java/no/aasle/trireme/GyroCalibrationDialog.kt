@@ -116,6 +116,7 @@ fun GyroCalibrationDialog(
                     null,
                     sink,
                     null,
+                    null, // clipboardSink: none for the short-lived gyro session
                     true,
                     // Gyro-calibration session: video is discarded, so Auto res + no
                     // refresh cap (0) is fine.
