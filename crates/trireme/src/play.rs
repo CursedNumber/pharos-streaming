@@ -1347,8 +1347,8 @@ impl ApplicationHandler<UserEvent> for App {
                     );
                 }
                 self.refresh_gamepad_sink(); // pads mute until the source is back
-                // Free the cursor if mouselook-grabbed — don't trap it during the
-                // reconnect window; the user re-grabs after reconnect.
+                                             // Free the cursor if mouselook-grabbed — don't trap it during the
+                                             // reconnect window; the user re-grabs after reconnect.
                 self.grab_wanted = false;
                 self.apply_grab();
                 let proxy = self.proxy.clone();
@@ -1364,7 +1364,7 @@ impl ApplicationHandler<UserEvent> for App {
                     s.input_tx = None; // back-channel is dead either way
                 }
                 self.refresh_gamepad_sink(); // pads mute while refused
-                // Free the cursor if mouselook-grabbed (same as a plain drop).
+                                             // Free the cursor if mouselook-grabbed (same as a plain drop).
                 self.grab_wanted = false;
                 self.apply_grab();
                 let name = self
@@ -1944,7 +1944,14 @@ fn decode_ffmpeg_args(tonemap: bool) -> Vec<String> {
     if tonemap {
         args.extend(
             [
-                "-i", "pipe:0", "-vf", HDR_TONEMAP_VF, "-f", "rawvideo", "-pix_fmt", "nv12",
+                "-i",
+                "pipe:0",
+                "-vf",
+                HDR_TONEMAP_VF,
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "nv12",
                 "pipe:1",
             ]
             .iter()
@@ -2884,7 +2891,10 @@ mod tests {
 
         // Initial guess was plain (or host flipped SDR→HDR mid-session): HDR client,
         // plain chain, host announces HDR → rebuild to tonemap, exactly once.
-        assert_eq!(chain_action(true, false, Some(true), true), RebuildToTonemap);
+        assert_eq!(
+            chain_action(true, false, Some(true), true),
+            RebuildToTonemap
+        );
 
         // HDR→SDR flip with the announce landed: tonemap chain but host now SDR →
         // rebuild to plain (whether ffmpeg is still alive or already died).

@@ -133,7 +133,9 @@ impl PairingManager {
     ) -> Result<(), String> {
         // Lockout gate: once tripped, stay down until the process restarts.
         if self.locked.load(Ordering::SeqCst) {
-            return Err("pairing locked after failed attempts; relaunch the host to re-enable".into());
+            return Err(
+                "pairing locked after failed attempts; relaunch the host to re-enable".into(),
+            );
         }
 
         let mut guard = self
@@ -418,19 +420,15 @@ mod tests {
     /// and returns the guard: the caller holds it for the whole test so no other
     /// env-mutating test can clobber `PHAROS_CONFIG_DIR` mid-run. Returns the dir
     /// (for cleanup) and the guard (to keep alive).
-    fn isolate_config_dir(
-        tag: &str,
-    ) -> (std::path::PathBuf, std::sync::MutexGuard<'static, ()>) {
+    fn isolate_config_dir(tag: &str) -> (std::path::PathBuf, std::sync::MutexGuard<'static, ()>) {
         use std::sync::atomic::AtomicU32;
         static SEQ: AtomicU32 = AtomicU32::new(0);
         let guard = crate::pair::env_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "pharos-pairmgr-{tag}-{}-{n}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("pharos-pairmgr-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("PHAROS_CONFIG_DIR", &dir);
         (dir, guard)
@@ -476,9 +474,15 @@ mod tests {
         );
         let st = mgr.status.lock().unwrap();
         let p = st.pairing.as_ref().expect("pairing state");
-        assert!(p.active, "always-open listener stays active through cancel()");
+        assert!(
+            p.active,
+            "always-open listener stays active through cancel()"
+        );
         assert!(p.always_on, "the always_on flag is surfaced to the panel");
-        assert!(p.pin.is_some(), "the PIN is retained (nothing was torn down)");
+        assert!(
+            p.pin.is_some(),
+            "the PIN is retained (nothing was torn down)"
+        );
         drop(st);
 
         std::env::remove_var("PHAROS_CONFIG_DIR");

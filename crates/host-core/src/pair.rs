@@ -397,7 +397,8 @@ pub fn run(addr: SocketAddr) -> Result<()> {
         None,
         // The standalone CLI is the host's only mDNS presence — announce.
         true,
-        |ev| match ev {
+        |ev| {
+            match ev {
             PairEvent::Listening { pin, .. } => announce_pin(&pin),
             PairEvent::Attempt { peer } => info!("incoming pair attempt from {peer}"),
             PairEvent::Paired { pubkey_hex, alias } => {
@@ -408,6 +409,7 @@ pub fn run(addr: SocketAddr) -> Result<()> {
                 "pairing locked out after {attempts} failed attempts; relaunch the host to re-enable"
             ),
             PairEvent::Stopped => info!("pair listener stopped"),
+        }
         },
     )
 }
@@ -604,7 +606,10 @@ async fn run_loop(
                     failures += 1;
                     warn!("pairing failed (wrong PIN): {:?}", he.as_err());
                 } else {
-                    warn!("pairing failed (not counted toward lockout): {:?}", he.as_err());
+                    warn!(
+                        "pairing failed (not counted toward lockout): {:?}",
+                        he.as_err()
+                    );
                 }
                 // Best-effort abort message; ignore I/O errors.
                 let _ = link

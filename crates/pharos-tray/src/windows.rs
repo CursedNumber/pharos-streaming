@@ -17,7 +17,9 @@ use tracing::{info, warn};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-use crate::{detect_pairing, detect_state, find_panel, open_panel, PairingHint, State, POLL_INTERVAL};
+use crate::{
+    detect_pairing, detect_state, find_panel, open_panel, PairingHint, State, POLL_INTERVAL,
+};
 
 /// Build a `tray-icon` icon from the shared RGBA raster at a tray-friendly size.
 fn icon_for(state: State) -> Result<Icon> {

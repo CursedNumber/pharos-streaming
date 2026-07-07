@@ -156,7 +156,13 @@ pub fn map_pad_event(ev: PadEvent, slot: u8, state: &mut PadState) -> Vec<InputE
 
 /// Emit an axis event with the deadzone (sticks only) and the epsilon dedup,
 /// mirroring Android's `sendAxis`.
-fn axis_event(slot: u8, idx: u8, raw: f32, is_stick: bool, state: &mut PadState) -> Vec<InputEvent> {
+fn axis_event(
+    slot: u8,
+    idx: u8,
+    raw: f32,
+    is_stick: bool,
+    state: &mut PadState,
+) -> Vec<InputEvent> {
     let v = if is_stick && raw.abs() < CENTER_DEADZONE {
         0.0
     } else {
@@ -186,7 +192,8 @@ fn dpad_button(btn: Button, pressed: bool, slot: u8, state: &mut PadState) -> Ve
         Button::DPadRight => state.dpad.right = pressed,
         _ => return Vec::new(),
     }
-    let hx = (if state.dpad.right { 1.0 } else { 0.0 }) + (if state.dpad.left { -1.0 } else { 0.0 });
+    let hx =
+        (if state.dpad.right { 1.0 } else { 0.0 }) + (if state.dpad.left { -1.0 } else { 0.0 });
     let hy = (if state.dpad.down { 1.0 } else { 0.0 }) + (if state.dpad.up { -1.0 } else { 0.0 });
     let mut out = axis_event(slot, canon::AXIS_HAT_X, hx, false, state);
     out.extend(axis_event(slot, canon::AXIS_HAT_Y, hy, false, state));
@@ -203,16 +210,16 @@ fn dpad_button(btn: Button, pressed: bool, slot: u8, state: &mut PadState) -> Ve
 /// correct and does NOT double-swap; the analog triggers go to the axes instead.
 fn button_index(btn: Button) -> Option<u8> {
     Some(match btn {
-        Button::South => canon::BTN_A,       // 0
-        Button::East => canon::BTN_B,        // 1
-        Button::West => canon::BTN_X,        // 2
-        Button::North => canon::BTN_Y,       // 3
-        Button::LeftTrigger => canon::BTN_LB, // 4 (the LB bumper, not the analog trigger)
-        Button::RightTrigger => canon::BTN_RB, // 5 (the RB bumper)
-        Button::Select => canon::BTN_BACK,   // 6
-        Button::Start => canon::BTN_START,   // 7
-        Button::Mode => canon::BTN_GUIDE,    // 8
-        Button::LeftThumb => canon::BTN_LSTICK, // 9
+        Button::South => canon::BTN_A,           // 0
+        Button::East => canon::BTN_B,            // 1
+        Button::West => canon::BTN_X,            // 2
+        Button::North => canon::BTN_Y,           // 3
+        Button::LeftTrigger => canon::BTN_LB,    // 4 (the LB bumper, not the analog trigger)
+        Button::RightTrigger => canon::BTN_RB,   // 5 (the RB bumper)
+        Button::Select => canon::BTN_BACK,       // 6
+        Button::Start => canon::BTN_START,       // 7
+        Button::Mode => canon::BTN_GUIDE,        // 8
+        Button::LeftThumb => canon::BTN_LSTICK,  // 9
         Button::RightThumb => canon::BTN_RSTICK, // 10
         _ => return None,
     })
@@ -222,7 +229,7 @@ fn button_index(btn: Button) -> Option<u8> {
 /// path where the trigger arrives as a `ButtonChanged` with a 0..1 value.
 fn trigger_axis(btn: Button) -> Option<u8> {
     match btn {
-        Button::LeftTrigger2 => Some(canon::AXIS_LTRIGGER),  // 4
+        Button::LeftTrigger2 => Some(canon::AXIS_LTRIGGER), // 4
         Button::RightTrigger2 => Some(canon::AXIS_RTRIGGER), // 5
         _ => None,
     }

@@ -4832,15 +4832,40 @@ impl Staging {
                     return;
                 }
                 (
-                    GamepadAxis { slot: s, axis: a, value },
-                    GamepadAxis { slot: ns, axis: na, value: nv },
+                    GamepadAxis {
+                        slot: s,
+                        axis: a,
+                        value,
+                    },
+                    GamepadAxis {
+                        slot: ns,
+                        axis: na,
+                        value: nv,
+                    },
                 ) if *s == *ns && *a == *na => {
                     *value = *nv;
                     return;
                 }
-                (GamepadMotion { slot: s, gx, gy, gz, ax, ay, az }, GamepadMotion { slot: ns, gx: ngx, gy: ngy, gz: ngz, ax: nax, ay: nay, az: naz })
-                    if *s == *ns =>
-                {
+                (
+                    GamepadMotion {
+                        slot: s,
+                        gx,
+                        gy,
+                        gz,
+                        ax,
+                        ay,
+                        az,
+                    },
+                    GamepadMotion {
+                        slot: ns,
+                        gx: ngx,
+                        gy: ngy,
+                        gz: ngz,
+                        ax: nax,
+                        ay: nay,
+                        az: naz,
+                    },
+                ) if *s == *ns => {
                     // Gyro rates SUM: the host integrates them into cursor pan with a
                     // per-sample delta linear in the rate and no dt, so the sum of the
                     // coalesced rates integrates to the identical rotation.
@@ -5008,7 +5033,15 @@ mod tests {
         // is the latest reading, not a sum.
         assert_eq!(s.items.len(), 8, "gyro burst coalesces to one item");
         match s.items[7] {
-            GamepadMotion { slot, gx, gy, gz, ax, ay, az } => {
+            GamepadMotion {
+                slot,
+                gx,
+                gy,
+                gz,
+                ax,
+                ay,
+                az,
+            } => {
                 assert_eq!(slot, 0);
                 assert_eq!(gx, 0.0);
                 assert_eq!(gy, 0.0);
@@ -5075,7 +5108,11 @@ mod tests {
         // Exactly AT the cap is not stuck; one past it is.
         let mut at_cap = super::Staging::new();
         for i in 0..super::INPUT_MAX_PENDING_TRANSITIONS {
-            at_cap.fold(Key { scancode: i as u32, pressed: true, mods });
+            at_cap.fold(Key {
+                scancode: i as u32,
+                pressed: true,
+                mods,
+            });
         }
         assert!(!at_cap.check_stuck(), "exactly at the cap must NOT trip");
         at_cap.fold(Key {
@@ -5090,8 +5127,11 @@ mod tests {
         let mut aged = super::Staging::new();
         aged.fold(PointerRel { dx: 1.0, dy: 0.0 });
         assert!(!aged.check_stuck(), "fresh staged item is not stuck");
-        aged.oldest_at =
-            Some(std::time::Instant::now() - super::INPUT_MAX_STAGE_AGE - std::time::Duration::from_millis(1));
+        aged.oldest_at = Some(
+            std::time::Instant::now()
+                - super::INPUT_MAX_STAGE_AGE
+                - std::time::Duration::from_millis(1),
+        );
         assert!(aged.check_stuck(), "an item aged past the bound must trip");
         assert!(aged.shutdown, "shutdown flag set for the writer to observe");
 
