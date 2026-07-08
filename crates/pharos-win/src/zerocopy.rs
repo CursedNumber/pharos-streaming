@@ -190,6 +190,33 @@ fn is_transient(msg: &str) -> bool {
     msg.contains("NeedMoreInput") || msg.contains("EncoderBusy") || msg.contains("LockBusy")
 }
 
+/// Periodic IDR cadence in frames (mirrors multi.rs's `idr_period_frames`).
+/// Used to be hardcoded to `fps` (1s) for fast mid-stream-join resync; that
+/// requirement no longer holds, so it's env-tunable via `PHAROS_IDR_PERIOD_SEC`
+/// (default 4s) — spacing IDRs out means the encoder eats the IDR-sized
+/// rate-control spike less often.
+fn idr_period_frames(fps: u32) -> u32 {
+    let secs = std::env::var("PHAROS_IDR_PERIOD_SEC")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4);
+    fps.max(1).saturating_mul(secs)
+}
+
+/// VBV buffer depth, in frames of average bitrate (mirrors multi.rs's
+/// `vbv_buffer_frames`). Used to be hardcoded to 1 frame, which an IDR (2-4x a
+/// P-frame) overflows — see the `bitrate_kbps` doc comment on the visible
+/// pulse this caused on the Bravia. Env-tunable via `PHAROS_VBV_FRAMES`
+/// (default 4).
+fn vbv_buffer_frames() -> u32 {
+    std::env::var("PHAROS_VBV_FRAMES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4)
+}
+
 /// CBR bitrate for the session, kbps: `PHAROS_BITRATE_KBPS` if set, else a
 /// pixel-rate + depth aware default (LAN-tuned), clamped to 15..60 Mbps.
 /// A flat 20 Mbps starves 4K60 Main10 badly enough that the 1s IDR refresh
@@ -455,13 +482,15 @@ fn zc_loop(
         .get_preset_config(encode_guid, preset_guid, tuning)
         .map_err(|e| anyhow!("preset config: {e:?}"))?;
 
-    // The Linux host's low-latency recipe: 1s GOP with an IDR each period and
-    // VPS/SPS/PPS repeated on every keyframe, so a mid-stream joiner resyncs
-    // in <=1s; plus explicit 1-frame-VBV CBR (multi.rs's shape).
+    // The Linux host's low-latency recipe: periodic GOP/IDR (see
+    // `idr_period_frames`) with VPS/SPS/PPS repeated on every keyframe, plus a
+    // multi-frame VBV CBR (multi.rs's shape) so an IDR-sized spike doesn't
+    // overflow the buffer and force a QP clamp.
     let cfg = &mut preset_config.presetCfg;
-    cfg.gopLength = fps.max(1);
+    let idr = idr_period_frames(fps);
+    cfg.gopLength = idr;
     cfg.frameIntervalP = 1;
-    cfg.encodeCodecConfig.hevcConfig.idrPeriod = fps.max(1);
+    cfg.encodeCodecConfig.hevcConfig.idrPeriod = idr;
     // SAFETY: the union is the HEVC variant (preset fetched for the HEVC GUID).
     unsafe {
         cfg.encodeCodecConfig.hevcConfig.set_repeatSPSPPS(1);
@@ -470,7 +499,8 @@ fn zc_loop(
     cfg.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
     cfg.rcParams.averageBitRate = kbps.saturating_mul(1000);
     cfg.rcParams.maxBitRate = kbps.saturating_mul(1000);
-    cfg.rcParams.vbvBufferSize = kbps.saturating_mul(1000) / fps.max(1);
+    cfg.rcParams.vbvBufferSize =
+        (kbps.saturating_mul(1000) / fps.max(1)).saturating_mul(vbv_buffer_frames());
     cfg.rcParams.vbvInitialDelay = cfg.rcParams.vbvBufferSize;
     if hdr {
         apply_hdr10(cfg);
@@ -609,7 +639,7 @@ fn zc_loop(
 
         // HDR10 static metadata rides every IDR; the GOP is aligned by forcing
         // the IDR at each period boundary, which also matches idrPeriod.
-        let params = if hdr && frame_no.is_multiple_of(u64::from(fps.max(1))) {
+        let params = if hdr && frame_no.is_multiple_of(u64::from(idr_period_frames(fps))) {
             sei_idr_params(&sei)
         } else {
             EncodePictureParams::default()

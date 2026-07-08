@@ -318,18 +318,45 @@ fn codec_encode_guid(codec: VideoCodec) -> nvidia_video_codec_sdk::sys::nvEncode
     }
 }
 
+/// Periodic IDR cadence in frames. Used to be hardcoded to `fps` (1s) so a
+/// mid-stream joiner resynced within a second; that requirement no longer
+/// holds, so it's env-tunable via `PHAROS_IDR_PERIOD_SEC` (default 4s) —
+/// spacing IDRs out means the encoder eats the IDR-sized rate-control spike
+/// less often.
+fn idr_period_frames(fps: u32) -> u32 {
+    let secs = std::env::var("PHAROS_IDR_PERIOD_SEC")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4);
+    fps.max(1).saturating_mul(secs)
+}
+
+/// VBV buffer depth, in frames of average bitrate. Used to be hardcoded to 1
+/// frame, which an IDR (2-4x a P-frame) overflows — the rate controller then
+/// clamps QP hard to stay in budget, visible as a blocky pulse synced to the
+/// IDR cadence. Env-tunable via `PHAROS_VBV_FRAMES` (default 4) now that the
+/// buffer no longer needs to double as the resync-latency bound.
+fn vbv_buffer_frames() -> u32 {
+    std::env::var("PHAROS_VBV_FRAMES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4)
+}
+
 /// Apply the codec-specific low-latency knobs onto a fresh preset config: a
-/// 1-second IDR period plus per-keyframe parameter-set repetition, so a client
-/// reconnecting mid-stream resyncs in ≤1s. HEVC repeats VPS/SPS/PPS
-/// (`repeatSPSPPS`); AV1 repeats the sequence-header OBU (`repeatSeqHdr`). `cfg`
-/// must be the preset returned by `get_preset_config` for this codec's GUID, so
-/// the active union variant matches the codec.
+/// periodic IDR (see `idr_period_frames`) plus per-keyframe parameter-set
+/// repetition. HEVC repeats VPS/SPS/PPS (`repeatSPSPPS`); AV1 repeats the
+/// sequence-header OBU (`repeatSeqHdr`). `cfg` must be the preset returned by
+/// `get_preset_config` for this codec's GUID, so the active union variant
+/// matches the codec.
 fn apply_codec_lowlatency(
     cfg: &mut nvidia_video_codec_sdk::sys::nvEncodeAPI::NV_ENC_CONFIG,
     codec: VideoCodec,
     fps: u32,
 ) {
-    let idr = fps.max(1);
+    let idr = idr_period_frames(fps);
     match codec {
         VideoCodec::Hevc => {
             cfg.encodeCodecConfig.hevcConfig.idrPeriod = idr;
@@ -542,8 +569,8 @@ fn resolve_rc_bitrate(cfg: &MultiCfg) -> Option<(u32, u32)> {
 /// Live-reconfigure the RC bitrate on every streaming pipeline's NVENC session
 /// (in place via `NvEncReconfigureEncoder` — proven crash-free, unlike a re-init).
 /// `avg_kbps` is the new average; the configured avg→max headroom ratio is
-/// preserved; VBV is sized to ~1 frame. Used by the network-aware controller and
-/// the reconnect-restore path. Errors are logged, not fatal.
+/// preserved; VBV is sized via `vbv_buffer_frames`. Used by the network-aware
+/// controller and the reconnect-restore path. Errors are logged, not fatal.
 fn reconfigure_all_bitrate(
     pipelines: &[Option<Pipeline>],
     avg_kbps: u32,
@@ -555,7 +582,7 @@ fn reconfigure_all_bitrate(
     let avg_bps = avg_kbps.saturating_mul(1000);
     let max_kbps = ((u64::from(avg_kbps) * u64::from(max_cap)) / u64::from(avg_cap.max(1))) as u32;
     let max_bps = max_kbps.saturating_mul(1000);
-    let vbv = avg_bps / fps.max(1);
+    let vbv = (avg_bps / fps.max(1)).saturating_mul(vbv_buffer_frames());
     for slot in pipelines.iter() {
         if let Some(p) = slot.as_ref() {
             if p.streamer.is_some() {
@@ -757,11 +784,11 @@ fn rebuild_pipeline_session(
     let mut preset_config = encoder
         .get_preset_config(encode_guid, preset_guid, tuning)
         .map_err(|e| anyhow::anyhow!("preset [{}]: {e:?}", p.name))?;
-    preset_config.presetCfg.gopLength = fps.max(1);
+    preset_config.presetCfg.gopLength = idr_period_frames(fps);
     preset_config.presetCfg.frameIntervalP = 1;
-    // Codec-specific 1s-IDR + parameter-set repetition, so a client reconnecting
-    // onto this freshly-rebuilt session resyncs within ≤1s (HEVC repeats
-    // VPS/SPS/PPS; AV1 repeats the sequence-header OBU).
+    // Codec-specific periodic IDR + parameter-set repetition, so a client
+    // reconnecting onto this freshly-rebuilt session resyncs at the next IDR
+    // (HEVC repeats VPS/SPS/PPS; AV1 repeats the sequence-header OBU).
     apply_codec_lowlatency(&mut preset_config.presetCfg, codec, fps);
     let mut init = EncoderInitParams::new(encode_guid, p.width, p.height);
     init.preset_guid(preset_guid)
@@ -1745,15 +1772,15 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
         let mut preset_config = encoder
             .get_preset_config(encode_guid, preset_guid, tuning)
             .map_err(|e| anyhow::anyhow!("preset [{}]: {e:?}", oc.name))?;
-        // Cap the GOP + IDR period at one second so a client that reconnects
-        // mid-stream sees an IDR within ≤1s and can resume decoding without
-        // a session-rebuild dance. The default for ULTRA_LOW_LATENCY is
-        // effectively "infinite" — fine for a single fixed connection, wrong
-        // for the multi-shot streamer. gopLength governs intra-distance;
-        // `apply_codec_lowlatency` sets the codec's IDR period + parameter-set
-        // repetition (HEVC VPS/SPS/PPS, AV1 sequence-header OBU) so the
-        // reconnecting decoder gets the headers an IDR/keyframe alone lacks.
-        preset_config.presetCfg.gopLength = cfg.fps.max(1);
+        // Cap the GOP + IDR period (see `idr_period_frames`) so a client that
+        // reconnects mid-stream resumes decoding without a session-rebuild
+        // dance. The default for ULTRA_LOW_LATENCY is effectively "infinite"
+        // — fine for a single fixed connection, wrong for the multi-shot
+        // streamer. gopLength governs intra-distance; `apply_codec_lowlatency`
+        // sets the codec's IDR period + parameter-set repetition (HEVC
+        // VPS/SPS/PPS, AV1 sequence-header OBU) so the reconnecting decoder
+        // gets the headers an IDR/keyframe alone lacks.
+        preset_config.presetCfg.gopLength = idr_period_frames(cfg.fps);
         preset_config.presetCfg.frameIntervalP = 1;
         apply_codec_lowlatency(&mut preset_config.presetCfg, cfg.video_codec, cfg.fps);
         if hdr {
@@ -1763,7 +1790,8 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
         // heuristic RC is kept (today's behavior). With one, cap the bitrate so a high
         // res/fps stream can't outrun the bounded QUIC flow window (PHAROS_STREAM_WINDOW_KB)
         // — the ~2s-backlog recipe. CBR when only an average is set; capped-VBR when a
-        // higher ceiling is given. Tight ~1-frame VBV keeps latency low.
+        // higher ceiling is given. VBV is a few frames deep (`vbv_buffer_frames`) so
+        // it can absorb an IDR-sized spike instead of underflowing into blockiness.
         if let Some((avg_kbps, max_kbps)) = resolve_rc_bitrate(cfg) {
             let rc = &mut preset_config.presetCfg.rcParams;
             let capped_vbr = max_kbps > avg_kbps;
@@ -1774,7 +1802,8 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
             };
             rc.averageBitRate = avg_kbps.saturating_mul(1000);
             rc.maxBitRate = max_kbps.saturating_mul(1000);
-            rc.vbvBufferSize = rc.averageBitRate / cfg.fps.max(1);
+            rc.vbvBufferSize =
+                (rc.averageBitRate / cfg.fps.max(1)).saturating_mul(vbv_buffer_frames());
             rc.vbvInitialDelay = rc.vbvBufferSize;
             info!(
                 "nvenc RC [{}]: {} avg={}kbps max={}kbps vbv={}B",
@@ -3693,8 +3722,9 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
             // On-demand IDR: if this output's streamer is asking for a keyframe
             // (it dropped an AU, or the client sent DG_REQUEST_IDR) and we haven't
             // just emitted one, force THIS frame to be an IDR so the client resyncs
-            // in ~1 frame instead of waiting for the periodic ~1s IDR. Rate-limited
-            // via last_idr_at so sustained loss can't trigger an IDR storm.
+            // in ~1 frame instead of waiting for the next periodic IDR (see
+            // `idr_period_frames`). Rate-limited via last_idr_at so sustained
+            // loss can't trigger an IDR storm.
             let force_idr = p.streamer.as_ref().is_some_and(|s| {
                 s.take_idr_request()
                     && last_idr_at[idx].is_none_or(|t| t.elapsed() >= min_idr_interval)
@@ -3702,16 +3732,17 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
             // Severity-aware encode + lock. Pre-P1 a bare `?` here meant a single
             // transient (EncoderBusy/NeedMoreInput/LockBusy) terminated the whole
             // host; now a retryable kind skips just this output's frame (the
-            // client resyncs off the periodic ~1s IDR) and only a fatal kind
+            // client resyncs off the next periodic IDR) and only a fatal kind
             // returns Err → the process exits + systemd respawns a FRESH NVENC
             // process (never an in-process re-init, which SIGSEGVs libnvcuvid).
             // HDR10 static metadata: re-emit MDCV(137)+CLL(144) on every IDR
-            // (idrPeriod == fps, plus any on-demand force_idr) so a mid-stream
-            // joiner gets the mastering/CLL info within ≤1s, matching repeatSPSPPS.
+            // (idrPeriod == idr_period_frames, plus any on-demand force_idr) so
+            // a mid-stream joiner gets the mastering/CLL info alongside
+            // repeatSPSPPS at the next periodic IDR.
             // The payload array must outlive the encode call; NVENC copies it.
             let mut hdr_sei_arr;
             let codec_params = match hdr_sei.as_ref() {
-                Some((mdcv, cll)) if force_idr || i.is_multiple_of(cfg.fps.max(1)) => {
+                Some((mdcv, cll)) if force_idr || i.is_multiple_of(idr_period_frames(cfg.fps)) => {
                     hdr_sei_arr = [
                         NV_ENC_SEI_PAYLOAD {
                             payloadSize: mdcv.len() as u32,
