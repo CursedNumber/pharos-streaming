@@ -834,6 +834,11 @@ fn zc_loop(
         } else {
             EncodePictureParams::default()
         };
+        if forced {
+            // The observable for validating on-demand resync (issue #32): one
+            // line per honoured request, absent when coalesced.
+            tracing::info!("wgc-zc: forced IDR at frame {frame_no} (client DG_REQUEST_IDR)");
+        }
         if periodic || forced {
             last_idr_at = Some(Instant::now());
         }
