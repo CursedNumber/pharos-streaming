@@ -84,6 +84,9 @@ pub struct ZcPipeline {
     stop: Arc<AtomicBool>,
     fault: Arc<Mutex<Option<String>>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// The off-encode-thread HDR-active poll (issue #29), if this generation watches
+    /// for a mid-session flip. Joined in `stop()`; exits within ~100ms of `stop`.
+    poll_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Tri-state receive, same contract as `wgc::Recv`: `Dead` is a pipeline
@@ -125,17 +128,38 @@ impl ZcPipeline {
         } else {
             false
         };
+        // Watch for a mid-session Windows HDR toggle only when it can change the encode:
+        // the client asked for HDR and we're not force-pinning it (PHAROS_HDR=1). A force
+        // or SDR-only session never repolls (its colorimetry doesn't depend on the
+        // desktop's HDR state).
+        let watch_hdr = hdr_requested && !force;
 
         let stop = Arc::new(AtomicBool::new(false));
         let fault = Arc::new(Mutex::new(None));
+        // Latched by the poll thread when the monitor's HDR-active state diverges from
+        // what this generation built; zc_loop reads it cheaply each tick and faults so
+        // the supervisor respawns at the new colorimetry (issue #29).
+        let hdr_changed = Arc::new(AtomicBool::new(false));
         let (au_tx, au_rx) = sync_channel::<Au>(8);
         let (init_tx, init_rx) =
             std::sync::mpsc::channel::<std::result::Result<(u32, u32), String>>();
         let (stop_t, fault_t) = (stop.clone(), fault.clone());
+        let hdr_changed_z = hdr_changed.clone();
+        // Captured for the poll thread below, before `hmon`/`hdr` move into the encode
+        // closure (HMONITOR travels as its raw isize; `hdr` is Copy).
+        let (hmon_isize, built_hdr) = (hmon.0, hdr);
         let thread = std::thread::Builder::new()
             .name("wgc-zc".into())
             .spawn(move || {
-                if let Err(e) = zc_loop(hmon, fps, hdr, &stop_t, init_tx.clone(), au_tx) {
+                if let Err(e) = zc_loop(
+                    hmon,
+                    fps,
+                    hdr,
+                    &hdr_changed_z,
+                    &stop_t,
+                    init_tx.clone(),
+                    au_tx,
+                ) {
                     let msg = format!("{e:#}");
                     tracing::error!("wgc-zc pipeline ended: {msg}");
                     *fault_t.lock().unwrap() = Some(msg.clone());
@@ -147,6 +171,44 @@ impl ZcPipeline {
             .recv()
             .map_err(|_| anyhow!("wgc-zc thread died during init"))?
             .map_err(|e| anyhow!("wgc-zc init: {e}"))?;
+        // The HDR-active poll runs on its OWN thread (issue #29 follow-up) so the DXGI
+        // enumeration in monitor_hdr_active never stalls the encode hot path. Spawned
+        // AFTER a successful init (so an init failure can't leak it); polls ~1x/s,
+        // latches `hdr_changed` on a real change, and exits within ~100ms of stop.
+        let poll_thread = if watch_hdr {
+            let (stop_p, changed_p) = (stop.clone(), hdr_changed.clone());
+            Some(
+                std::thread::Builder::new()
+                    .name("wgc-hdr-poll".into())
+                    .spawn(move || {
+                        let hmon = windows::Win32::Graphics::Gdi::HMONITOR(hmon_isize);
+                        'poll: while !stop_p.load(Ordering::Relaxed) {
+                            for _ in 0..10 {
+                                if stop_p.load(Ordering::Relaxed) {
+                                    break 'poll;
+                                }
+                                std::thread::sleep(Duration::from_millis(100));
+                            }
+                            match display::monitor_hdr_active(hmon) {
+                                Ok(now) if now != built_hdr => {
+                                    tracing::info!(
+                                        "wgc-zc: Windows HDR toggled on the captured output \
+                                         (was {built_hdr}, now {now}); requesting respawn (issue #29)"
+                                    );
+                                    changed_p.store(true, Ordering::Relaxed);
+                                    break 'poll;
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::debug!("wgc-zc HDR poll failed: {e:#} (ignored)")
+                                }
+                            }
+                        }
+                    })?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
             size,
             hdr,
@@ -154,6 +216,7 @@ impl ZcPipeline {
             stop,
             fault,
             thread: Some(thread),
+            poll_thread,
         })
     }
 
@@ -179,6 +242,9 @@ impl ZcPipeline {
         self.stop.store(true, Ordering::Relaxed);
         drop(self.au_rx.take());
         if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+        if let Some(t) = self.poll_thread.take() {
             let _ = t.join();
         }
     }
@@ -434,6 +500,10 @@ fn zc_loop(
     hmon: windows::Win32::Graphics::Gdi::HMONITOR,
     fps: u32,
     hdr: bool,
+    // Latched true by the pipeline's off-thread HDR-active poll when the monitor's HDR
+    // state diverges from what this generation built (issue #29); checked cheaply each
+    // tick below so a mid-session flip faults into a colorimetry respawn.
+    hdr_changed: &AtomicBool,
     stop: &AtomicBool,
     init_tx: std::sync::mpsc::Sender<std::result::Result<(u32, u32), String>>,
     au_tx: SyncSender<Au>,
@@ -596,6 +666,15 @@ fn zc_loop(
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
+        }
+        // Mid-session HDR flip (issue #29): the off-thread poll latched a colorimetry
+        // change, so end this generation with a typed fault — the supervisor respawns at
+        // the new colorimetry and re-announces (a reconfigure, not a fault: no backoff).
+        if hdr_changed.load(Ordering::Relaxed) {
+            return Err(anyhow!(
+                "Windows HDR toggled on the captured output; respawning to re-encode at \
+                 the new colorimetry (issue #29)"
+            ));
         }
         // Drain the pool to the newest frame; GPU-copy it and return the pool
         // buffer immediately.

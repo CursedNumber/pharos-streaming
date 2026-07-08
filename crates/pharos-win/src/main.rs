@@ -503,12 +503,13 @@ fn run_stream(
         coded.store(pack_wh(w, h), Ordering::Relaxed);
         info!("capture geometry {w}x{h} (output_idx {output_idx}); announcing to clients");
     }
-    // Colorimetry announce (issue #16): SDR until a pipeline actually builds an HDR
-    // encode. The wgc-zc path re-announces the real value each generation build
-    // below; the ffmpeg path is always SDR. This connect-time SDR default keeps the
-    // client on plain decode (the crash-safe choice) if it connects before the first
-    // pipeline, and matches this project's "HDR is a per-build property" rule.
-    streamer.set_hdr(false);
+    // Colorimetry announce (issues #16, #28): leave it UNDETERMINED until the first
+    // pipeline build determines the real value (wgc-zc samples the monitor's HDR state
+    // at build; the ffmpeg path announces SDR at build). The transport now holds a
+    // tri-state and sends no DG_STREAM_HDR until then, so a client that connects before
+    // the first pipeline plain-decodes for the sub-second gap instead of being told a
+    // premature SDR it must later correct — the connect-time gray wash. (Was an eager
+    // `streamer.set_hdr(false)` here, which caused exactly that flash.)
 
     // Cursor-mode poll: the foreground game's own cursor-capture state, announced to
     // the client as DG_CURSOR_MODE so the desktop cursor mirrors it (auto-locks to
@@ -1013,6 +1014,15 @@ fn run_stream(
                 backoff = Duration::from_millis(500); // clean stream window → reset
             }
             let rmsg = reason.describe();
+            // A deliberate HDR-flip reconfigure (issue #29) is not a fault: respawn
+            // immediately at the new colorimetry — no breaker tick, no backoff — so the
+            // client's reconfigure gap (its green/black flash) is as short as possible.
+            if matches!(reason, FaultReason::Reconfigure(_)) {
+                warn!("encoder pipeline reconfiguring (gen {generation}): {rmsg}");
+                set_health(&gpu_health, control_ipc::GpuHealth::Healthy);
+                generation += 1;
+                continue 'supervisor;
+            }
             warn!("encoder pipeline ended (gen {generation}): {rmsg} — recovering");
             if breaker.record_and_check() {
                 set_health(
@@ -1252,6 +1262,9 @@ enum FaultReason {
     DeviceLoss(String),
     /// The PHAROS_WIN_FAULT_INJECT seam fired a synthetic fault.
     FaultInjected(String),
+    /// A DELIBERATE reconfigure (wgc-zc mid-session HDR flip, issue #29) — respawn
+    /// immediately at the new colorimetry, without the fault backoff or breaker tick.
+    Reconfigure(String),
 }
 
 #[cfg(windows)]
@@ -1261,6 +1274,7 @@ impl FaultReason {
             FaultReason::Eof => "ffmpeg exited (stdout EOF)".to_string(),
             FaultReason::DeviceLoss(r) => format!("device loss: {r}"),
             FaultReason::FaultInjected(r) => r.clone(),
+            FaultReason::Reconfigure(r) => r.clone(),
         }
     }
 }
@@ -1563,6 +1577,11 @@ fn inner_pump_zc(
                 let reason = pipeline
                     .fault_reason()
                     .unwrap_or_else(|| "encoder thread exited".to_string());
+                // A deliberate HDR-flip respawn (issue #29) is a reconfigure, not a
+                // fault: classify it so the supervisor skips the backoff + breaker.
+                if reason.contains("issue #29") {
+                    return FaultReason::Reconfigure(reason);
+                }
                 return FaultReason::DeviceLoss(reason);
             }
         }
