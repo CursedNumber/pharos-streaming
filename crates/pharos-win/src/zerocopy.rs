@@ -31,7 +31,7 @@
 //! `wgc::Recv`), and the P6 ladder rebuilds the whole pipeline with a fresh
 //! device and session next generation.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -72,6 +72,24 @@ pub struct Au {
     pub keyframe: bool,
 }
 
+/// Shared bitrate-control cell between the ~1 s adaptive loop (the sole writer of
+/// `target_kbps`) and the encode thread (the sole writer of `ceiling_kbps`, and the
+/// reader of `target_kbps`). All values are kbps; 0 = unset. (issue #30)
+#[derive(Clone, Default)]
+pub struct BitrateCtl {
+    /// The CBR target the adaptive loop currently wants. 0 until the loop first
+    /// pushes a value; the encode thread treats 0 as "use the build ceiling".
+    pub target_kbps: Arc<AtomicU32>,
+    /// The build/ceiling bitrate of the CURRENT generation (the resolution+HDR
+    /// `bitrate_kbps`); the adaptive loop reads it as its upper bound and waits
+    /// while it is 0 (no pipeline built yet).
+    pub ceiling_kbps: Arc<AtomicU32>,
+}
+
+/// Lower bound the adaptive-bitrate loop (issue #30) will drop to, kbps — mirrors the
+/// Linux compositor's NET_FLOOR_KBPS. Clamped to the ceiling when the ceiling is lower.
+pub const MIN_ADAPTIVE_KBPS: u32 = 2000;
+
 /// Handle the supervisor owns: AUs come out of `recv_timeout`, faults surface
 /// as [`ZcRecv::Dead`] with a reason in `fault_reason`, and `stop` tears the
 /// encoder thread down without any process to kill (the in-process analogue
@@ -104,7 +122,12 @@ impl ZcPipeline {
     /// forces it for bring-up on SDR rigs). Blocks until the capture item and
     /// NVENC session are up (so `size` is the item's true size) or reports
     /// the init error.
-    pub fn start(monitor_idx: usize, fps: u32, hdr_requested: bool) -> Result<Self> {
+    pub fn start(
+        monitor_idx: usize,
+        fps: u32,
+        hdr_requested: bool,
+        ctl: BitrateCtl,
+    ) -> Result<Self> {
         let hmon = wgc::monitor_by_index(monitor_idx)?;
         let force = std::env::var("PHAROS_HDR").is_ok_and(|v| v.trim() == "1");
         let hdr = if force {
@@ -145,6 +168,7 @@ impl ZcPipeline {
             std::sync::mpsc::channel::<std::result::Result<(u32, u32), String>>();
         let (stop_t, fault_t) = (stop.clone(), fault.clone());
         let hdr_changed_z = hdr_changed.clone();
+        let ctl_z = ctl.clone();
         // Captured for the poll thread below, before `hmon`/`hdr` move into the encode
         // closure (HMONITOR travels as its raw isize; `hdr` is Copy).
         let (hmon_isize, built_hdr) = (hmon.0, hdr);
@@ -157,6 +181,7 @@ impl ZcPipeline {
                     hdr,
                     &hdr_changed_z,
                     &stop_t,
+                    &ctl_z,
                     init_tx.clone(),
                     au_tx,
                 ) {
@@ -281,6 +306,13 @@ fn vbv_buffer_frames() -> u32 {
         .and_then(|s| s.trim().parse::<u32>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(4)
+}
+
+/// VBV buffer size in BITS for a given CBR `kbps` at `fps` — the value NVENC wants in
+/// `rcParams.vbvBufferSize`. Factored so the initial config and a live
+/// `reconfigure_bitrate` (issue #30) size the VBV identically.
+fn vbv_bits(kbps: u32, fps: u32) -> u32 {
+    (kbps.saturating_mul(1000) / fps.max(1)).saturating_mul(vbv_buffer_frames())
 }
 
 /// CBR bitrate for the session, kbps: `PHAROS_BITRATE_KBPS` if set, else a
@@ -496,6 +528,7 @@ fn blob_bytes(blob: &ID3DBlob) -> &[u8] {
 
 /// The capture+encode thread body. Owns every COM/NVENC object; returns Err
 /// only for init or fatal runtime faults (recorded by the spawn wrapper).
+#[allow(clippy::too_many_arguments)]
 fn zc_loop(
     hmon: windows::Win32::Graphics::Gdi::HMONITOR,
     fps: u32,
@@ -505,6 +538,10 @@ fn zc_loop(
     // tick below so a mid-session flip faults into a colorimetry respawn.
     hdr_changed: &AtomicBool,
     stop: &AtomicBool,
+    // Adaptive-bitrate cell (issue #30): read `target_kbps` each tick and reconfigure
+    // the live NVENC session in place; publish `ceiling_kbps` at build (in the config
+    // block above).
+    ctl: &BitrateCtl,
     init_tx: std::sync::mpsc::Sender<std::result::Result<(u32, u32), String>>,
     au_tx: SyncSender<Au>,
 ) -> Result<()> {
@@ -565,12 +602,19 @@ fn zc_loop(
     unsafe {
         cfg.encodeCodecConfig.hevcConfig.set_repeatSPSPPS(1);
     }
-    let kbps = bitrate_kbps(w, h, fps, hdr);
+    // Adaptive bitrate (issue #30): publish this generation's ceiling so the control
+    // loop knows the upper bound, and START at the loop's current target if it has one
+    // (continuity across a respawn) — else the ceiling.
+    let ceiling = bitrate_kbps(w, h, fps, hdr);
+    ctl.ceiling_kbps.store(ceiling, Ordering::Relaxed);
+    let kbps = match ctl.target_kbps.load(Ordering::Relaxed) {
+        0 => ceiling,
+        t => t.clamp(MIN_ADAPTIVE_KBPS.min(ceiling), ceiling),
+    };
     cfg.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
     cfg.rcParams.averageBitRate = kbps.saturating_mul(1000);
     cfg.rcParams.maxBitRate = kbps.saturating_mul(1000);
-    cfg.rcParams.vbvBufferSize =
-        (kbps.saturating_mul(1000) / fps.max(1)).saturating_mul(vbv_buffer_frames());
+    cfg.rcParams.vbvBufferSize = vbv_bits(kbps, fps);
     cfg.rcParams.vbvInitialDelay = cfg.rcParams.vbvBufferSize;
     if hdr {
         apply_hdr10(cfg);
@@ -663,6 +707,9 @@ fn zc_loop(
     // capture-limited stall (fresh << ticks) from an encode-limited one (ticks drop).
     let mut fresh_frames: u64 = 0;
     let mut last_stage_log = Instant::now();
+    // Adaptive bitrate (issue #30): the CBR value NVENC is currently configured for;
+    // reconfigured in place below when the control loop moves `ctl.target_kbps`.
+    let mut applied_kbps = kbps;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -800,6 +847,38 @@ fn zc_loop(
             stage_frames = 0;
             fresh_frames = 0;
             last_stage_log = Instant::now();
+        }
+
+        // Adaptive bitrate (issue #30): apply the control loop's target in place via an
+        // NVENC RC-only reconfigure (no session reset) when it has moved. Force an IDR on
+        // a DROP so the client re-syncs cleanly at the lower rate; a raise needs none.
+        {
+            let ceil = ctl.ceiling_kbps.load(Ordering::Relaxed).max(1);
+            let want = match ctl.target_kbps.load(Ordering::Relaxed) {
+                0 => applied_kbps,
+                t => t.clamp(MIN_ADAPTIVE_KBPS.min(ceil), ceil),
+            };
+            if want != applied_kbps {
+                let bits = want.saturating_mul(1000);
+                match nv_session.reconfigure_bitrate(
+                    NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR,
+                    bits,
+                    bits,
+                    vbv_bits(want, fps),
+                    want < applied_kbps,
+                ) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "wgc-zc: bitrate {applied_kbps} -> {want} kbps (idr={})",
+                            want < applied_kbps
+                        );
+                        applied_kbps = want;
+                    }
+                    Err(e) => {
+                        tracing::warn!("wgc-zc: reconfigure_bitrate to {want} kbps failed: {e:?}")
+                    }
+                }
+            }
         }
 
         // Blocking send = natural backpressure (the ffmpeg pipe's role). The
