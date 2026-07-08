@@ -2896,6 +2896,19 @@ fn spawn_decode(
     // the session is over there is nothing feeding a new decode child, so the reader
     // must EXIT rather than rebuild (which would otherwise spawn an unfed child).
     let quic_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // While set, the on_frame closure DROPS every AU that can't start a fresh
+    // decode (no HEVC IRAP / AV1 key frame). A decoder fed mid-GOP emits
+    // zero-initialised concealment frames — the green flash of issue #32 — so a
+    // freshly spawned child (initial connect AND every colorimetry rebuild) waits
+    // for a key AU; the renderer meanwhile keeps presenting the last uploaded
+    // frame, turning the host's HDR↔SDR respawn into a brief freeze. Set here for
+    // the initial child and by the reader's rebuild path BEFORE it installs the
+    // new child's stdin (so the QUIC thread can never slip a mid-GOP AU past it).
+    let await_key = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    // One-shot client→host IDR request (DG_REQUEST_IDR, flushed within ~100ms by
+    // the transport loop). The rebuild path sets it so the wait for a key AU ends
+    // in ~1 RTT + encode instead of up to a full host IDR period.
+    let request_idr = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let frames_r = frames.clone();
     let proxy_r = proxy.clone();
@@ -2903,6 +2916,8 @@ fn spawn_decode(
     let submit_dec = submit_times.clone();
     let stdin_dec = shared_stdin.clone();
     let quic_done_dec = quic_done.clone();
+    let await_key_dec = await_key.clone();
+    let request_idr_dec = request_idr.clone();
     std::thread::Builder::new()
         .name(format!("trireme-raw-{idx}"))
         .spawn(move || {
@@ -2994,9 +3009,19 @@ fn spawn_decode(
                 *stdin_dec.lock().unwrap() = None;
                 match spawn_decode_ffmpeg(to_chain) {
                     Ok((new_ff, new_stdin, new_stdout)) => {
+                        // Arm the key-AU gate BEFORE the fresh stdin becomes reachable:
+                        // a mid-GOP AU fed to the new child would decode as green
+                        // concealment frames (issue #32). Ordering matters — the QUIC
+                        // thread takes the stdin under the same lock, so setting the
+                        // gate first means no write can precede it.
+                        await_key_dec.store(true, std::sync::atomic::Ordering::Relaxed);
                         // 4. Install the new child's stdin under the lock so the next
                         //    on_frame feeds the fresh chain.
                         *stdin_dec.lock().unwrap() = Some(new_stdin);
+                        // Ask the host for an on-demand IDR so the gate opens in ~1 RTT
+                        // instead of waiting out the periodic IDR (the freeze the user
+                        // sees is exactly this window).
+                        request_idr_dec.store(true, std::sync::atomic::Ordering::Relaxed);
                         Some((new_ff, new_stdout))
                     }
                     Err(e) => {
@@ -3156,6 +3181,11 @@ fn spawn_decode(
     // therefore atomic in practice and can only race the reader's swap, which we handle
     // by NOT clobbering a stdin the reader installed while our write was in flight.
     let stdin_quic = shared_stdin.clone();
+    let await_key_quic = await_key.clone();
+    let request_idr_quic = request_idr.clone();
+    // The codec whose bitstream the key-AU gate parses. Same env-derived choice
+    // `decode_ffmpeg_args` makes, resolved once — the QUIC closure is hot.
+    let stream_codec = media_decode::codec_from_env(media_decode::StreamCodec::Hevc);
     std::thread::Builder::new()
         .name(format!("trireme-quic-{idx}"))
         .spawn(move || {
@@ -3164,14 +3194,40 @@ fn spawn_decode(
                 expected_pubkey,
                 Some(client_identity.as_ref()),
                 |au| {
-                    // Stamp the submit instant just before handing the AU to the
-                    // decoder; the reader thread pops it when the matching NV12
-                    // frame comes out (decode-stage latency).
-                    submit_times.lock().unwrap().push_back(Instant::now());
                     // TAKE the stdin out under the lock, then release before writing so a
                     // full-pipe `write_all` never blocks the reader's rebuild `lock()`.
-                    let taken = stdin_quic.lock().unwrap().take();
+                    // The key-AU gate (issue #32) is checked under the SAME guard: the
+                    // rebuild path arms it before installing a fresh child's stdin, so
+                    // holding the lock across check+take means a mid-GOP AU can never
+                    // slip into a decoder that hasn't seen its first IRAP/key frame yet
+                    // (that's what decoded to the green concealment frames). Gated AUs
+                    // are dropped whole — no submit stamp, no write.
+                    let taken = {
+                        let mut slot = stdin_quic.lock().unwrap();
+                        if await_key_quic.load(std::sync::atomic::Ordering::Relaxed) {
+                            if !media_decode::is_keyframe_au(stream_codec, &au) {
+                                // Still waiting — keep nudging the host. The transport
+                                // tick flushes at most one DG_REQUEST_IDR per ~100ms
+                                // and the host coalesces within its min-IDR interval,
+                                // so this is self-limiting; without the re-arm, a
+                                // single request the host rate-limited away (e.g. it
+                                // landed right after the respawn's leading IDR, which
+                                // the OLD chain consumed) would leave the gate closed
+                                // until the next periodic IDR.
+                                request_idr_quic.store(true, std::sync::atomic::Ordering::Relaxed);
+                                return;
+                            }
+                            await_key_quic.store(false, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        slot.take()
+                    };
                     if let Some(mut stdin) = taken {
+                        // Stamp the submit instant just before handing the AU to the
+                        // decoder; the reader thread pops it when the matching NV12
+                        // frame comes out (decode-stage latency). Only for AUs that
+                        // actually reach ffmpeg — a stamped-but-dropped AU would pair
+                        // later frames with earlier instants and inflate the EMA.
+                        submit_times.lock().unwrap().push_back(Instant::now());
                         let _ = stdin.write_all(&au);
                         // PUT it back only if the reader hasn't installed a new child in
                         // the meantime. If the slot is now Some (rebuild swapped in the
@@ -3217,7 +3273,10 @@ fn spawn_decode(
                         }
                     }
                 })),
-                None, // request_idr: no per-frame decode-error hook on desktop; host self-triggers on drops
+                // request_idr: set by the reader's colorimetry rebuild so the fresh
+                // decode child gets its key AU in ~1 RTT (issue #32); the transport
+                // loop flushes it as DG_REQUEST_IDR within ~100ms.
+                Some(request_idr),
                 core_proto::StreamMode::default(), // requested_mode: desktop sends Auto for now
                 None, // res_pref: desktop player has no resolution selector yet
                 None, // bitrate_pref: ditto

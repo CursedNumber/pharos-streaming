@@ -337,6 +337,105 @@ pub fn sniff_codec(head: &[u8]) -> StreamCodec {
     StreamCodec::Hevc
 }
 
+/// Whether an access unit can start a fresh decode: it contains an HEVC IRAP
+/// NAL (IDR/CRA/BLA) or an AV1 key frame. The client's decode-chain rebuild
+/// (issue #32) gates what it feeds a freshly spawned ffmpeg on this — feeding a
+/// new decoder mid-GOP makes it emit zero-initialised concealment frames, which
+/// render as the green flash. False negatives would freeze the stream, so both
+/// parsers err permissive: HEVC keys on the NAL type alone, AV1 accepts either
+/// a sequence-header OBU (NVENC repeats it on every key frame, mirroring
+/// repeatSPSPPS) or an explicit KEY_FRAME frame header.
+pub fn is_keyframe_au(codec: StreamCodec, au: &[u8]) -> bool {
+    match codec {
+        StreamCodec::Hevc => hevc_has_irap(au),
+        StreamCodec::Av1 => av1_has_key(au),
+    }
+}
+
+/// Scan an Annex-B AU for an IRAP NAL. HEVC `nal_unit_type` lives in bits 6..1
+/// of the first byte after the start code; types 16..=23 are the IRAP class
+/// (BLA_W_LP..RSV_IRAP_VCL23), any of which starts a decodable chain.
+fn hevc_has_irap(au: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < au.len() {
+        // Both 3- and 4-byte start codes appear in NVENC output.
+        if au[i] == 0 && au[i + 1] == 0 {
+            let hdr = if au[i + 2] == 1 {
+                i + 3
+            } else if au[i + 2] == 0 && au.get(i + 3) == Some(&1) {
+                i + 4
+            } else {
+                i += 1;
+                continue;
+            };
+            if let Some(&b) = au.get(hdr) {
+                if (16..=23).contains(&((b >> 1) & 0x3f)) {
+                    return true;
+                }
+            }
+            i = hdr;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Walk a low-overhead AV1 OBU stream for key-frame evidence: a sequence-header
+/// OBU (type 1), or a frame / frame-header OBU (6 / 3) whose first bits decode
+/// to `show_existing_frame=0, frame_type=KEY_FRAME`. Malformed input just ends
+/// the scan (→ not a key frame).
+fn av1_has_key(au: &[u8]) -> bool {
+    let mut i = 0;
+    while i < au.len() {
+        let b = au[i];
+        if b & 0x80 != 0 {
+            return false; // forbidden bit — not an OBU boundary; bail
+        }
+        let obu_type = (b >> 3) & 0x0f;
+        let has_ext = b & 0x04 != 0;
+        let has_size = b & 0x02 != 0;
+        let mut p = i + 1 + usize::from(has_ext);
+        let size = if has_size {
+            // leb128, ≤8 bytes per spec.
+            let mut v: u64 = 0;
+            let mut ok = false;
+            for k in 0..8 {
+                let Some(&sb) = au.get(p) else { return false };
+                p += 1;
+                v |= u64::from(sb & 0x7f) << (7 * k);
+                if sb & 0x80 == 0 {
+                    ok = true;
+                    break;
+                }
+            }
+            if !ok {
+                return false;
+            }
+            v as usize
+        } else {
+            au.len() - p // size-less OBU extends to the end of the AU
+        };
+        if obu_type == 1 {
+            return true; // sequence header rides key frames only
+        }
+        if matches!(obu_type, 3 | 6) {
+            // frame_header: show_existing_frame f(1); if 0, frame_type f(2)
+            // (KEY_FRAME = 0). Top 3 bits of the first payload byte.
+            if let Some(&fb) = au.get(p) {
+                if fb & 0xe0 == 0 {
+                    return true;
+                }
+            }
+        }
+        i = p.saturating_add(size);
+        if size == 0 && obu_type != 2 {
+            return false; // only a temporal delimiter is legitimately empty
+        }
+    }
+    false
+}
+
 /// ffmpeg input args for the chosen decoder, retargeted to `codec`. HEVC uses the
 /// probed decoder verbatim; AV1 maps the probed HW engine to its AV1 sibling
 /// (`hevc_cuvid`→`av1_cuvid`, `hevc_qsv`→`av1_qsv`, `hevc_rkmpp`→`av1_rkmpp`);
@@ -388,6 +487,56 @@ mod codec_tests {
         assert_eq!(sniff_codec(&[0x12, 0x00]), StreamCodec::Av1);
         // Sequence-header OBU (type 1) = 0x0a.
         assert_eq!(sniff_codec(&[0x0a, 0x0e]), StreamCodec::Av1);
+    }
+
+    #[test]
+    fn keyframe_hevc_sample_is_irap() {
+        // The bundled probe sample opens VPS/SPS/PPS + IDR — a key AU.
+        assert!(is_keyframe_au(StreamCodec::Hevc, SAMPLE));
+    }
+
+    #[test]
+    fn keyframe_hevc_p_slice_is_not() {
+        // TRAIL_R slice (type 1): header byte = 1 << 1 = 0x02.
+        assert!(!is_keyframe_au(
+            StreamCodec::Hevc,
+            &[0, 0, 0, 1, 0x02, 0x01, 0xd0]
+        ));
+        // Parameter sets alone (VPS 32 = 0x40) don't make a key AU either.
+        assert!(!is_keyframe_au(
+            StreamCodec::Hevc,
+            &[0, 0, 0, 1, 0x40, 0x01]
+        ));
+    }
+
+    #[test]
+    fn keyframe_hevc_idr_after_params() {
+        // VPS then IDR_W_RADL (19): header byte = 19 << 1 = 0x26.
+        assert!(is_keyframe_au(
+            StreamCodec::Hevc,
+            &[0, 0, 0, 1, 0x40, 0x01, 0, 0, 1, 0x26, 0x01]
+        ));
+        // CRA (21) counts too: 21 << 1 = 0x2a.
+        assert!(is_keyframe_au(StreamCodec::Hevc, &[0, 0, 1, 0x2a, 0x01]));
+    }
+
+    #[test]
+    fn keyframe_av1_sequence_header() {
+        // Temporal delimiter (type 2, has_size, size 0) then sequence header
+        // (type 1, has_size): 0x12 0x00, 0x0a <len> …
+        assert!(is_keyframe_au(
+            StreamCodec::Av1,
+            &[0x12, 0x00, 0x0a, 0x02, 0x00, 0x00]
+        ));
+    }
+
+    #[test]
+    fn keyframe_av1_key_frame_header() {
+        // Frame OBU (type 6, has_size): first payload byte 0b000….. =
+        // show_existing_frame=0, frame_type=KEY.
+        assert!(is_keyframe_au(StreamCodec::Av1, &[0x32, 0x02, 0x10, 0x00]));
+        // Inter frame (frame_type=1 → bits 001…): not a key AU.
+        assert!(!is_keyframe_au(StreamCodec::Av1, &[0x32, 0x02, 0x30, 0x00]));
     }
 
     #[test]

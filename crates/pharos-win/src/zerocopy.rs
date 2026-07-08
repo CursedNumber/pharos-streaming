@@ -100,6 +100,10 @@ pub struct ZcPipeline {
     pub hdr: bool,
     au_rx: Option<Receiver<Au>>,
     stop: Arc<AtomicBool>,
+    /// One-shot on-demand keyframe request (client `DG_REQUEST_IDR`, forwarded
+    /// by the supervisor pump). The encode loop swaps it false and forces the
+    /// next picture to an IDR, rate-limited like the Linux host.
+    idr_req: Arc<AtomicBool>,
     fault: Arc<Mutex<Option<String>>>,
     thread: Option<std::thread::JoinHandle<()>>,
     /// The off-encode-thread HDR-active poll (issue #29), if this generation watches
@@ -158,6 +162,7 @@ impl ZcPipeline {
         let watch_hdr = hdr_requested && !force;
 
         let stop = Arc::new(AtomicBool::new(false));
+        let idr_req = Arc::new(AtomicBool::new(false));
         let fault = Arc::new(Mutex::new(None));
         // Latched by the poll thread when the monitor's HDR-active state diverges from
         // what this generation built; zc_loop reads it cheaply each tick and faults so
@@ -169,6 +174,7 @@ impl ZcPipeline {
         let (stop_t, fault_t) = (stop.clone(), fault.clone());
         let hdr_changed_z = hdr_changed.clone();
         let ctl_z = ctl.clone();
+        let idr_t = idr_req.clone();
         // Captured for the poll thread below, before `hmon`/`hdr` move into the encode
         // closure (HMONITOR travels as its raw isize; `hdr` is Copy).
         let (hmon_isize, built_hdr) = (hmon.0, hdr);
@@ -181,6 +187,7 @@ impl ZcPipeline {
                     hdr,
                     &hdr_changed_z,
                     &stop_t,
+                    &idr_t,
                     &ctl_z,
                     init_tx.clone(),
                     au_tx,
@@ -239,10 +246,18 @@ impl ZcPipeline {
             hdr,
             au_rx: Some(au_rx),
             stop,
+            idr_req,
             fault,
             thread: Some(thread),
             poll_thread,
         })
+    }
+
+    /// Ask the encode loop to make the next picture an IDR (on-demand keyframe,
+    /// e.g. a client resyncing after a decode-chain rebuild — issue #32). The
+    /// loop coalesces requests within its min-IDR interval.
+    pub fn request_idr(&self) {
+        self.idr_req.store(true, Ordering::Relaxed);
     }
 
     /// Next AU, waiting up to `dur`.
@@ -538,6 +553,9 @@ fn zc_loop(
     // tick below so a mid-session flip faults into a colorimetry respawn.
     hdr_changed: &AtomicBool,
     stop: &AtomicBool,
+    // One-shot on-demand keyframe request (client `DG_REQUEST_IDR`, issue #32):
+    // swapped false each tick; forces the next picture to an IDR, coalesced.
+    idr_req: &AtomicBool,
     // Adaptive-bitrate cell (issue #30): read `target_kbps` each tick and reconfigure
     // the live NVENC session in place; publish `ceiling_kbps` at build (in the config
     // block above).
@@ -710,6 +728,18 @@ fn zc_loop(
     // Adaptive bitrate (issue #30): the CBR value NVENC is currently configured for;
     // reconfigured in place below when the control loop moves `ctl.target_kbps`.
     let mut applied_kbps = kbps;
+    // On-demand IDR coalescing, mirroring the Linux host (multi.rs): honour a
+    // client `DG_REQUEST_IDR` by forcing the next picture to an IDR, but drop
+    // requests landing within the min interval of the last keyframe (periodic
+    // or forced) — a fresh IDR already gave a clean reference, and this caps
+    // the IDR-byte cost under sustained loss. Same env lever as Linux.
+    let min_idr_interval = Duration::from_millis(
+        std::env::var("PHAROS_MIN_IDR_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(150),
+    );
+    let mut last_idr_at: Option<Instant> = None;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -785,12 +815,28 @@ fn zc_loop(
         }
 
         // HDR10 static metadata rides every IDR; the GOP is aligned by forcing
-        // the IDR at each period boundary, which also matches idrPeriod.
-        let params = if hdr && frame_no.is_multiple_of(u64::from(idr_period_frames(fps))) {
+        // the IDR at each period boundary, which also matches idrPeriod. An
+        // on-demand request (client resync, issue #32) forces one off-period,
+        // rate-limited; the swap always consumes the request (coalesce, don't
+        // queue). HDR attaches the SEI to forced IDRs too, so a mid-GOP joiner
+        // still gets the mastering/CLL metadata.
+        let periodic = frame_no.is_multiple_of(u64::from(idr_period_frames(fps)));
+        let forced = idr_req.swap(false, Ordering::Relaxed)
+            && !periodic
+            && last_idr_at.is_none_or(|t| t.elapsed() >= min_idr_interval);
+        let params = if hdr && (periodic || forced) {
             sei_idr_params(&sei)
+        } else if forced {
+            EncodePictureParams {
+                force_idr: true,
+                ..Default::default()
+            }
         } else {
             EncodePictureParams::default()
         };
+        if periodic || forced {
+            last_idr_at = Some(Instant::now());
+        }
 
         let ob = &mut outputs[(frame_no as usize) % num_bufs];
         let enc0 = Instant::now();
