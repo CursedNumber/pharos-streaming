@@ -194,6 +194,37 @@ fn transport_config() -> Result<Arc<quinn::TransportConfig>> {
     // is known. `PHAROS_STREAM_WINDOW_KB` remains as a pin: when set, all three
     // windows take that fixed value and the runtime adaptation stays off
     // (compat with the documented SBC tuning recipes).
+    // Congestion controller. quinn's default (Cubic) is LOSS-BASED: it halves
+    // its window on packet loss, which reads stochastic WiFi loss as
+    // congestion — at the 2-4% bursty loss a contended WiFi hop shows under
+    // load, Cubic's sustainable rate collapses to ~1-2 Mbps regardless of real
+    // capacity, which is BELOW the 4K60 video floor → the send queue overflows
+    // at any encoder target (seen live 2026-07-08). BBR is rate-based (models
+    // delivery rate + min-RTT instead of reacting to individual losses) and is
+    // the right controller for real-time video on lossy links, so per the
+    // project's WiFi-first principle it is the DEFAULT; `PHAROS_CC` reverts
+    // (`cubic` | `newreno`) for A/B or if BBR misbehaves on some path.
+    match std::env::var("PHAROS_CC")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("cubic") => {
+            t.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
+            tracing::info!("QUIC congestion control: Cubic (PHAROS_CC)");
+        }
+        Some("newreno") => {
+            t.congestion_controller_factory(Arc::new(quinn::congestion::NewRenoConfig::default()));
+            tracing::info!("QUIC congestion control: NewReno (PHAROS_CC)");
+        }
+        _ => {
+            t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+            tracing::info!(
+                "QUIC congestion control: BBR (rate-based, loss-tolerant; \
+                 PHAROS_CC=cubic reverts)"
+            );
+        }
+    }
     match stream_window_pin() {
         Some(win_kb) => {
             let win_bytes = win_kb.saturating_mul(1024);
@@ -3231,6 +3262,12 @@ async fn serve_stream(
         let mut health_tick = tokio::time::interval(std::time::Duration::from_millis(500));
         health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_drops = drops.load(Ordering::Relaxed);
+        // QUIC path telemetry (every 4th health beat ≈ 2s): cwnd/rtt/loss straight
+        // from quinn — THE readout separating "the path is fine" from "the
+        // congestion controller collapsed on stochastic WiFi loss" (a cwnd parked
+        // in the tens of KB with congestion events climbing is the collapse).
+        let mut stats_beat = 0u32;
+        let (mut stats_last_lost, mut stats_last_cong) = (0u64, 0u64);
 
         let end_reason: LoopEnd;
         'stream: loop {
@@ -3287,6 +3324,19 @@ async fn serve_stream(
                     let degraded = now > last_drops;
                     last_drops = now;
                     let _ = conn.send_datagram(tagged_datagram(DG_LINK_HEALTH, &[degraded as u8]));
+                    stats_beat = stats_beat.wrapping_add(1);
+                    if stats_beat.is_multiple_of(4) {
+                        let s = conn.stats();
+                        let (lost, cong) = (s.path.lost_packets, s.path.congestion_events);
+                        tracing::info!(
+                            "quic path: cwnd={}KB rtt={}ms lost=+{} congestion=+{}",
+                            s.path.cwnd / 1024,
+                            s.path.rtt.as_millis(),
+                            lost.saturating_sub(stats_last_lost),
+                            cong.saturating_sub(stats_last_cong),
+                        );
+                        (stats_last_lost, stats_last_cong) = (lost, cong);
+                    }
                 }
                 next = rx.recv() => {
                     let Some(chunk) = next else {
