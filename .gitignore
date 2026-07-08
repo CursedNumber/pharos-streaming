@@ -24,6 +24,9 @@
 *.iml
 .DS_Store
 
+# Local host-test scratch (logs, captured .hevc, probes) — never source
+/scratchpad/
+
 # Personal rig artifacts — kept out of the public tree (belt-and-suspenders so
 # `git add -A` can't resurrect them). Tracked icons/scripts/WORKAROUNDS remain.
 /launcher_simulation
