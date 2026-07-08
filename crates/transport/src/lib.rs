@@ -271,11 +271,14 @@ const WINDOW_CAP_BYTES: u32 = 8 * 1024 * 1024;
 /// Connection receive window before the first rate measurement lands: ~250ms
 /// at the 60 Mbps encode ceiling, so a full-rate stream starts unthrottled.
 const WINDOW_START_BYTES: u32 = 2 * 1024 * 1024;
-/// Lower clamp for the adaptive window (an idle stream decays to this).
-/// Comfortably above any LAN/WAN bandwidth-delay product this project meets
-/// (60 Mbps at 40ms RTT ≈ 300KB), so a sudden idle→busy burst is never
-/// throughput-throttled during the ≤1s until the next resize.
-const WINDOW_FLOOR_BYTES: u32 = 512 * 1024;
+/// Lower clamp for the adaptive window (an idle or heavily-braked stream
+/// decays to this). This is a LATENCY floor, so it must stay SMALL: the
+/// window is a byte budget, and at a braked 2 Mbps a 512KB floor is TWO
+/// SECONDS of standing buffer — measured live 2026-07-09 as ~5s of pointer
+/// lag while the picture flowed at 52fps (every frame seconds stale). 64KB
+/// is ~250ms at 2 Mbps, and it cannot throughput-throttle a burst for more
+/// than the ≤1s until the next resize (64KB per ~10ms LAN RTT ≈ 50 Mbps).
+const WINDOW_FLOOR_BYTES: u32 = 64 * 1024;
 
 /// The adaptive receive-window target for a measured video byte rate: ~250ms
 /// of buffer at that rate, clamped to [floor, cap]. Pure for unit tests.
@@ -5274,12 +5277,17 @@ mod tests {
         // Idle / tiny rates clamp to the floor.
         assert_eq!(adaptive_window_target(0.0), WINDOW_FLOOR_BYTES);
         assert_eq!(adaptive_window_target(100_000.0), WINDOW_FLOOR_BYTES);
+        // A braked 2 Mbps stream (250 KB/s) sits just at/above the floor — the
+        // live regression: a 512KB floor here was 2s of standing buffer (~5s
+        // pointer lag measured); the floor must track the ~250ms budget.
+        assert_eq!(adaptive_window_target(250_000.0), WINDOW_FLOOR_BYTES);
+        assert!(u64::from(WINDOW_FLOOR_BYTES) * 4 <= 1_000_000); // ≤ ~1s at 2 Mbps
+                                                                 // 10 Mbps couch stream = 1.25 MB/s → ~312KB of 250ms budget.
+        assert_eq!(adaptive_window_target(1_250_000.0), 1_250_000 / 4);
         // 60 Mbps (the hosts' encode ceiling) = 7.5 MB/s → ~1.9MB of 250ms budget.
         let at_ceiling = adaptive_window_target(7_500_000.0);
         assert_eq!(at_ceiling, 7_500_000 / 4);
         assert!(at_ceiling > WINDOW_FLOOR_BYTES && at_ceiling < WINDOW_CAP_BYTES);
-        // 10 Mbps couch stream = 1.25 MB/s → floor-clamped (512KB > 312KB).
-        assert_eq!(adaptive_window_target(1_250_000.0), WINDOW_FLOOR_BYTES);
         // Absurd rates clamp to the memory cap.
         assert_eq!(adaptive_window_target(1e9), WINDOW_CAP_BYTES);
     }

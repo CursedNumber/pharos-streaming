@@ -1220,10 +1220,25 @@ fn run_stream(
                         // Fold queue drops into the deficit so the brake severity scales
                         // with how much of the window the queue actually shed — a burst
                         // of drops brakes hard even before the client's QoS reflects it.
+                        // "Heavy" = ≥2% of the window's frames; a stray single-frame
+                        // shed on bursty air shouldn't zero the clean counter.
                         let drop_deficit = 1.0 - (q_drops as f32 / sent_frames as f32).min(1.0);
                         let deficit = qos_deficit.min(drop_deficit);
-                        let congested =
-                            q_drops > 0 || deficit < 0.85 || loss >= LOSSY_PERMILLE || bloat;
+                        let heavy_shed = q_drops.saturating_mul(50) >= sent_frames;
+                        // At the floor the rtt-bloat signal is SELF-REFERENTIAL: the
+                        // client's ~250ms-of-rate receive window keeps that many bytes
+                        // in flight, which at a floor-braked rate reads as hundreds of
+                        // ms of "bloat" that braking cannot reduce (it IS our own
+                        // window) — measured live 2026-07-09 as the controller parked
+                        // at 2000 kbps on air that idled at 2ms between bursts. Floor
+                        // recovery is therefore gated on hard evidence only (sheds /
+                        // loss); above the floor the full signal set applies.
+                        let at_floor = allowed <= floor;
+                        let congested = if at_floor {
+                            heavy_shed || loss >= LOSSY_PERMILLE
+                        } else {
+                            heavy_shed || deficit < 0.85 || loss >= LOSSY_PERMILLE || bloat
+                        };
                         clear_ticks = if congested { 0 } else { clear_ticks.saturating_add(1) };
                         // Additive probe step above the brake: ~4% of the ceiling.
                         let probe = (ceiling / 25).max(1000);
