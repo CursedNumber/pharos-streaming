@@ -3075,17 +3075,33 @@ fn spawn_decode(
                 }
                 // Re-derive the frame size if the host (re-)announced geometry that
                 // differs from what we're slicing at — covers the resolution actuator's
-                // live changes and a late/lost connect-time datagram. ffmpeg switches
-                // its raw output at a frame boundary on a real res change, so the next
-                // read realigns; the renderer reallocates textures when Frame.w/h move.
+                // live changes, a late/lost connect-time datagram, and a host
+                // generation respawn at a new display mode. RESPAWN the decode child
+                // rather than resizing `buf` in place: by the time the announce is
+                // seen here, the OLD child has usually already emitted frames at the
+                // new size into its stdout, so this reader's fixed-size `read_exact`
+                // is permanently mid-frame — phase loss no later size fix can heal
+                // (the locked, sheared, green-cast screen seen live 2026-07-08 after
+                // an HDR toggle bounced the display mode). A fresh child = a fresh
+                // pipe = guaranteed frame alignment, and the rebuild arms the key-AU
+                // gate + requests an on-demand IDR, so the new size starts clean in
+                // ~1 RTT. The renderer reallocates textures when Frame.w/h move.
                 if let Some((gw, gh)) = taps_dec.geometry() {
                     if (gw, gh) != (fw, fh) {
                         tracing::info!(
-                            "source[{idx}] geometry → {gw}x{gh} (was {fw}x{fh}); resizing reader"
+                            "source[{idx}] geometry → {gw}x{gh} (was {fw}x{fh}); respawning \
+                             decode chain (phase-safe)"
                         );
+                        let Some((new_ff, new_stdout)) = rebuild(ff.take(), chain) else {
+                            break;
+                        };
+                        ff = Some(new_ff);
+                        stdout = new_stdout;
                         fw = gw;
                         fh = gh;
                         buf = vec![0u8; chain.frame_bytes(fw, fh)];
+                        frames_this_chain = 0;
+                        continue;
                     }
                 }
                 if stdout.read_exact(&mut buf).is_err() {
