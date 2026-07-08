@@ -6584,6 +6584,7 @@ dependencies = [
  "egui",
  "gilrs",
  "hex",
+ "libc",
  "mdns-sd",
  "media-audio",
  "media-decode",

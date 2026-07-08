@@ -61,6 +61,11 @@ vnc = "0.4"
 # feature and only pulled in (with its `ffi` feature) when that's enabled.
 media-spice = { path = "../media-spice", features = ["ffi"], optional = true }
 
+# F_SETPIPE_SZ on the decode ffmpeg's raw-frame pipes: the default 64KB pipe
+# costs ~380 read syscalls per 25MB 4K P010 frame in the reader hot loop.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 # Compile in the native SPICE source (`protocol = "spice"`). Requires the

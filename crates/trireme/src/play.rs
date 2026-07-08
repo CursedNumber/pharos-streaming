@@ -2465,6 +2465,21 @@ fn spawn_decode_ffmpeg(
         .context("spawn ffmpeg (HEVC/AV1 decode)")?;
     let stdin = ff.stdin.take().context("ffmpeg stdin")?;
     let stdout = ff.stdout.take().context("ffmpeg stdout")?;
+    // Fatten the raw-frame pipes (Linux): a 4K P010 frame is ~25MB and the
+    // default 64KB pipe costs ~380 read syscalls per frame in the reader hot
+    // loop — a real slice of the ~52fps reader ceiling that backpressured the
+    // whole HDR path (2026-07-09). 1MB is the unprivileged max
+    // (/proc/sys/fs/pipe-max-size). Best-effort: on failure the default size
+    // still works, just slower.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        for fd in [stdin.as_raw_fd(), stdout.as_raw_fd()] {
+            unsafe {
+                libc::fcntl(fd, libc::F_SETPIPE_SZ, 1024 * 1024);
+            }
+        }
+    }
     Ok((ff, stdin, stdout))
 }
 
@@ -3151,8 +3166,17 @@ fn spawn_decode(
                 if count.is_multiple_of(120) {
                     tracing::info!("source[{idx}] decoded {count} frames");
                 }
+                // Hand the buffer over instead of cloning it. A 4K P010 frame is
+                // ~25MB; at 60fps the old `buf.clone()` was 1.5GB/s of pure memcpy
+                // in the loop that must outrun the decoder — the measured ~52fps
+                // reader ceiling that backpressured ffmpeg → the client's QUIC
+                // reads → the host's flow-control credit → multi-second host
+                // `write_all` stalls (the 2026-07-09 HDR input lag). The
+                // replacement Vec comes from mmap'd zero pages (no memset for
+                // allocations this size), so this removes the copy outright.
+                let data = std::mem::replace(&mut buf, vec![0u8; chain.frame_bytes(fw, fh)]);
                 frames_r.push(Frame {
-                    data: buf.clone(),
+                    data,
                     w: fw,
                     h: fh,
                     hdr: chain == DecodeChain::TonemapGpu,
