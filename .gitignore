@@ -31,6 +31,8 @@
 /rig/*.log
 /rig/*.png
 /rig/*.py
+# ...but the issue-#15 shader-math verification harness is tracked on purpose.
+!/rig/hdr-tonemap-ab.py
 /rig/hdr-traces-*/
 /rig/newui-shots/
 /rig/launch-crimson-wayland.sh

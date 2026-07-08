@@ -299,13 +299,19 @@ pub fn load_config_path(path: &Path) -> Result<PlayerCfg> {
 
 // --- Frame queue ------------------------------------------------------------
 
-/// One decoded NV12 frame plus the resolution it was produced at. Native
-/// sources (VNC/SPICE) can change resolution mid-stream, so each frame carries
-/// its own size and the GPU resizes its textures to match.
+/// One decoded NV12 (or, for the GPU-tonemap HDR path, P010) frame plus the
+/// resolution it was produced at. Native sources (VNC/SPICE) can change
+/// resolution mid-stream, so each frame carries its own size and the GPU
+/// resizes its textures to match.
 struct Frame {
     data: Vec<u8>,
     w: u32,
     h: u32,
+    /// `true` = 10-bit P010 BT.2020/PQ from a [`DecodeChain::TonemapGpu`] chain
+    /// (16-bit samples, tonemapped in the fragment shader); `false` = 8-bit
+    /// BT.709 NV12. The GPU re-creates a source's plane textures when this
+    /// flips, exactly as it does on a resolution change.
+    hdr: bool,
     /// Instant this decoded frame became available (pushed onto the queue). The
     /// render path reads `produced.elapsed()` when the frame is actually
     /// presented to feed the live latency benchmark's present stage. Cheap to
@@ -341,21 +347,26 @@ impl FrameQueue {
 
 // --- GPU --------------------------------------------------------------------
 
-/// Per-source GPU state — Y (R8, full-res) + CbCr (Rg8, half-res) NV12 planes
-/// and a bind group, sampled + color-converted by the shared pipeline. The
-/// planes are re-created when a source changes resolution (see `Gpu::upload`).
+/// Per-source GPU state — Y (full-res) + CbCr (half-res) planes and a bind
+/// group, sampled + color-converted by the shared pipeline. SDR sources are
+/// 8-bit NV12 (R8 + Rg8); HDR sources on the GPU-tonemap path are 16-bit P010
+/// (R16 + Rg16, sampled by the HDR pipeline instead). The planes are re-created
+/// when a source changes resolution OR colorimetry (see `Gpu::upload`).
 struct SourceGpu {
     width: u32,
     height: u32,
+    /// Whether the planes are 16-bit P010 (HDR) or 8-bit NV12 (SDR).
+    hdr: bool,
     y_texture: wgpu::Texture,
     uv_texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
 }
 
 impl SourceGpu {
-    /// Allocate the NV12 plane textures (+ bind group) for a `w × h` source and
-    /// seed them with neutral black (Y=16, Cb=Cr=128) so the cell is black, not
-    /// green, until the first frame arrives. `w`/`h` are forced even (NV12).
+    /// Allocate the plane textures (+ bind group) for a `w × h` source and seed
+    /// them with neutral black (limited-range black Y, centered chroma) so the
+    /// cell is black, not green, until the first frame arrives. `w`/`h` are
+    /// forced even (4:2:0 subsampling).
     fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -363,8 +374,17 @@ impl SourceGpu {
         sampler: &wgpu::Sampler,
         w: u32,
         h: u32,
+        hdr: bool,
     ) -> SourceGpu {
         let (w, h) = (w.max(2) & !1, h.max(2) & !1);
+        let (y_fmt, uv_fmt) = if hdr {
+            (
+                wgpu::TextureFormat::R16Unorm,
+                wgpu::TextureFormat::Rg16Unorm,
+            )
+        } else {
+            (wgpu::TextureFormat::R8Unorm, wgpu::TextureFormat::Rg8Unorm)
+        };
         let tex = |label, fw, fh, fmt| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -381,9 +401,18 @@ impl SourceGpu {
                 view_formats: &[],
             })
         };
-        let y_texture = tex("source-y", w, h, wgpu::TextureFormat::R8Unorm);
-        let uv_texture = tex("source-uv", w / 2, h / 2, wgpu::TextureFormat::Rg8Unorm);
-        let write = |t: &wgpu::Texture, fill: u8, fw: u32, fh: u32, bpr: u32| {
+        let y_texture = tex("source-y", w, h, y_fmt);
+        let uv_texture = tex("source-uv", w / 2, h / 2, uv_fmt);
+        // Per-texel seed patterns. SDR NV12: Y=16, Cb=Cr=128. HDR P010 stores
+        // 10-bit codes left-justified in 16 bits (LE), so black Y = 64<<6 =
+        // 0x1000 and centered chroma = 512<<6 = 0x8000.
+        let (y_texel, uv_texel): (&[u8], &[u8]) = if hdr {
+            (&[0x00, 0x10], &[0x00, 0x80, 0x00, 0x80])
+        } else {
+            (&[16], &[128, 128])
+        };
+        let write = |t: &wgpu::Texture, texel: &[u8], fw: u32, fh: u32| {
+            let bpr = fw * texel.len() as u32;
             queue.write_texture(
                 wgpu::ImageCopyTexture {
                     texture: t,
@@ -391,7 +420,7 @@ impl SourceGpu {
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                &vec![fill; (bpr * fh) as usize],
+                &texel.repeat((fw * fh) as usize),
                 wgpu::ImageDataLayout {
                     offset: 0,
                     bytes_per_row: Some(bpr),
@@ -404,8 +433,8 @@ impl SourceGpu {
                 },
             );
         };
-        write(&y_texture, 16, w, h, w);
-        write(&uv_texture, 128, w / 2, h / 2, w);
+        write(&y_texture, y_texel, w, h);
+        write(&uv_texture, uv_texel, w / 2, h / 2);
         let y_view = y_texture.create_view(&Default::default());
         let uv_view = uv_texture.create_view(&Default::default());
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -429,10 +458,38 @@ impl SourceGpu {
         SourceGpu {
             width: w,
             height: h,
+            hdr,
             y_texture,
             uv_texture,
             bind_group,
         }
+    }
+}
+
+/// Whether the GPU present path can tonemap HDR itself (16-bit P010 plane
+/// textures + the PQ/hable fragment shader). Set once by [`Gpu::new`] from the
+/// device's actual `TEXTURE_FORMAT_16BIT_NORM` support — which `resumed()`
+/// runs BEFORE any decode pipeline spawns, so the decode chain choice always
+/// sees the real capability. Unset (pre-GPU) reads as `false`, i.e. the safe
+/// CPU-zscale fallback.
+static GPU_TONEMAP_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// `TRIREME_GPU_TONEMAP=0` forces the CPU zscale tonemap even on a capable GPU
+/// — the escape hatch if the shader's color math ever disagrees with the
+/// reference zscale output on some driver.
+fn gpu_tonemap_env_off() -> bool {
+    std::env::var("TRIREME_GPU_TONEMAP").is_ok_and(|v| v == "0")
+}
+
+/// Which tonemap chain an HDR-confirmed stream should get on this machine:
+/// GPU (P010 passthrough, shader tonemap) when the device supports 16-bit
+/// normalized textures, else the CPU zscale chain (the GLES/ARM path — R16
+/// sampled textures aren't guaranteed on Panfrost/V3D).
+fn tonemap_chain() -> DecodeChain {
+    if !gpu_tonemap_env_off() && *GPU_TONEMAP_OK.get().unwrap_or(&false) {
+        DecodeChain::TonemapGpu
+    } else {
+        DecodeChain::TonemapCpu
     }
 }
 
@@ -442,6 +499,11 @@ struct Gpu {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
+    /// HDR variant of `pipeline`: samples 16-bit P010 planes and runs the
+    /// BT.2020/PQ → hable → BT.709 tonemap in the fragment shader (issue #15).
+    /// `None` when the device lacks `TEXTURE_FORMAT_16BIT_NORM` (GLES/ARM) —
+    /// those clients keep the CPU zscale chain and never produce HDR frames.
+    hdr_pipeline: Option<wgpu::RenderPipeline>,
     sources: Vec<SourceGpu>,
     /// Kept so `upload` can re-create a source's plane textures when it changes
     /// resolution (a native VNC/SPICE guest switching video mode).
@@ -536,11 +598,35 @@ impl Gpu {
             .await
             .context("no suitable GPU adapter")?;
         tracing::info!("wgpu adapter: {}", adapter.get_info().name);
+        // 16-bit normalized textures carry the P010 planes of the GPU HDR
+        // tonemap (issue #15). Optional in wgpu — request only when the adapter
+        // has it, and record the outcome so the decode chain knows whether an
+        // HDR stream can skip the CPU zscale tonemap. Desktop Vulkan/DX12 all
+        // have it; GLES (ARM SBCs) generally doesn't and keeps the CPU path.
+        let hdr_capable = !gpu_tonemap_env_off()
+            && adapter
+                .features()
+                .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
+        let _ = GPU_TONEMAP_OK.set(hdr_capable);
+        tracing::info!(
+            "GPU HDR tonemap: {}",
+            if hdr_capable {
+                "available (16-bit textures)"
+            } else if gpu_tonemap_env_off() {
+                "disabled by TRIREME_GPU_TONEMAP=0 (CPU zscale fallback)"
+            } else {
+                "unavailable on this device (CPU zscale fallback)"
+            }
+        );
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("trireme"),
-                    required_features: wgpu::Features::empty(),
+                    required_features: if hdr_capable {
+                        wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+                    } else {
+                        wgpu::Features::empty()
+                    },
                     required_limits: wgpu::Limits::default(),
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
@@ -643,9 +729,42 @@ impl Gpu {
             cache: None,
         });
 
+        // HDR pipeline: same fullscreen blit over the same bind group layout
+        // (16-bit plane views still sample as filterable float), but the
+        // fragment shader does the whole HDR10→SDR tonemap (issue #15). The
+        // hable normalization peak is baked into the shader source at startup.
+        let hdr_pipeline = hdr_capable.then(|| {
+            let src = HDR_SHADER.replace("{PEAK}", &format!("{:?}", hdr_tonemap_peak()));
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("blit-hdr"),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("blit-hdr"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(format.into())],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            })
+        });
+
         let source_gpus = sources
             .iter()
-            .map(|s| SourceGpu::new(&device, &queue, &bgl, &sampler, s.width, s.height))
+            .map(|s| SourceGpu::new(&device, &queue, &bgl, &sampler, s.width, s.height, false))
             .collect();
 
         // --- active-cell glow overlay ---------------------------------------
@@ -717,6 +836,7 @@ impl Gpu {
             queue,
             config,
             pipeline,
+            hdr_pipeline,
             sources: source_gpus,
             sampler,
             bgl,
@@ -726,14 +846,29 @@ impl Gpu {
         })
     }
 
-    /// Upload one NV12 frame: the Y plane (`w*h` bytes) to the R8 texture and
-    /// the interleaved CbCr plane (`w*h/2` bytes, half-res) to the Rg8 texture.
-    /// If the frame's resolution differs from the current textures (a native
-    /// source changed video mode), the planes are re-created at the new size
-    /// first. The YUV→RGB conversion happens later in the fragment shader.
+    /// Upload one decoded frame: the Y plane to the full-res texture and the
+    /// interleaved CbCr plane to the half-res texture (NV12 = 1 byte/sample,
+    /// P010 = 2 bytes/sample). If the frame's resolution OR colorimetry differs
+    /// from the current textures (a native source changed video mode, or the
+    /// decode chain flipped SDR↔HDR), the planes are re-created first. The
+    /// YUV→RGB conversion happens later in the fragment shader.
     fn upload(&mut self, idx: usize, frame: &Frame) {
-        if self.sources[idx].width != frame.w || self.sources[idx].height != frame.h {
-            tracing::info!("source[{idx}] gpu textures → {}x{}", frame.w, frame.h);
+        if frame.hdr && self.hdr_pipeline.is_none() {
+            // Can't happen while the decode chain respects `tonemap_chain()`,
+            // but never feed P010 bytes to a device without 16-bit textures.
+            tracing::warn!("source[{idx}] dropped an HDR frame (no GPU tonemap support)");
+            return;
+        }
+        if self.sources[idx].width != frame.w
+            || self.sources[idx].height != frame.h
+            || self.sources[idx].hdr != frame.hdr
+        {
+            tracing::info!(
+                "source[{idx}] gpu textures → {}x{} ({})",
+                frame.w,
+                frame.h,
+                if frame.hdr { "P010" } else { "NV12" }
+            );
             self.sources[idx] = SourceGpu::new(
                 &self.device,
                 &self.queue,
@@ -741,11 +876,13 @@ impl Gpu {
                 &self.sampler,
                 frame.w,
                 frame.h,
+                frame.hdr,
             );
         }
         let s = &self.sources[idx];
+        let bps = if s.hdr { 2 } else { 1 };
         let frame = &frame.data;
-        let y_size = (s.width * s.height) as usize;
+        let y_size = (s.width * s.height) as usize * bps;
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &s.y_texture,
@@ -756,7 +893,7 @@ impl Gpu {
             &frame[..y_size.min(frame.len())],
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(s.width),
+                bytes_per_row: Some(s.width * bps as u32),
                 rows_per_image: Some(s.height),
             },
             wgpu::Extent3d {
@@ -775,8 +912,8 @@ impl Gpu {
             &frame[y_size.min(frame.len())..],
             wgpu::ImageDataLayout {
                 offset: 0,
-                // (w/2) CbCr texels × 2 bytes = w bytes per row.
-                bytes_per_row: Some(s.width),
+                // (w/2) CbCr texels × 2 channels × bps = w*bps bytes per row.
+                bytes_per_row: Some(s.width * bps as u32),
                 rows_per_image: Some(s.height / 2),
             },
             wgpu::Extent3d {
@@ -832,10 +969,17 @@ impl Gpu {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            rp.set_pipeline(&self.pipeline);
             for cell in cells {
+                // Per-cell pipeline: HDR sources (P010 planes) tonemap in the
+                // shader; SDR sources take the plain BT.709 blit. Mixed grids
+                // just switch pipelines between draws.
+                let src = &self.sources[cell.source];
+                match (src.hdr, &self.hdr_pipeline) {
+                    (true, Some(hdr)) => rp.set_pipeline(hdr),
+                    _ => rp.set_pipeline(&self.pipeline),
+                }
                 rp.set_viewport(cell.x, cell.y, cell.w, cell.h, 0.0, 1.0);
-                rp.set_bind_group(0, &self.sources[cell.source].bind_group, &[]);
+                rp.set_bind_group(0, &src.bind_group, &[]);
                 rp.draw(0..3, 0..1);
             }
             // Highlight overlay: clip a fullscreen triangle to the active cell
@@ -894,6 +1038,139 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // round-trip is a net no-op and the gamma-encoded video reaches the
     // framebuffer unchanged — matching the previous swscale-RGBA look.
     return vec4(srgb_to_linear(rgb), 1.0);
+}
+"#;
+
+/// The hable normalization peak baked into the HDR shader: the tonemap divides
+/// by `hable(PEAK)` so this is the signal level that maps to full white.
+///
+/// The default 10.0 reproduces the CPU chain's look: ffmpeg's `tonemap=hable`
+/// reads the peak from the stream's mastering metadata as
+/// `max_luminance / REFERENCE_WHITE` = 1000 / 100 = 10.0 (both Pharos hosts
+/// attach 1000-nit MDCV SEI), and applies it to a signal that zscale's
+/// `npl=203` normalized to SDR-white=1.0 — a unit mismatch, but it IS the look
+/// the tonemap has always had, so we replicate it rather than "fix" it.
+/// `TRIREME_HDR_PEAK` overrides for A/B tuning (lower = brighter midtones).
+fn hdr_tonemap_peak() -> f32 {
+    std::env::var("TRIREME_HDR_PEAK")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|p| p.is_finite() && *p > 0.0)
+        .unwrap_or(10.0)
+}
+
+/// GPU HDR→SDR tonemap (issue #15): the fragment-shader port of the CPU chain
+/// `zscale=t=linear:npl=203,tonemap=hable,zscale=p=bt709:t=bt709:m=bt709:r=tv`,
+/// fed 10-bit P010 planes straight from the decoder instead of CPU-tonemapped
+/// NV12 — the zimg path topped out at ~19 fps at 4K where the decoder itself
+/// was fine, so the whole transform moves onto the GPU. Stages, in the CPU
+/// chain's exact order:
+///   1. P010 → 10-bit codes (samples are left-justified in 16 bits).
+///   2. Limited-range BT.2020-NCL YCbCr → non-linear R'G'B'.
+///   3. PQ EOTF (ST-2084; constants match the host encoder's inverse in
+///      `compositor/src/multi.rs` / `pharos-win/src/zerocopy.rs`), normalized
+///      to SDR white = 203 nits (zscale's `npl=203`).
+///   4. hable tonemap with ffmpeg's default desaturation (desat=2.0), still in
+///      linear BT.2020, exactly where `tonemap=hable` runs. NOTE the desat
+///      "luma" is r+g+b with UNITY coefficients: zscale hands vf_tonemap an
+///      RGB-colorspace frame, so ffmpeg's `av_csp_luma_coeffs_from_avcsp`
+///      yields unity weights and every pixel with r+g+b > 2 desaturates toward
+///      gray. A quirk, but it IS the shipped look — verified pixel-exact
+///      against the reference chain (worst 2.33/255 over a 40-patch sweep on
+///      ffmpeg n8.1.2), so we replicate it deliberately.
+///   5. BT.2020 → BT.709 linear gamut map (the exact inverse of the host's
+///      BT709_TO_BT2020 matrix).
+///   6. Inverse BT.1886 encode (pure gamma 1/2.4 — zimg's display-referred
+///      `t=bt709`, NOT the scene OETF; also verified against the reference),
+///      then the same sRGB-decode-before-sRGB-store no-op as the SDR shader so
+///      the encoded video reaches the framebuffer as-is.
+///
+/// `{PEAK}` is replaced with [`hdr_tonemap_peak`] at pipeline creation.
+const HDR_SHADER: &str = r#"
+@group(0) @binding(0) var y_tex: texture_2d<f32>;
+@group(0) @binding(1) var uv_tex: texture_2d<f32>;
+@group(0) @binding(2) var samp: sampler;
+
+struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
+    var p = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+    var out: VsOut;
+    let xy = p[i];
+    out.pos = vec4(xy, 0.0, 1.0);
+    out.uv = vec2((xy.x + 1.0) * 0.5, (1.0 - xy.y) * 0.5);
+    return out;
+}
+
+const PQ_M1: f32 = 0.1593017578125;
+const PQ_M2: f32 = 78.84375;
+const PQ_C1: f32 = 0.8359375;
+const PQ_C2: f32 = 18.8515625;
+const PQ_C3: f32 = 18.6875;
+
+// PQ EOTF (ST-2084): non-linear signal → nits. The inverse of the host
+// encoder's nits_to_pq.
+fn pq_to_nits(e: vec3<f32>) -> vec3<f32> {
+    let em = pow(max(e, vec3(0.0)), vec3(1.0 / PQ_M2));
+    let num = max(em - vec3(PQ_C1), vec3(0.0));
+    let den = max(vec3(PQ_C2) - PQ_C3 * em, vec3(1e-6));
+    return 10000.0 * pow(num / den, vec3(1.0 / PQ_M1));
+}
+
+// Uncharted-2 hable curve, ffmpeg vf_tonemap's constants.
+fn hable(x: f32) -> f32 {
+    return (x * (x * 0.15 + 0.05) + 0.004) / (x * (x * 0.15 + 0.5) + 0.06) - 1.0 / 15.0;
+}
+
+// BT.2020 → BT.709 linear RGB: the exact inverse of the host's
+// BT709_TO_BT2020 (multi.rs / zerocopy.rs), column-major.
+const BT2020_TO_BT709: mat3x3<f32> = mat3x3<f32>(
+    vec3(1.660491002, -0.124550474, -0.018150764),
+    vec3(-0.587641138, 1.132899897, -0.100578898),
+    vec3(-0.072849864, -0.008349423, 1.118729662),
+);
+
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let lo = c / 12.92;
+    let hi = pow((c + 0.055) / 1.055, vec3(2.4));
+    return select(lo, hi, c > vec3(0.04045));
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    // P010: 10-bit codes left-justified in 16-bit words, so an R16Unorm sample
+    // is code*64/65535; rescale to code/1023.
+    let scale = 65535.0 / 65472.0;
+    let yv = textureSample(y_tex, samp, in.uv).r * scale;
+    let cv = textureSample(uv_tex, samp, in.uv).rg * scale;
+    // 10-bit limited range: Y 64..940, chroma 64..960 centered on 512.
+    let y  = (yv * 1023.0 - 64.0) / 876.0;
+    let cb = (cv.x * 1023.0 - 512.0) / 896.0;
+    let cr = (cv.y * 1023.0 - 512.0) / 896.0;
+    // BT.2020 non-constant-luminance YCbCr → R'G'B' (Kr=0.2627, Kb=0.0593).
+    let rgb_pq = clamp(vec3(
+        y + 1.4746 * cr,
+        y - 0.16455313 * cb - 0.57135313 * cr,
+        y + 1.8814 * cb,
+    ), vec3(0.0), vec3(1.0));
+    // PQ → linear light, normalized so SDR white (203 nits) = 1.0 (npl=203).
+    var lin = pq_to_nits(rgb_pq) / 203.0;
+    // hable tonemap in linear BT.2020, matching ffmpeg vf_tonemap: desaturate
+    // overbrights toward "luma" (desat=2.0 default) — with UNITY coefficients,
+    // the CPU chain's csp=gbr quirk (see the Rust doc comment above) — then
+    // scale by the max component through the curve, normalized to the peak.
+    let luma = lin.r + lin.g + lin.b;
+    let overbright = max(luma - 2.0, 1e-6) / max(luma, 1e-6);
+    lin = mix(lin, vec3(luma), overbright);
+    let sig = max(max(lin.r, lin.g), max(lin.b, 1e-6));
+    lin = lin * (hable(sig) / hable({PEAK}) / sig);
+    // Gamut map to BT.709, then encode like the CPU chain's final zscale:
+    // inverse BT.1886 (display-referred pure gamma 1/2.4).
+    let lin709 = clamp(BT2020_TO_BT709 * lin, vec3(0.0), vec3(1.0));
+    let enc = pow(lin709, vec3(1.0 / 2.4));
+    // Same sRGB-store no-op dance as the SDR shader.
+    return vec4(srgb_to_linear(enc), 1.0);
 }
 "#;
 
@@ -1971,7 +2248,49 @@ type SpawnedSource = (Option<InputSender>, Option<Arc<transport::LatencyTaps>>);
 const HDR_TONEMAP_VF: &str =
     "zscale=t=linear:npl=203,tonemap=hable,zscale=p=bt709:t=bt709:m=bt709:r=tv,format=nv12";
 
-/// Decide whether the decode ffmpeg should insert the HDR→SDR tonemap `-vf`.
+/// The decode ffmpeg's output arrangement — what happens to an HDR stream
+/// between the decoder and the renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodeChain {
+    /// Plain 8-bit NV12 decode, no tonemap. The only chain an SDR stream may
+    /// carry (issue #16).
+    Plain,
+    /// CPU HDR→SDR tonemap: the zscale/zimg `-vf` chain, NV12 out. Correct but
+    /// slow — tops out ~19 fps at 4K10 (issue #15) — so it is only the
+    /// fallback for devices without 16-bit GPU textures (GLES/ARM).
+    TonemapCpu,
+    /// GPU tonemap: decode straight to 10-bit P010 and let the renderer's HDR
+    /// fragment shader do PQ→hable→BT.709 (issue #15). No CPU filtering at
+    /// all, so the decoder's full rate reaches the screen.
+    TonemapGpu,
+}
+
+impl DecodeChain {
+    /// Bytes per raw sample on ffmpeg's stdout: P010 is 16-bit, NV12 8-bit.
+    fn bytes_per_sample(self) -> usize {
+        match self {
+            DecodeChain::TonemapGpu => 2,
+            _ => 1,
+        }
+    }
+    /// Whether this chain treats the incoming stream as HDR.
+    fn is_tonemap(self) -> bool {
+        self != DecodeChain::Plain
+    }
+    /// Raw frame size on ffmpeg's stdout for a `w × h` 4:2:0 frame.
+    fn frame_bytes(self, w: u32, h: u32) -> usize {
+        (w as usize) * (h as usize) * 3 / 2 * self.bytes_per_sample()
+    }
+    fn label(self) -> &'static str {
+        match self {
+            DecodeChain::Plain => "plain",
+            DecodeChain::TonemapCpu => "tonemap-cpu",
+            DecodeChain::TonemapGpu => "tonemap-gpu",
+        }
+    }
+}
+
+/// Decide whether the decode chain should treat the stream as HDR at all.
 ///
 /// `wants_hdr` is the client's CAPABILITY opt-in (`TRIREME_HDR`): it asks the host
 /// for a 10-bit stream, but does NOT by itself force the tonemap. `announced` is the
@@ -2011,24 +2330,27 @@ fn should_tonemap_hdr(wants_hdr: bool, announced: Option<bool>) -> bool {
 enum ChainAction {
     /// The chain matches the stream; do nothing.
     Keep,
-    /// Restart ffmpeg WITH the HDR→SDR tonemap `-vf`.
-    RebuildToTonemap,
-    /// Restart ffmpeg WITHOUT the tonemap (plain NV12 decode).
-    RebuildToPlain,
+    /// Restart ffmpeg as the given chain.
+    Rebuild(DecodeChain),
 }
 
+/// `tonemap` is which HDR chain THIS machine builds when the stream is
+/// confirmed HDR ([`tonemap_chain`]: GPU when 16-bit textures exist, else the
+/// CPU zscale fallback). Passed in, not read from the global, so the decision
+/// stays pure and unit-testable.
 fn chain_action(
     wants_hdr: bool,
-    chain_tonemap: bool,
+    chain: DecodeChain,
     announced: Option<bool>,
     ffmpeg_alive: bool,
+    tonemap: DecodeChain,
 ) -> ChainAction {
     // A never-opted-in (SDR) client must NEVER carry a tonemap chain — forcing the
     // tonemap onto an SDR stream is the original black-window crash (#16). This is the
     // one case where we rebuild a still-alive chain: back to plain, unconditionally.
     if !wants_hdr {
-        return if chain_tonemap {
-            ChainAction::RebuildToPlain
+        return if chain.is_tonemap() {
+            ChainAction::Rebuild(DecodeChain::Plain)
         } else {
             ChainAction::Keep
         };
@@ -2041,9 +2363,11 @@ fn chain_action(
     //
     // A tonemap chain that DIED without ever confirming HDR is such evidence: the
     // stream was really SDR, zscale had `no path between colorspaces`, and ffmpeg
-    // exited (the request/stream mismatch — BUG 3). Force it back to plain.
-    if !ffmpeg_alive && chain_tonemap && announced != Some(true) {
-        return ChainAction::RebuildToPlain;
+    // exited (the request/stream mismatch — BUG 3). Force it back to plain. (The GPU
+    // chain converts SDR input without dying, so for it this arm is just belt and
+    // braces; the announce arm below is what corrects a wrong P010 guess.)
+    if !ffmpeg_alive && chain.is_tonemap() && announced != Some(true) {
+        return ChainAction::Rebuild(DecodeChain::Plain);
     }
     // With no confirmed announce yet, hold an alive chain as-is (the storm-free
     // branch). Once the announce lands, `should_tonemap_hdr` is the canonical target
@@ -2053,11 +2377,15 @@ fn chain_action(
     let Some(_) = announced else {
         return ChainAction::Keep;
     };
-    let target_tonemap = should_tonemap_hdr(wants_hdr, announced);
-    match (target_tonemap, chain_tonemap) {
-        (true, false) => ChainAction::RebuildToTonemap,
-        (false, true) => ChainAction::RebuildToPlain,
-        _ => ChainAction::Keep,
+    let target = if should_tonemap_hdr(wants_hdr, announced) {
+        tonemap
+    } else {
+        DecodeChain::Plain
+    };
+    if chain != target {
+        ChainAction::Rebuild(target)
+    } else {
+        ChainAction::Keep
     }
 }
 
@@ -2072,12 +2400,13 @@ fn reinsert_stdin(slot_empty: bool) -> bool {
     slot_empty
 }
 
-/// Build the full ffmpeg argument vector for the HEVC/AV1 → NV12 decode, optionally
-/// inserting the HDR→SDR tonemap `-vf` (`tonemap = true`). Factored out of
-/// [`spawn_decode`] so the reader thread can rebuild the child IN PLACE with the
-/// other chain on a mid-session colorimetry flip (issue #16), reusing the exact same
-/// decoder/codec/loglevel setup rather than reconnecting.
-fn decode_ffmpeg_args(tonemap: bool) -> Vec<String> {
+/// Build the full ffmpeg argument vector for the HEVC/AV1 → raw decode as the given
+/// chain: plain NV12, CPU-tonemapped NV12 (the zscale `-vf`), or P010 passthrough
+/// for the GPU tonemap (no filtering — the shader does the color transform).
+/// Factored out of [`spawn_decode`] so the reader thread can rebuild the child IN
+/// PLACE with another chain on a mid-session colorimetry flip (issue #16), reusing
+/// the exact same decoder/codec/loglevel setup rather than reconnecting.
+fn decode_ffmpeg_args(chain: DecodeChain) -> Vec<String> {
     let ff_debug = std::env::var_os("TRIREME_FFMPEG_DEBUG").is_some();
     let lead: &[&str] = if ff_debug {
         &["-hide_banner", "-loglevel", "info", "-stats"]
@@ -2089,31 +2418,28 @@ fn decode_ffmpeg_args(tonemap: bool) -> Vec<String> {
     args.extend(media_decode::input_args_for(codec));
     args.push("-f".into());
     args.push(codec.ffmpeg_format());
-    if tonemap {
-        args.extend(
-            [
-                "-i",
-                "pipe:0",
-                "-vf",
-                HDR_TONEMAP_VF,
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "nv12",
-                "pipe:1",
-            ]
-            .iter()
-            .map(|s| s.to_string()),
-        );
-    } else {
-        args.extend(
-            [
-                "-i", "pipe:0", "-f", "rawvideo", "-pix_fmt", "nv12", "pipe:1",
-            ]
-            .iter()
-            .map(|s| s.to_string()),
-        );
-    }
+    let tail: &[&str] = match chain {
+        DecodeChain::Plain => &[
+            "-i", "pipe:0", "-f", "rawvideo", "-pix_fmt", "nv12", "pipe:1",
+        ],
+        DecodeChain::TonemapCpu => &[
+            "-i",
+            "pipe:0",
+            "-vf",
+            HDR_TONEMAP_VF,
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "nv12",
+            "pipe:1",
+        ],
+        // 10-bit HEVC decodes natively to P010; no `-vf` means no zimg on the
+        // CPU at all — the renderer's HDR shader takes it from here.
+        DecodeChain::TonemapGpu => &[
+            "-i", "pipe:0", "-f", "rawvideo", "-pix_fmt", "p010le", "pipe:1",
+        ],
+    };
+    args.extend(tail.iter().map(|s| s.to_string()));
     args
 }
 
@@ -2123,13 +2449,13 @@ fn decode_ffmpeg_args(tonemap: bool) -> Vec<String> {
 /// nothing here (the caller kills-and-reaps the old child first), it just swaps in a
 /// freshly-spawned child on the SAME QUIC connection.
 fn spawn_decode_ffmpeg(
-    tonemap: bool,
+    chain: DecodeChain,
 ) -> Result<(
     std::process::Child,
     std::process::ChildStdin,
     std::process::ChildStdout,
 )> {
-    let args = decode_ffmpeg_args(tonemap);
+    let args = decode_ffmpeg_args(chain);
     let mut ff = Command::new(ffmpeg_program())
         .args(&args)
         .stdin(Stdio::piped())
@@ -2431,6 +2757,7 @@ fn spawn_rgba_ffmpeg(
                     data: buf.clone(),
                     w: width,
                     h: height,
+                    hdr: false,
                     produced: Instant::now(),
                 });
                 let _ = proxy_r.send_event(UserEvent::FrameReady(idx));
@@ -2521,11 +2848,16 @@ fn spawn_decode(
     let submit_times: Arc<Mutex<VecDeque<Instant>>> = Arc::new(Mutex::new(VecDeque::new()));
 
     // HDR (TRIREME_HDR): the flag is a CAPABILITY opt-in — it asks the host for a
-    // 10-bit HEVC Main10 (BT.2020/PQ) stream (the `wants_hdr` handshake below). The
-    // desktop render path is 8-bit NV12 / BT.709, so a genuinely-HDR stream must be
-    // tonemapped HDR10 → SDR BT.709 in ffmpeg; an SDR stream must NOT (zscale fails
-    // `no path between colorspaces` and blacks the window — issue #16).
+    // 10-bit HEVC Main10 (BT.2020/PQ) stream (the `wants_hdr` handshake below). A
+    // genuinely-HDR stream must be tonemapped HDR10 → SDR BT.709 — on the GPU when
+    // the device can (P010 planes + fragment-shader tonemap, issue #15), else via
+    // ffmpeg's zscale chain; an SDR stream must NOT be (zscale fails `no path
+    // between colorspaces` and blacks the window — issue #16).
     let wants_hdr = std::env::var_os("TRIREME_HDR").is_some();
+    // Which tonemap chain this machine builds when the stream is HDR. Resolved once
+    // per spawn: `resumed()` created the GPU (and set the capability) before any
+    // source spawns, so this is stable for the reader's whole life.
+    let tonemap = tonemap_chain();
 
     // Initial chain from the CLIENT REQUEST, not a host announce (issue #16). The
     // old code waited up to 500ms for `taps.stream_hdr()` HERE, but nothing feeds the
@@ -2537,14 +2869,19 @@ fn spawn_decode(
     // host) then builds the correct chain FIRST → no flip, no storm. If the host
     // actually serves SDR, the reader rebuilds to plain in place (same QUIC
     // connection) the moment ffmpeg dies with 0 frames or the announce says SDR.
-    let initial_tonemap = wants_hdr;
-    if initial_tonemap {
+    let initial_chain = if wants_hdr {
+        tonemap
+    } else {
+        DecodeChain::Plain
+    };
+    if wants_hdr {
         tracing::info!(
-            "source[{idx}] HDR requested; building HDR→SDR tonemap chain (adapts if the \
-             stream is actually SDR)"
+            "source[{idx}] HDR requested; building {} chain (adapts if the stream is \
+             actually SDR)",
+            initial_chain.label()
         );
     }
-    let (ff, stdin0, mut stdout) = spawn_decode_ffmpeg(initial_tonemap)
+    let (ff, stdin0, mut stdout) = spawn_decode_ffmpeg(initial_chain)
         .with_context(|| format!("spawn ffmpeg (source[{idx}] decode)"))?;
     // The stdin the on_frame closure writes each AU to. Wrapped so the reader thread
     // can SWAP it for a freshly-rebuilt child's stdin on a colorimetry flip WITHOUT
@@ -2571,8 +2908,8 @@ fn spawn_decode(
         .spawn(move || {
             // Colorimetry the CURRENTLY RUNNING ffmpeg chain was built for. Starts at
             // the request-based initial choice and moves only when THIS thread rebuilds
-            // the child, so it always reflects the live `-vf`.
-            let mut chain_tonemap = initial_tonemap;
+            // the child, so it always reflects the live arrangement.
+            let mut chain = initial_chain;
             // Size the NV12 reader to the host's TRUE geometry. The host announces
             // it over the wire (DG_STREAM_GEOMETRY → stashed in the taps); wait
             // briefly so the very first read is aligned — the host sends it before
@@ -2580,8 +2917,9 @@ fn spawn_decode(
             // anyway, so this resolves in well under the timeout. Falling back to the
             // configured size only happens for hosts that don't announce geometry.
             // NV12 = full-res Y plane (w*h) + half-res interleaved CbCr (w*h/2) =
-            // w*h*3/2 bytes. Slicing by the WRONG size shears every frame (the green
-            // bug); this is the fix.
+            // w*h*3/2 bytes; P010 is the same layout at 2 bytes/sample (see
+            // `DecodeChain::frame_bytes`). Slicing by the WRONG size shears every
+            // frame (the green bug); this is the fix.
             let (mut fw, mut fh) = {
                 let mut g = taps_dec.geometry();
                 let mut waited_ms = 0u32;
@@ -2597,7 +2935,7 @@ fn spawn_decode(
                     "source[{idx}] host geometry {fw}x{fh} (config assumed {width}x{height})"
                 );
             }
-            let mut buf = vec![0u8; (fw as usize) * (fh as usize) * 3 / 2];
+            let mut buf = vec![0u8; chain.frame_bytes(fw, fh)];
             let mut count: u64 = 0;
             // Frames THIS ffmpeg child has emitted. Reset on every rebuild so a chain
             // that dies without producing anything is recognisable as the
@@ -2628,7 +2966,7 @@ fn spawn_decode(
             // DROPS the guard, after which our lock below succeeds. Merely setting the
             // Option to None can NOT free a child blocked on its STDOUT, so the kill (not
             // an EOF on stdin) is what actually unwedges everything.
-            let rebuild = |old_ff: Option<std::process::Child>, to_tonemap: bool| {
+            let rebuild = |old_ff: Option<std::process::Child>, to_chain: DecodeChain| {
                 // 1. Kill the old child BEFORE any lock acquisition. This unblocks a
                 //    concurrent on_frame `write_all` that is stuck on the old child's full
                 //    stdin pipe (it gets EPIPE and releases the guard), and it lets us reap
@@ -2654,7 +2992,7 @@ fn spawn_decode(
                 //    ChildStdin. A few AUs may fall in the None window; the host's ~1×/s
                 //    IDR re-sync papers over that on the new chain.)
                 *stdin_dec.lock().unwrap() = None;
-                match spawn_decode_ffmpeg(to_tonemap) {
+                match spawn_decode_ffmpeg(to_chain) {
                     Ok((new_ff, new_stdin, new_stdout)) => {
                         // 4. Install the new child's stdin under the lock so the next
                         //    on_frame feeds the fresh chain.
@@ -2691,20 +3029,21 @@ fn spawn_decode(
                 // chain we WANT differs from the one running, rebuild it in place. The
                 // decision is a fixed point (`chain_action` returns Keep once the chain
                 // matches the stream), so this cannot thrash.
-                match chain_action(wants_hdr, chain_tonemap, taps_dec.stream_hdr(), true) {
+                match chain_action(wants_hdr, chain, taps_dec.stream_hdr(), true, tonemap) {
                     ChainAction::Keep => {}
-                    action => {
-                        let to_tonemap = matches!(action, ChainAction::RebuildToTonemap);
+                    ChainAction::Rebuild(to_chain) => {
                         tracing::info!(
-                            "source[{idx}] colorimetry: rebuilding decode chain (tonemap \
-                             {chain_tonemap} → {to_tonemap})"
+                            "source[{idx}] colorimetry: rebuilding decode chain ({} → {})",
+                            chain.label(),
+                            to_chain.label()
                         );
-                        let Some((new_ff, new_stdout)) = rebuild(ff.take(), to_tonemap) else {
+                        let Some((new_ff, new_stdout)) = rebuild(ff.take(), to_chain) else {
                             break;
                         };
                         ff = Some(new_ff);
                         stdout = new_stdout;
-                        chain_tonemap = to_tonemap;
+                        chain = to_chain;
+                        buf = vec![0u8; chain.frame_bytes(fw, fh)];
                         frames_this_chain = 0;
                         continue;
                     }
@@ -2721,7 +3060,7 @@ fn spawn_decode(
                         );
                         fw = gw;
                         fh = gh;
-                        buf = vec![0u8; (fw as usize) * (fh as usize) * 3 / 2];
+                        buf = vec![0u8; chain.frame_bytes(fw, fh)];
                     }
                 }
                 if stdout.read_exact(&mut buf).is_err() {
@@ -2735,22 +3074,22 @@ fn spawn_decode(
                     // Otherwise (a genuine EOF/decoder crash on an already-correct chain)
                     // fall through to the plain break and let the session end normally.
                     let alive = frames_this_chain > 0;
-                    match chain_action(wants_hdr, chain_tonemap, taps_dec.stream_hdr(), alive) {
+                    match chain_action(wants_hdr, chain, taps_dec.stream_hdr(), alive, tonemap) {
                         ChainAction::Keep => break,
-                        action => {
-                            let to_tonemap = matches!(action, ChainAction::RebuildToTonemap);
+                        ChainAction::Rebuild(to_chain) => {
                             tracing::info!(
                                 "source[{idx}] decode ffmpeg exited after {frames_this_chain} \
-                                 frames on a {}-colorimetry chain; rebuilding to tonemap={}",
-                                if chain_tonemap { "tonemap" } else { "plain" },
-                                to_tonemap
+                                 frames on a {}-colorimetry chain; rebuilding to {}",
+                                chain.label(),
+                                to_chain.label()
                             );
-                            let Some((new_ff, new_stdout)) = rebuild(ff.take(), to_tonemap) else {
+                            let Some((new_ff, new_stdout)) = rebuild(ff.take(), to_chain) else {
                                 break;
                             };
                             ff = Some(new_ff);
                             stdout = new_stdout;
-                            chain_tonemap = to_tonemap;
+                            chain = to_chain;
+                            buf = vec![0u8; chain.frame_bytes(fw, fh)];
                             frames_this_chain = 0;
                             continue;
                         }
@@ -2775,6 +3114,7 @@ fn spawn_decode(
                     data: buf.clone(),
                     w: fw,
                     h: fh,
+                    hdr: chain == DecodeChain::TonemapGpu,
                     produced: Instant::now(),
                 });
                 let _ = proxy_r.send_event(UserEvent::FrameReady(idx));
@@ -3051,41 +3391,55 @@ mod tests {
     /// rule the reader uses, and its key property is that it is a FIXED POINT — once
     /// the chain matches the stream it returns `Keep`, so the reader cannot loop
     /// (the old reconnect/preempt storm is structurally impossible here).
+    /// Parameterized over BOTH tonemap kinds (GPU / CPU-fallback, issue #15): the
+    /// safety rules are identical whichever chain does the tonemapping.
     #[test]
     fn chain_action_adapts_without_storming() {
         use ChainAction::*;
-        // HAPPY PATH (the storm case, now fixed): HDR client, tonemap chain built
-        // optimistically from the request, host really is HDR, ffmpeg alive → KEEP.
-        // No rebuild means no reconnect means no preempt means no storm.
-        assert_eq!(chain_action(true, true, Some(true), true), Keep);
+        use DecodeChain::*;
+        for &tm in &[TonemapGpu, TonemapCpu] {
+            // HAPPY PATH (the storm case, now fixed): HDR client, tonemap chain built
+            // optimistically from the request, host really is HDR, ffmpeg alive →
+            // KEEP. No rebuild means no reconnect means no preempt means no storm.
+            assert_eq!(chain_action(true, tm, Some(true), true, tm), Keep);
 
-        // Initial guess was plain (or host flipped SDR→HDR mid-session): HDR client,
-        // plain chain, host announces HDR → rebuild to tonemap, exactly once.
-        assert_eq!(
-            chain_action(true, false, Some(true), true),
-            RebuildToTonemap
-        );
+            // Initial guess was plain (or host flipped SDR→HDR mid-session): HDR
+            // client, plain chain, host announces HDR → rebuild to THIS machine's
+            // tonemap chain, exactly once.
+            assert_eq!(chain_action(true, Plain, Some(true), true, tm), Rebuild(tm));
 
-        // HDR→SDR flip with the announce landed: tonemap chain but host now SDR →
-        // rebuild to plain (whether ffmpeg is still alive or already died).
-        assert_eq!(chain_action(true, true, Some(false), true), RebuildToPlain);
-        assert_eq!(chain_action(true, true, Some(false), false), RebuildToPlain);
+            // HDR→SDR flip with the announce landed: tonemap chain but host now SDR →
+            // rebuild to plain (whether ffmpeg is still alive or already died).
+            assert_eq!(
+                chain_action(true, tm, Some(false), true, tm),
+                Rebuild(Plain)
+            );
+            assert_eq!(
+                chain_action(true, tm, Some(false), false, tm),
+                Rebuild(Plain)
+            );
 
-        // BUG 3 core: request/stream mismatch. HDR client, tonemap chain, the announce
-        // hasn't said anything yet, but ffmpeg DIED with no frames (zscale `no path
-        // between colorspaces`) → treat as SDR and rebuild to plain, no black window.
-        assert_eq!(chain_action(true, true, None, false), RebuildToPlain);
-        // ...but a tonemap chain that is STILL ALIVE with the announce merely unknown
-        // must be kept — we don't tear down a working HDR stream on a missing announce.
-        assert_eq!(chain_action(true, true, None, true), Keep);
+            // BUG 3 core: request/stream mismatch. HDR client, tonemap chain, the
+            // announce hasn't said anything yet, but ffmpeg DIED with no frames
+            // (zscale `no path between colorspaces`) → treat as SDR and rebuild to
+            // plain, no black window.
+            assert_eq!(chain_action(true, tm, None, false, tm), Rebuild(Plain));
+            // ...but a tonemap chain that is STILL ALIVE with the announce merely
+            // unknown must be kept — we don't tear down a working HDR stream on a
+            // missing announce.
+            assert_eq!(chain_action(true, tm, None, true, tm), Keep);
 
-        // SDR client never tonemaps: a plain chain is always kept regardless of what
-        // the (ignored) announce says (preserves the #16 safety win).
-        assert_eq!(chain_action(false, false, Some(true), true), Keep);
-        assert_eq!(chain_action(false, false, None, true), Keep);
-        assert_eq!(chain_action(false, false, Some(false), true), Keep);
-        // And an SDR client that somehow has a tonemap chain rebuilds back to plain.
-        assert_eq!(chain_action(false, true, Some(true), true), RebuildToPlain);
+            // SDR client never tonemaps: a plain chain is always kept regardless of
+            // what the (ignored) announce says (preserves the #16 safety win).
+            assert_eq!(chain_action(false, Plain, Some(true), true, tm), Keep);
+            assert_eq!(chain_action(false, Plain, None, true, tm), Keep);
+            assert_eq!(chain_action(false, Plain, Some(false), true, tm), Keep);
+            // And an SDR client that somehow has a tonemap chain rebuilds to plain.
+            assert_eq!(
+                chain_action(false, tm, Some(true), true, tm),
+                Rebuild(Plain)
+            );
+        }
     }
 
     /// Idempotence / anti-loop proof: against a STEADY stream (a live ffmpeg and a
@@ -3094,38 +3448,43 @@ mod tests {
     /// storm impossible; encode it so a future refactor can't reintroduce it.
     #[test]
     fn chain_action_converges_to_keep() {
-        for &wants_hdr in &[false, true] {
-            // Only CONFIRMED announces have a definite target chain. (An unknown
-            // announce deliberately holds an alive chain as-is; covered separately.)
-            for &stream_hdr in &[false, true] {
-                let announced = Some(stream_hdr);
-                let target = should_tonemap_hdr(wants_hdr, announced);
-                // Start deliberately on the opposite chain, ffmpeg alive, then iterate.
-                let mut chain = !target;
-                let mut rebuilds = 0;
-                for _ in 0..8 {
-                    match chain_action(wants_hdr, chain, announced, true) {
-                        ChainAction::Keep => break,
-                        ChainAction::RebuildToTonemap => {
-                            chain = true;
-                            rebuilds += 1;
-                        }
-                        ChainAction::RebuildToPlain => {
-                            chain = false;
-                            rebuilds += 1;
+        use DecodeChain::*;
+        for &tm in &[TonemapGpu, TonemapCpu] {
+            for &wants_hdr in &[false, true] {
+                // Only CONFIRMED announces have a definite target chain. (An unknown
+                // announce deliberately holds an alive chain as-is; covered
+                // separately.)
+                for &stream_hdr in &[false, true] {
+                    let announced = Some(stream_hdr);
+                    let target = if should_tonemap_hdr(wants_hdr, announced) {
+                        tm
+                    } else {
+                        Plain
+                    };
+                    // Start deliberately on the wrong chain, ffmpeg alive, iterate.
+                    let mut chain = if target == Plain { tm } else { Plain };
+                    let mut rebuilds = 0;
+                    for _ in 0..8 {
+                        match chain_action(wants_hdr, chain, announced, true, tm) {
+                            ChainAction::Keep => break,
+                            ChainAction::Rebuild(to) => {
+                                chain = to;
+                                rebuilds += 1;
+                            }
                         }
                     }
+                    assert!(
+                        rebuilds <= 1,
+                        "tm={tm:?} wants_hdr={wants_hdr} announced={announced:?}: \
+                         {rebuilds} rebuilds (want ≤1)"
+                    );
+                    assert_eq!(chain, target);
+                    // Fixed point: re-evaluating the settled chain returns Keep.
+                    assert_eq!(
+                        chain_action(wants_hdr, chain, announced, true, tm),
+                        ChainAction::Keep
+                    );
                 }
-                assert!(
-                    rebuilds <= 1,
-                    "wants_hdr={wants_hdr} announced={announced:?}: {rebuilds} rebuilds (want ≤1)"
-                );
-                assert_eq!(chain, target);
-                // Fixed point: re-evaluating the settled chain returns Keep.
-                assert_eq!(
-                    chain_action(wants_hdr, chain, announced, true),
-                    ChainAction::Keep
-                );
             }
         }
     }
@@ -3136,15 +3495,33 @@ mod tests {
     /// real evidence (a confirmed announce, or ffmpeg dying) arrives.
     #[test]
     fn chain_action_holds_alive_chain_until_announce() {
-        // HDR client, optimistic tonemap chain, announce not yet arrived, alive → Keep.
-        assert_eq!(
-            chain_action(true, true, None, true),
-            ChainAction::Keep,
-            "an alive optimistic tonemap chain must not be rebuilt before the announce"
-        );
-        // HDR client, plain chain, announce not yet arrived, alive → Keep (we don't
-        // speculatively upgrade to tonemap without a confirmed HDR announce).
-        assert_eq!(chain_action(true, false, None, true), ChainAction::Keep);
+        use DecodeChain::*;
+        for &tm in &[TonemapGpu, TonemapCpu] {
+            // HDR client, optimistic tonemap chain, announce not arrived, alive → Keep.
+            assert_eq!(
+                chain_action(true, tm, None, true, tm),
+                ChainAction::Keep,
+                "an alive optimistic tonemap chain must not be rebuilt before the announce"
+            );
+            // HDR client, plain chain, announce not yet arrived, alive → Keep (we don't
+            // speculatively upgrade to tonemap without a confirmed HDR announce).
+            assert_eq!(chain_action(true, Plain, None, true, tm), ChainAction::Keep);
+        }
+    }
+
+    /// The GPU tonemap decodes to 16-bit P010 (issue #15) — twice the bytes of the
+    /// 8-bit NV12 chains. The reader sizes its `read_exact` buffer from this; a
+    /// wrong size shears every frame, so pin the arithmetic.
+    #[test]
+    fn chain_frame_bytes_track_sample_depth() {
+        use DecodeChain::*;
+        // 4K: NV12 = 3840*2160*1.5, P010 doubles it.
+        assert_eq!(Plain.frame_bytes(3840, 2160), 12_441_600);
+        assert_eq!(TonemapCpu.frame_bytes(3840, 2160), 12_441_600);
+        assert_eq!(TonemapGpu.frame_bytes(3840, 2160), 24_883_200);
+        // Only the GPU chain produces HDR (P010) frames for the renderer.
+        assert!(TonemapGpu.is_tonemap() && TonemapCpu.is_tonemap());
+        assert!(!Plain.is_tonemap());
     }
 
     /// The on_frame writer's take/put race decision (issue #16 deadlock fix). After a
@@ -3158,6 +3535,74 @@ mod tests {
         // Reader installed a new child's stdin while we wrote: do NOT re-insert (drop
         // the stale one). This is what keeps a mid-write colorimetry rebuild correct.
         assert!(!reinsert_stdin(false));
+    }
+
+    /// Compile both blit shaders (SDR + the issue-#15 HDR tonemap) on a real
+    /// headless device so a WGSL error can't hide until a live stream. Needs a
+    /// GPU with 16-bit-norm texture support, hence ignored by default — run
+    /// with `cargo test -p trireme -- --ignored hdr_shader` on a dev box.
+    #[test]
+    #[ignore]
+    fn hdr_shader_compiles_on_this_gpu() {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("no adapter");
+        assert!(
+            adapter
+                .features()
+                .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM),
+            "adapter lacks 16-bit norm textures; HDR path would fall back to CPU"
+        );
+        let (device, _queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("hdr-shader-test"),
+                required_features: wgpu::Features::TEXTURE_FORMAT_16BIT_NORM,
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::Performance,
+            },
+            None,
+        ))
+        .expect("device");
+        // Fail the test on any validation error instead of wgpu's default panic-log.
+        device.on_uncaptured_error(Box::new(|e| panic!("wgpu validation: {e}")));
+        for (label, src) in [
+            ("sdr", SHADER.to_string()),
+            (
+                "hdr",
+                HDR_SHADER.replace("{PEAK}", &format!("{:?}", hdr_tonemap_peak())),
+            ),
+        ] {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: None, // auto layout is fine for a compile check
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: "vs_main",
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::TextureFormat::Rgba8UnormSrgb.into())],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
+        }
+        device.poll(wgpu::Maintain::Wait);
     }
 
     #[test]
