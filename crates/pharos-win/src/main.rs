@@ -1029,6 +1029,11 @@ fn run_stream(
                     let (mut allowed, mut pushed, mut ssthresh) = (0u32, 0u32, 0u32);
                     let mut base_rtt_us = 0u32;
                     let mut last_conn: Option<String> = None;
+                    // Pipeline generation last seen; a bump = the encoder respawned
+                    // (colorimetry flip / mode change / fault recovery).
+                    let mut last_gen = 0u32;
+                    // Ticks left in the post-respawn grace window (no adaptation).
+                    let mut grace_ticks = 0u32;
                     let mut last_frames = frames_b.load(Ordering::Relaxed);
                     let mut win = Instant::now();
                     loop {
@@ -1056,6 +1061,42 @@ fn run_stream(
                         }
                         // No client, or the pipeline hasn't published a ceiling yet.
                         if conn.is_none() || ceiling == 0 {
+                            while qos_rx.try_recv().is_ok() {}
+                            last_frames = frames_b.load(Ordering::Relaxed);
+                            win = Instant::now();
+                            continue;
+                        }
+                        // Pipeline respawn: the transition itself wobbles the box (a
+                        // Windows display-mode switch spikes RTT and drops packets for
+                        // seconds — DPC storms), so any brake earned on those signals
+                        // is garbage and would otherwise be inherited by the fresh
+                        // generation, parking it near the floor with a ~30s additive
+                        // climb back. Re-arm at the ceiling, relearn the RTT baseline,
+                        // and hold a short grace before adapting; a genuinely
+                        // congested link simply re-brakes on real signals right after.
+                        let gen = ctl_b.generation.load(Ordering::Relaxed);
+                        if gen != last_gen {
+                            last_gen = gen;
+                            recv_fps_ewma = 0.0;
+                            clear_ticks = 0;
+                            stale_ticks = 0;
+                            base_rtt_us = 0;
+                            allowed = ceiling;
+                            pushed = ceiling;
+                            ssthresh = ceiling;
+                            ctl_b.target_kbps.store(ceiling, Ordering::Relaxed);
+                            grace_ticks = 3;
+                            while qos_rx.try_recv().is_ok() {}
+                            last_frames = frames_b.load(Ordering::Relaxed);
+                            win = Instant::now();
+                            info!(
+                                "adaptive bitrate: pipeline respawn (gen {gen}) — re-armed at \
+                                 ceiling {ceiling} kbps, {grace_ticks}s grace"
+                            );
+                            continue;
+                        }
+                        if grace_ticks > 0 {
+                            grace_ticks -= 1;
                             while qos_rx.try_recv().is_ok() {}
                             last_frames = frames_b.load(Ordering::Relaxed);
                             win = Instant::now();

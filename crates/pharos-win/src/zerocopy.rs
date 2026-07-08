@@ -84,6 +84,13 @@ pub struct BitrateCtl {
     /// `bitrate_kbps`); the adaptive loop reads it as its upper bound and waits
     /// while it is 0 (no pipeline built yet).
     pub ceiling_kbps: Arc<AtomicU32>,
+    /// Bumped once per pipeline build (colorimetry flip, display-mode change,
+    /// fault recovery). The control loop watches it and RE-ARMS at the ceiling
+    /// with a short grace window instead of inheriting a brake earned on the
+    /// respawn transient — a Windows display-mode switch spikes RTT and drops
+    /// packets for a few seconds (DPC storms), which reads as severe congestion
+    /// and otherwise parks the whole session at the floor.
+    pub generation: Arc<AtomicU32>,
 }
 
 /// Lower bound the adaptive-bitrate loop (issue #30) will drop to, kbps — mirrors the
@@ -644,9 +651,11 @@ fn zc_loop(
     }
     // Adaptive bitrate (issue #30): publish this generation's ceiling so the control
     // loop knows the upper bound, and START at the loop's current target if it has one
-    // (continuity across a respawn) — else the ceiling.
+    // (continuity across a respawn) — else the ceiling. The generation bump tells the
+    // loop to re-arm at the ceiling + grace rather than inherit a transient brake.
     let ceiling = bitrate_kbps(w, h, fps, hdr);
     ctl.ceiling_kbps.store(ceiling, Ordering::Relaxed);
+    ctl.generation.fetch_add(1, Ordering::Relaxed);
     let kbps = match ctl.target_kbps.load(Ordering::Relaxed) {
         0 => ceiling,
         t => t.clamp(MIN_ADAPTIVE_KBPS.min(ceiling), ceiling),
