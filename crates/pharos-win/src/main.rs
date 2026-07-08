@@ -339,30 +339,56 @@ fn unpack_wh(g: u64) -> (u32, u32) {
     ((g >> 32) as u32, g as u32)
 }
 
-/// One evaluation step of the adaptive-bitrate controller (issue #30), factored pure
-/// for unit tests. Mirrors the Linux compositor ladder: on a sustained lossy link
-/// (≥2 windows) drop fast to `current * deficit`; on a clean link (≥3 windows) raise
-/// slowly by +20%; always clamp to `[floor, ceiling]`. The caller applies the >8%
-/// actuator debounce before pushing the result to the encoder.
+/// One evaluation step of the bufferbloat-aware adaptive-bitrate controller (issue
+/// #30), factored pure for unit tests. AIMD with a TCP-style **ssthresh brake** so the
+/// up-ramp stops blindly chasing the ceiling — the flaw that made the first cut
+/// sawtooth ~7 Mbps over a WiFi link's capacity. `congested` folds three signals the
+/// caller computes: delivered-fps deficit, packet loss, and — critically — an RTT
+/// bufferbloat spike (latency growth the other two miss). On congestion: mark
+/// `ssthresh` at the current rate and multiplicatively decrease (harder when the
+/// deficit is worse). When clean for ≥3 windows: fast-ramp back toward `ssthresh`
+/// (never overshooting it), then probe ABOVE it additively, raising the mark as it
+/// safely climbs. Returns `(allowed_kbps, ssthresh_kbps)`; the caller applies the >8%
+/// actuator debounce before pushing `allowed` to the encoder.
 #[cfg(any(windows, test))]
+#[allow(clippy::too_many_arguments)]
 fn adapt_bitrate_step(
-    current_kbps: u32,
+    allowed_kbps: u32,
+    ssthresh_kbps: u32,
     floor_kbps: u32,
     ceiling_kbps: u32,
-    lossy: bool,
+    congested: bool,
     deficit: f32,
-    low_ticks: u32,
     clear_ticks: u32,
-) -> u32 {
+    probe_step_kbps: u32,
+) -> (u32, u32) {
     let floor = floor_kbps.min(ceiling_kbps);
-    let next = if lossy && low_ticks >= 2 {
-        (current_kbps as f32 * deficit.clamp(0.0, 1.0)) as u32
-    } else if !lossy && clear_ticks >= 3 && current_kbps < ceiling_kbps {
-        (current_kbps as f32 * 1.2) as u32
+    if congested {
+        // React on the FIRST congested window (latency protection needs speed). Brake at
+        // ~85% of where we congested and drop at least that far (harder when the deficit
+        // is worse), so recovery hovers BELOW capacity instead of sawtoothing above it —
+        // the fix for the ceiling-chasing oscillation.
+        let beta = deficit.clamp(0.5, 0.85);
+        let ssthresh = ((allowed_kbps as f32 * 0.85) as u32).max(floor);
+        let allowed = ((allowed_kbps as f32 * beta) as u32).max(floor);
+        (allowed, ssthresh.max(allowed))
+    } else if clear_ticks >= 3 {
+        if allowed_kbps < ssthresh_kbps {
+            // Fast recovery toward the last-known-good rate — never overshoot the mark.
+            let allowed = ((allowed_kbps as f32 * 1.2) as u32)
+                .min(ssthresh_kbps)
+                .clamp(floor, ceiling_kbps);
+            (allowed, ssthresh_kbps)
+        } else {
+            // At/above the mark: probe up slowly (additive), raising the mark as we go.
+            let allowed = allowed_kbps
+                .saturating_add(probe_step_kbps)
+                .clamp(floor, ceiling_kbps);
+            (allowed, allowed.max(ssthresh_kbps))
+        }
     } else {
-        current_kbps
-    };
-    next.clamp(floor, ceiling_kbps)
+        (allowed_kbps.clamp(floor, ceiling_kbps), ssthresh_kbps)
+    }
 }
 
 #[cfg(any(windows, test))]
@@ -977,12 +1003,14 @@ fn run_stream(
 
     // ── Adaptive bitrate controller (issue #30) ──────────────────────────────
     // wgc-zc only: it's the one path with an in-process NVENC session that can
-    // `reconfigure_bitrate` in place. A ~1s loop rides the CBR target between the
-    // MIN_ADAPTIVE_KBPS floor and the build ceiling from the client's QoS (recv_fps),
-    // falling back to host-side path loss when QoS is stale — the Windows port of the
-    // Linux compositor's adaptive ladder. It only publishes into `bitrate_ctl`; the
-    // encode thread reads it and applies the reconfigure. Survives respawns (shared
-    // cell), and snaps back to the ceiling on a new client.
+    // `reconfigure_bitrate` in place. A ~1s AIMD loop rides the CBR target between the
+    // MIN_ADAPTIVE_KBPS floor and the build ceiling. Congestion is ANY of: a
+    // delivered-fps deficit (client QoS), forward packet loss, or an RTT bufferbloat
+    // spike — the last of which is what fps/loss miss (frames still arrive, just late,
+    // which is the "crisp but laggy" failure of the first cut). A TCP-style ssthresh
+    // brake keeps recovery below capacity instead of chasing the ceiling. Only
+    // publishes into `bitrate_ctl`; the encode thread applies the reconfigure. Survives
+    // respawns (shared cell); snaps back to the ceiling on a new client.
     let bitrate_ctl = zerocopy::BitrateCtl::default();
     if matches!(capture, CaptureBackend::WgcZc) {
         if let Some(mut qos_rx) = streamer.take_qos_rx() {
@@ -991,11 +1019,15 @@ fn run_stream(
             std::thread::Builder::new()
                 .name("wgc-bitrate-ctl".into())
                 .spawn(move || {
-                    // 2% forward loss ≈ congested, used only when client QoS goes stale.
+                    // ≥2% forward loss counts as congestion.
                     const LOSSY_PERMILLE: u32 = 20;
                     let mut recv_fps_ewma = 0.0f32;
-                    let (mut low_ticks, mut clear_ticks, mut stale_ticks) = (0u32, 0u32, 0u32);
-                    let (mut allowed, mut pushed) = (0u32, 0u32);
+                    let (mut clear_ticks, mut stale_ticks) = (0u32, 0u32);
+                    // `allowed` = the loop's current target; `pushed` = last value sent to
+                    // the encoder (8% debounce); `ssthresh` = the AIMD brake; `base_rtt_us`
+                    // = the learned uncongested path RTT (min-filter with a slow leak).
+                    let (mut allowed, mut pushed, mut ssthresh) = (0u32, 0u32, 0u32);
+                    let mut base_rtt_us = 0u32;
                     let mut last_conn: Option<String> = None;
                     let mut last_frames = frames_b.load(Ordering::Relaxed);
                     let mut win = Instant::now();
@@ -1003,16 +1035,17 @@ fn run_stream(
                         std::thread::sleep(Duration::from_secs(1));
                         let ceiling = ctl_b.ceiling_kbps.load(Ordering::Relaxed);
                         let conn = streamer_b.connected_addr();
-                        // New client (or disconnect): snap the target back to the ceiling
-                        // so a fresh session never inherits a prior WAN client's rate.
+                        // New client (or disconnect): snap the target + brake back to the
+                        // ceiling so a fresh session never inherits a prior client's rate.
                         if conn != last_conn {
                             last_conn = conn.clone();
                             recv_fps_ewma = 0.0;
-                            low_ticks = 0;
                             clear_ticks = 0;
                             stale_ticks = 0;
+                            base_rtt_us = 0;
                             allowed = ceiling;
                             pushed = ceiling;
+                            ssthresh = ceiling;
                             if ceiling > 0 {
                                 ctl_b.target_kbps.store(ceiling, Ordering::Relaxed);
                             }
@@ -1031,16 +1064,17 @@ fn run_stream(
                         if allowed == 0 {
                             allowed = ceiling;
                             pushed = ceiling;
+                            ssthresh = ceiling;
                         }
                         let floor = zerocopy::MIN_ADAPTIVE_KBPS.min(ceiling);
                         let secs = win.elapsed().as_secs_f32().max(1e-3);
                         win = Instant::now();
-                        // Host send-rate this window (the "expected" fps the client is
-                        // measured against), from the shared AU counter.
+                        // Host send-rate this window (the client's delivered fps is
+                        // measured against it), from the shared AU counter.
                         let f = frames_b.load(Ordering::Relaxed);
                         let send_fps = f.saturating_sub(last_frames) as f32 / secs;
                         last_frames = f;
-                        // Client-reported delivered fps, EWMA α=0.5 (mirrors Linux).
+                        // Client-reported delivered fps, EWMA α=0.5.
                         let mut got_qos = false;
                         while let Ok(q) = qos_rx.try_recv() {
                             recv_fps_ewma = if recv_fps_ewma <= 0.0 {
@@ -1050,41 +1084,39 @@ fn run_stream(
                             };
                             got_qos = true;
                         }
-                        if got_qos {
-                            stale_ticks = 0;
-                        } else {
-                            stale_ticks = stale_ticks.saturating_add(1);
+                        stale_ticks = if got_qos { 0 } else { stale_ticks.saturating_add(1) };
+                        // Bufferbloat: learn the baseline RTT (min-filter with a slow
+                        // upward leak so a genuinely higher baseline is tracked), and flag
+                        // congestion when the live RTT inflates past base + max(15ms,
+                        // base/2) — queue buildup that loss and the fps deficit both miss.
+                        let rtt = streamer_b.rtt_us();
+                        if rtt > 0 {
+                            base_rtt_us = if base_rtt_us == 0 {
+                                rtt
+                            } else {
+                                rtt.min(base_rtt_us.saturating_add((base_rtt_us / 32).max(200)))
+                            };
                         }
-                        // Congestion signal: delivered/sent deficit while fresh QoS is
-                        // flowing; host-side path loss once QoS has been stale ≥3s.
-                        let (lossy, deficit) = if stale_ticks >= 3 {
-                            let loss = streamer_b.loss_permille();
-                            (
-                                loss >= LOSSY_PERMILLE,
-                                (1.0 - loss as f32 / 1000.0).clamp(0.3, 1.0),
-                            )
-                        } else if recv_fps_ewma > 2.0 && send_fps > 2.0 {
-                            let d = recv_fps_ewma / send_fps;
-                            (d < 0.85, d)
+                        let bloat = rtt > 0
+                            && base_rtt_us > 0
+                            && rtt > base_rtt_us.saturating_add((base_rtt_us / 2).max(15_000));
+                        // Delivered-fps deficit while QoS is fresh; forward loss always.
+                        let loss = streamer_b.loss_permille();
+                        let deficit = if stale_ticks < 3 && recv_fps_ewma > 2.0 && send_fps > 2.0 {
+                            recv_fps_ewma / send_fps
                         } else {
-                            (false, 1.0)
+                            1.0
                         };
-                        if lossy {
-                            clear_ticks = 0;
-                            low_ticks += 1;
-                        } else {
-                            low_ticks = 0;
-                            clear_ticks += 1;
-                        }
-                        allowed = adapt_bitrate_step(
-                            allowed,
-                            floor,
-                            ceiling,
-                            lossy,
-                            deficit,
-                            low_ticks,
-                            clear_ticks,
+                        let congested = deficit < 0.85 || loss >= LOSSY_PERMILLE || bloat;
+                        clear_ticks = if congested { 0 } else { clear_ticks.saturating_add(1) };
+                        // Additive probe step above the brake: ~4% of the ceiling.
+                        let probe = (ceiling / 25).max(1000);
+                        let (next_allowed, next_ssthresh) = adapt_bitrate_step(
+                            allowed, ssthresh, floor, ceiling, congested, deficit, clear_ticks,
+                            probe,
                         );
+                        allowed = next_allowed;
+                        ssthresh = next_ssthresh;
                         // Actuator debounce: only reconfigure on a >8% move, so a healthy
                         // link pinned at the ceiling never churns the encoder.
                         if allowed != pushed
@@ -1092,9 +1124,11 @@ fn run_stream(
                         {
                             ctl_b.target_kbps.store(allowed, Ordering::Relaxed);
                             info!(
-                                "adaptive bitrate: {pushed} -> {allowed} kbps \
-                                 (recv_fps~{recv_fps_ewma:.0} send_fps~{send_fps:.0} \
-                                 lossy={lossy} ceiling={ceiling})"
+                                "adaptive bitrate: {pushed} -> {allowed} kbps (recv_fps~{recv_fps_ewma:.0} \
+                                 send_fps~{send_fps:.0} loss={loss}permille rtt={}ms base={}ms bloat={bloat} \
+                                 ssthresh={ssthresh} ceiling={ceiling})",
+                                rtt / 1000,
+                                base_rtt_us / 1000
                             );
                             pushed = allowed;
                         }
@@ -1982,54 +2016,63 @@ mod tests {
     };
 
     #[test]
-    fn adaptive_drops_fast_when_sustained_lossy() {
-        // deficit 0.5 for ≥2 lossy ticks → current × 0.5.
+    fn adaptive_congestion_backs_off_below_the_congestion_point() {
+        // deficit 0.7 → drop to 70%; ssthresh braked to 85% of where we congested
+        // (60000×0.7=42000, ssthresh=60000×0.85=51000).
         assert_eq!(
-            adapt_bitrate_step(20000, 2000, 25000, true, 0.5, 2, 0),
-            10000
+            adapt_bitrate_step(60000, 60000, 2000, 60000, true, 0.7, 0, 2400),
+            (42000, 51000)
         );
     }
 
     #[test]
-    fn adaptive_drop_needs_two_ticks() {
+    fn adaptive_fast_recovery_stops_at_ssthresh() {
+        // Clean ≥3 windows, below the brake → +20%, but never past ssthresh.
         assert_eq!(
-            adapt_bitrate_step(20000, 2000, 25000, true, 0.5, 1, 0),
-            20000
+            adapt_bitrate_step(42000, 51000, 2000, 60000, false, 1.0, 3, 2400),
+            (50400, 51000)
+        );
+        // Next +20% would be 60480 but caps at the brake.
+        assert_eq!(
+            adapt_bitrate_step(50400, 51000, 2000, 60000, false, 1.0, 3, 2400),
+            (51000, 51000)
         );
     }
 
     #[test]
-    fn adaptive_raises_slowly_when_clean() {
-        // ≥3 clean ticks → +20%.
+    fn adaptive_probes_additively_above_the_brake() {
+        // At/above ssthresh + clean → additive probe, raising the brake with it.
         assert_eq!(
-            adapt_bitrate_step(10000, 2000, 25000, false, 1.0, 0, 3),
-            12000
+            adapt_bitrate_step(51000, 51000, 2000, 60000, false, 1.0, 3, 2400),
+            (53400, 53400)
         );
     }
 
     #[test]
-    fn adaptive_raise_needs_three_ticks_and_caps_at_ceiling() {
+    fn adaptive_holds_until_three_clean_windows() {
         assert_eq!(
-            adapt_bitrate_step(10000, 2000, 25000, false, 1.0, 0, 2),
-            10000
-        );
-        // 24000 × 1.2 = 28800, capped to the ceiling.
-        assert_eq!(
-            adapt_bitrate_step(24000, 2000, 25000, false, 1.0, 0, 3),
-            25000
+            adapt_bitrate_step(42000, 51000, 2000, 60000, false, 1.0, 2, 2400),
+            (42000, 51000)
         );
     }
 
     #[test]
-    fn adaptive_clamps_to_floor() {
-        // 3000 × 0.1 = 300 → floor.
-        assert_eq!(adapt_bitrate_step(3000, 2000, 25000, true, 0.1, 2, 0), 2000);
+    fn adaptive_inert_pinned_at_ceiling_on_a_clean_link() {
+        // allowed == ceiling == ssthresh, clean → no change (probe clamps at ceiling).
+        assert_eq!(
+            adapt_bitrate_step(60000, 60000, 2000, 60000, false, 1.0, 3, 2400),
+            (60000, 60000)
+        );
     }
 
     #[test]
-    fn adaptive_floor_never_exceeds_ceiling() {
-        // Ceiling below the nominal floor: the effective floor is the ceiling.
-        assert_eq!(adapt_bitrate_step(1500, 2000, 1500, true, 0.5, 2, 0), 1500);
+    fn adaptive_congestion_clamps_to_floor() {
+        // Hard deficit clamps allowed to the floor; ssthresh stays >= floor
+        // (2500×0.5=1250 → floor 2000; ssthresh=2500×0.85=2125).
+        assert_eq!(
+            adapt_bitrate_step(2500, 2200, 2000, 60000, true, 0.1, 0, 2400),
+            (2000, 2125)
+        );
     }
 
     #[test]

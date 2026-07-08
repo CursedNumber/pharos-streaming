@@ -702,6 +702,11 @@ pub struct QuicStreamer {
     /// Read by the compositor as a host-side congestion signal (works even when the
     /// client sends no QoS). See [`Self::loss_permille`].
     loss_permille: Arc<std::sync::atomic::AtomicU32>,
+    /// Smoothed forward-path RTT in microseconds (quinn PathStats), ~1s cadence. A
+    /// latency (bufferbloat) congestion signal the host bitrate loop watches — RTT
+    /// inflation over the path baseline catches queue buildup that packet loss and the
+    /// delivered-fps deficit both miss (issue #30). See [`Self::rtt_us`].
+    rtt_us: Arc<std::sync::atomic::AtomicU32>,
     /// Live per-connection registry — populated ONLY by the mirror keep-N path;
     /// empty in single mode (so [`Self::connected_clients`] falls back to the
     /// scalar peer fields). The compositor snapshots it to publish one
@@ -860,6 +865,8 @@ impl QuicStreamer {
         let cursor_captured_thread = cursor_captured.clone();
         let loss_permille = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let loss_thread = loss_permille.clone();
+        let rtt_us = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let rtt_us_thread = rtt_us.clone();
         // P-frame drop counter, shared with the serve thread so its connection
         // loop can emit the DG_LINK_HEALTH heartbeat (the producer-side note_drop
         // increments it). Monotonic — the emit side resets its own per-connection
@@ -917,6 +924,7 @@ impl QuicStreamer {
                     hdr_thread,
                     cursor_captured_thread,
                     loss_thread,
+                    rtt_us_thread,
                     drops_thread,
                     request_idr_thread,
                     mirror,
@@ -954,6 +962,7 @@ impl QuicStreamer {
             hdr,
             cursor_captured,
             loss_permille,
+            rtt_us,
             clients,
         })
     }
@@ -964,6 +973,13 @@ impl QuicStreamer {
     pub fn loss_permille(&self) -> u32 {
         self.loss_permille
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Smoothed forward-path RTT in microseconds (quinn PathStats), ~1s cadence; 0 when
+    /// idle / no client. The host bitrate loop watches its inflation over the path
+    /// baseline as a bufferbloat signal (issue #30).
+    pub fn rtt_us(&self) -> u32 {
+        self.rtt_us.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Tell the streamer the encoder's current output geometry. Announced to the
@@ -2567,6 +2583,7 @@ async fn serve_stream(
     hdr: Arc<std::sync::atomic::AtomicU8>,
     cursor_captured: Arc<AtomicBool>,
     loss: Arc<std::sync::atomic::AtomicU32>,
+    rtt_us: Arc<std::sync::atomic::AtomicU32>,
     drops: Arc<std::sync::atomic::AtomicU64>,
     request_idr: Arc<AtomicBool>,
     mirror: Arc<AtomicBool>,
@@ -3270,6 +3287,10 @@ async fn serve_stream(
                             .checked_div(dsent)
                             .map_or(0, |v| v.min(1000) as u32);
                         loss.store(permille, Ordering::Relaxed);
+                        rtt_us.store(
+                            s.rtt.as_micros().min(u128::from(u32::MAX)) as u32,
+                            Ordering::Relaxed,
+                        );
                         tracing::info!(
                             target: "compositor::wire",
                             "quic path: rtt={:.0}ms cwnd={} lost_1s={} loss={}permille lost_total={}",
