@@ -1195,6 +1195,11 @@ struct App {
     /// would leave pads dead after the first blip. `None` means "don't forward":
     /// either no source is connected, or `CaptureMode::Off` has muted input.
     gamepad_sink: crate::gamepad::GamepadSink,
+    /// Last input device that deliberately drove the stream (kbd/mouse vs pad),
+    /// shared with the gamepad capture thread. Used to mute bare mouse-motion
+    /// forwarding while a controller is in use, so a free cursor drifting to the
+    /// window edge stops fighting the pad for the game's active-device focus.
+    input_source: crate::gamepad::InputSource,
     /// The user's cursor-grab intent (issue #5) — flipped by the `toggle_grab`
     /// hotkey. Persists across focus loss so alt-tab-and-back resumes mouselook.
     grab_wanted: bool,
@@ -1299,7 +1304,7 @@ impl ApplicationHandler<UserEvent> for App {
             // spawn the capture thread ONCE (issue #14). The thread outlives every
             // reconnect; only the shared sink is re-pointed as sources cycle.
             self.refresh_gamepad_sink();
-            crate::gamepad::run_gamepad_capture(self.gamepad_sink.clone());
+            crate::gamepad::run_gamepad_capture(self.gamepad_sink.clone(), self.input_source.clone());
         }
     }
 
@@ -1590,6 +1595,30 @@ impl App {
     /// have one source). Multi-source routing follows the pointer: the source
     /// the cursor is currently over receives the events, falling back to 0.
     fn send_to_active(&self, ev: core_proto::InputEvent) {
+        use core_proto::InputEvent as IE;
+        use crate::gamepad::SRC_KBDMOUSE;
+        use std::sync::atomic::Ordering;
+        // Last-used-device arbitration (matches the pad side in `gamepad.rs`):
+        // bare pointer motion is the flood a free cursor generates (edge-escape,
+        // drift), so forward it ONLY while kbd/mouse is the active source — a
+        // controller in use must not be fought by a stray mouse. Motion never
+        // *switches* the active source (idle drift must not steal focus back from
+        // the pad). A deliberate key/click/scroll (a real press) claims kbd/mouse;
+        // key/button *releases* pass through without claiming, so a release that
+        // lands mid-gamepad-use can't un-mute the drifting cursor.
+        match &ev {
+            IE::PointerAbs { .. } | IE::PointerRel { .. } => {
+                if self.input_source.load(Ordering::Relaxed) != SRC_KBDMOUSE {
+                    return;
+                }
+            }
+            IE::Key { pressed: true, .. }
+            | IE::PointerButton { pressed: true, .. }
+            | IE::Scroll { .. } => {
+                self.input_source.store(SRC_KBDMOUSE, Ordering::Relaxed);
+            }
+            _ => {}
+        }
         let idx = self.cursor_cell.unwrap_or(0);
         if let Some(tx) = self.sources.get(idx).and_then(|s| s.input_tx.as_ref()) {
             let _ = tx.send(ev);
@@ -2844,6 +2873,7 @@ pub fn run(cfg: PlayerCfg) -> Result<()> {
         fullscreen: false,
         suspended: false,
         gamepad_sink: Arc::new(Mutex::new(None)),
+        input_source: Arc::new(std::sync::atomic::AtomicU8::new(crate::gamepad::SRC_KBDMOUSE)),
         grab_wanted: false,
         grabbed: false,
     };

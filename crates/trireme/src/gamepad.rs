@@ -25,6 +25,7 @@
 //! d-pad, triggers, buttons, and hotplug all work.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -46,6 +47,20 @@ const AXIS_EPSILON: f32 = 0.004;
 /// Poll cadence when idle. gilrs is not async; we sleep briefly between drains so
 /// the thread doesn't spin. Short enough to stay imperceptible for input.
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
+
+/// Which input device most recently *deliberately* drove the stream, shared
+/// between the keyboard/mouse send path (`play::send_to_active`) and this
+/// capture thread. A free desktop cursor drifting to the window edge fires a
+/// continuous `PointerAbs` flood that fights a controller for the game's "active
+/// device" focus (and wastes back-channel bandwidth); the play loop forwards
+/// bare pointer motion only while kbd/mouse is the active source. Real pad
+/// activity (a button, or a stick past the deadzone) claims [`SRC_GAMEPAD`]
+/// here; a deliberate key/click/scroll claims [`SRC_KBDMOUSE`] there. A pad
+/// merely *connecting* does NOT claim it (an idle pad must not steal the mouse).
+pub const SRC_KBDMOUSE: u8 = 0;
+pub const SRC_GAMEPAD: u8 = 1;
+/// Shared last-deliberately-used input source (see [`SRC_KBDMOUSE`]).
+pub type InputSource = Arc<AtomicU8>;
 
 /// The reconnect-safe sink the capture thread writes into. It is an
 /// `Arc<Mutex<Option<Sender>>>` and NOT a bare `Sender` on purpose: the active
@@ -305,7 +320,7 @@ fn emit(sink: &GamepadSink, ev: InputEvent) {
 /// of the process. If gilrs can't init on this platform (headless CI, missing
 /// permissions) it logs and returns without spawning — the rest of the client is
 /// unaffected, since the whole path is inert unless a pad is present.
-pub fn run_gamepad_capture(sink: GamepadSink) {
+pub fn run_gamepad_capture(sink: GamepadSink, source: InputSource) {
     let mut gilrs = match Gilrs::new() {
         Ok(g) => g,
         Err(e) => {
@@ -343,7 +358,16 @@ pub fn run_gamepad_capture(sink: GamepadSink) {
                             // dropped.
                             if let Some(&slot) = slots.of.get(&id) {
                                 let state = states.entry(slot).or_default();
-                                for ev in map_event(&other, slot, state) {
+                                let evs = map_event(&other, slot, state);
+                                // A non-empty map means real, past-deadzone pad
+                                // use (map_event drops sub-deadzone/sub-epsilon
+                                // noise), so claim the active source before
+                                // forwarding — this mutes the stray-cursor
+                                // PointerAbs flood on the play side.
+                                if !evs.is_empty() {
+                                    source.store(SRC_GAMEPAD, Ordering::Relaxed);
+                                }
+                                for ev in evs {
                                     emit(&sink, ev);
                                 }
                             }
