@@ -577,12 +577,29 @@ fn zc_loop(
     let mut next = Instant::now() + interval;
     let mut got_first = false;
     let mut frame_no: u64 = 0;
+    // #27 per-stage timing: accumulate each stage's per-frame cost and log the
+    // averages every ~2s, so a per-frame sync stall (vs raw NVENC throughput) is
+    // visible in the host log — capture drain, PQ pass, encode submit, and the
+    // blocking bitstream lock are timed separately.
+    let (mut t_cap, mut t_pq, mut t_enc, mut t_lock) = (
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::ZERO,
+    );
+    let mut stage_frames: u64 = 0;
+    // Count of fresh WGC frames actually drained this window (the true capture
+    // rate) vs stage_frames (the tick grid) — the two together separate a
+    // capture-limited stall (fresh << ticks) from an encode-limited one (ticks drop).
+    let mut fresh_frames: u64 = 0;
+    let mut last_stage_log = Instant::now();
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
         // Drain the pool to the newest frame; GPU-copy it and return the pool
         // buffer immediately.
+        let cap0 = Instant::now();
         let mut fresh = false;
         loop {
             let frame = match pool.TryGetNextFrame() {
@@ -615,10 +632,14 @@ fn zc_loop(
             let _ = frame.Close();
             got_first = true;
             fresh = true;
+            fresh_frames += 1;
         }
+        t_cap += cap0.elapsed();
         if fresh {
             if let Some((_, pass)) = &hdr_pass {
+                let pq0 = Instant::now();
                 pass.run(&context);
+                t_pq += pq0.elapsed();
             }
         }
 
@@ -646,6 +667,7 @@ fn zc_loop(
         };
 
         let ob = &mut outputs[(frame_no as usize) % num_bufs];
+        let enc0 = Instant::now();
         if let Err(e) = nv_session.encode_picture(&mut reg, ob, params) {
             let msg = format!("encode_picture: {e:?}");
             if is_transient(&msg) {
@@ -654,6 +676,8 @@ fn zc_loop(
             }
             return Err(anyhow!(msg));
         }
+        t_enc += enc0.elapsed();
+        let lock0 = Instant::now();
         let lock = match ob.lock() {
             Ok(l) => l,
             Err(e) => {
@@ -670,7 +694,34 @@ fn zc_loop(
         );
         let bytes = lock.data().to_vec();
         drop(lock);
+        t_lock += lock0.elapsed();
         frame_no += 1;
+
+        // #27: emit per-stage averages every ~2s. A stage near the ~16.7ms frame
+        // budget is the bottleneck; a large `lock` specifically = the encode→retrieve
+        // is serialized (submit N, then block for N) rather than pipelined.
+        stage_frames += 1;
+        if last_stage_log.elapsed() >= Duration::from_secs(2) {
+            let win = last_stage_log.elapsed().as_secs_f64().max(1e-9);
+            let n = stage_frames.max(1) as f64;
+            tracing::info!(
+                "wgc-zc over {win:.1}s (hdr={hdr}): fresh_capture={:.1}fps encode_ticks={:.1}fps \
+                 | per-frame capture={:.1}ms pq={:.1}ms encode={:.1}ms lock={:.1}ms",
+                fresh_frames as f64 / win,
+                stage_frames as f64 / win,
+                t_cap.as_secs_f64() * 1000.0 / n,
+                t_pq.as_secs_f64() * 1000.0 / n,
+                t_enc.as_secs_f64() * 1000.0 / n,
+                t_lock.as_secs_f64() * 1000.0 / n,
+            );
+            t_cap = Duration::ZERO;
+            t_pq = Duration::ZERO;
+            t_enc = Duration::ZERO;
+            t_lock = Duration::ZERO;
+            stage_frames = 0;
+            fresh_frames = 0;
+            last_stage_log = Instant::now();
+        }
 
         // Blocking send = natural backpressure (the ffmpeg pipe's role). The
         // supervisor unblocks a stuck send by dropping the receiver in stop().
@@ -873,6 +924,11 @@ pub fn encode_test_pattern(
     let mut out = std::fs::File::create(out_path)?;
     tracing::info!("nvenc-test: {frames} frames {width}x{height} HEVC → {out_path}");
 
+    // #27 probe: time only the GPU encode + bitstream-retrieve stages (the CPU
+    // ramp fill and UpdateSubresource are outside this region), so the summary is
+    // a clean read of the encode/retrieve throughput independent of capture.
+    let (mut t_enc, mut t_lock) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+
     for i in 0..frames {
         // BGRA gradient sweep, animated so successive frames differ.
         let t = (255 * i / frames.max(1)) as u8;
@@ -889,14 +945,26 @@ pub fn encode_test_pattern(
             context.UpdateSubresource(&tex, 0, None, host.as_ptr().cast(), pitch as u32, 0);
         }
         let ob = &mut outputs[i as usize % num_bufs];
+        let e0 = std::time::Instant::now();
         session
             .encode_picture(&mut reg, ob, Default::default())
             .map_err(|e| anyhow!("encode_picture: {e:?}"))?;
+        t_enc += e0.elapsed();
+        let l0 = std::time::Instant::now();
         let lock = ob.lock().map_err(|e| anyhow!("bitstream lock: {e:?}"))?;
+        t_lock += l0.elapsed();
         out.write_all(lock.data())?;
     }
     drop(outputs.drain(..));
     drop(reg);
+    let region = (t_enc + t_lock).as_secs_f64();
+    tracing::info!(
+        "nvenc-test timing @ {width}x{height}: encode={:.2}ms/f lock={:.2}ms/f → {:.1} fps \
+         (encode+lock region, SDR 8-bit)",
+        t_enc.as_secs_f64() * 1000.0 / frames.max(1) as f64,
+        t_lock.as_secs_f64() * 1000.0 / frames.max(1) as f64,
+        frames as f64 / region.max(1e-9),
+    );
     tracing::info!("nvenc-test complete: {out_path}");
     Ok(())
 }
@@ -962,6 +1030,15 @@ pub fn encode_test_pattern_hdr(
         "nvenc-test-hdr: {frames} frames {width}x{height} HEVC Main10 BT.2020/PQ → {out_path}"
     );
 
+    // #27 probe: time the scRGB→PQ pass + GPU encode + bitstream retrieve (CPU ramp
+    // fill and UpdateSubresource excluded) — the HDR counterpart to nvenc-test, so
+    // the two summaries A/B the 10-bit vs 8-bit encode/retrieve cost with no capture.
+    let (mut t_pq, mut t_enc, mut t_lock) = (
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+    );
+
     for i in 0..frames {
         // Horizontal scRGB luminance ramp 0..~10.0 (0..800 nits), animated.
         let phase = i as f32 / frames.max(1) as f32;
@@ -980,7 +1057,9 @@ pub fn encode_test_pattern_hdr(
         unsafe {
             context.UpdateSubresource(&cap_tex, 0, None, host.as_ptr().cast(), pitch as u32, 0);
         }
+        let p0 = std::time::Instant::now();
         pass.run(&context);
+        t_pq += p0.elapsed();
 
         let params = if i.is_multiple_of(fps.max(1)) {
             sei_idr_params(&sei)
@@ -988,14 +1067,27 @@ pub fn encode_test_pattern_hdr(
             EncodePictureParams::default()
         };
         let ob = &mut outputs[i as usize % num_bufs];
+        let e0 = std::time::Instant::now();
         session
             .encode_picture(&mut reg, ob, params)
             .map_err(|e| anyhow!("encode_picture: {e:?}"))?;
+        t_enc += e0.elapsed();
+        let l0 = std::time::Instant::now();
         let lock = ob.lock().map_err(|e| anyhow!("bitstream lock: {e:?}"))?;
+        t_lock += l0.elapsed();
         out.write_all(lock.data())?;
     }
     drop(outputs.drain(..));
     drop(reg);
+    let region = (t_pq + t_enc + t_lock).as_secs_f64();
+    tracing::info!(
+        "nvenc-test-hdr timing @ {width}x{height}: pq={:.2}ms/f encode={:.2}ms/f lock={:.2}ms/f \
+         → {:.1} fps (pq+encode+lock region, HDR Main10 10-bit)",
+        t_pq.as_secs_f64() * 1000.0 / frames.max(1) as f64,
+        t_enc.as_secs_f64() * 1000.0 / frames.max(1) as f64,
+        t_lock.as_secs_f64() * 1000.0 / frames.max(1) as f64,
+        frames as f64 / region.max(1e-9),
+    );
     tracing::info!("nvenc-test-hdr complete: {out_path}");
     Ok(())
 }
