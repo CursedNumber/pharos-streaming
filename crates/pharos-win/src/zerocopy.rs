@@ -151,9 +151,15 @@ impl ZcPipeline {
         let thread = std::thread::Builder::new()
             .name("wgc-zc".into())
             .spawn(move || {
-                if let Err(e) =
-                    zc_loop(hmon, fps, hdr, &hdr_changed_z, &stop_t, init_tx.clone(), au_tx)
-                {
+                if let Err(e) = zc_loop(
+                    hmon,
+                    fps,
+                    hdr,
+                    &hdr_changed_z,
+                    &stop_t,
+                    init_tx.clone(),
+                    au_tx,
+                ) {
                     let msg = format!("{e:#}");
                     tracing::error!("wgc-zc pipeline ended: {msg}");
                     *fault_t.lock().unwrap() = Some(msg.clone());
