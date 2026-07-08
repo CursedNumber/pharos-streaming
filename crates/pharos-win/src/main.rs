@@ -339,6 +339,32 @@ fn unpack_wh(g: u64) -> (u32, u32) {
     ((g >> 32) as u32, g as u32)
 }
 
+/// One evaluation step of the adaptive-bitrate controller (issue #30), factored pure
+/// for unit tests. Mirrors the Linux compositor ladder: on a sustained lossy link
+/// (≥2 windows) drop fast to `current * deficit`; on a clean link (≥3 windows) raise
+/// slowly by +20%; always clamp to `[floor, ceiling]`. The caller applies the >8%
+/// actuator debounce before pushing the result to the encoder.
+#[cfg(any(windows, test))]
+fn adapt_bitrate_step(
+    current_kbps: u32,
+    floor_kbps: u32,
+    ceiling_kbps: u32,
+    lossy: bool,
+    deficit: f32,
+    low_ticks: u32,
+    clear_ticks: u32,
+) -> u32 {
+    let floor = floor_kbps.min(ceiling_kbps);
+    let next = if lossy && low_ticks >= 2 {
+        (current_kbps as f32 * deficit.clamp(0.0, 1.0)) as u32
+    } else if !lossy && clear_ticks >= 3 && current_kbps < ceiling_kbps {
+        (current_kbps as f32 * 1.2) as u32
+    } else {
+        current_kbps
+    };
+    next.clamp(floor, ceiling_kbps)
+}
+
 #[cfg(any(windows, test))]
 #[allow(clippy::too_many_arguments)]
 fn build_status(
@@ -949,6 +975,134 @@ fn run_stream(
     let backoff_cap = Duration::from_secs(4);
     let mut generation: u64 = 0;
 
+    // ── Adaptive bitrate controller (issue #30) ──────────────────────────────
+    // wgc-zc only: it's the one path with an in-process NVENC session that can
+    // `reconfigure_bitrate` in place. A ~1s loop rides the CBR target between the
+    // MIN_ADAPTIVE_KBPS floor and the build ceiling from the client's QoS (recv_fps),
+    // falling back to host-side path loss when QoS is stale — the Windows port of the
+    // Linux compositor's adaptive ladder. It only publishes into `bitrate_ctl`; the
+    // encode thread reads it and applies the reconfigure. Survives respawns (shared
+    // cell), and snaps back to the ceiling on a new client.
+    let bitrate_ctl = zerocopy::BitrateCtl::default();
+    if matches!(capture, CaptureBackend::WgcZc) {
+        if let Some(mut qos_rx) = streamer.take_qos_rx() {
+            let (streamer_b, frames_b, ctl_b) =
+                (streamer.clone(), frames.clone(), bitrate_ctl.clone());
+            std::thread::Builder::new()
+                .name("wgc-bitrate-ctl".into())
+                .spawn(move || {
+                    // 2% forward loss ≈ congested, used only when client QoS goes stale.
+                    const LOSSY_PERMILLE: u32 = 20;
+                    let mut recv_fps_ewma = 0.0f32;
+                    let (mut low_ticks, mut clear_ticks, mut stale_ticks) = (0u32, 0u32, 0u32);
+                    let (mut allowed, mut pushed) = (0u32, 0u32);
+                    let mut last_conn: Option<String> = None;
+                    let mut last_frames = frames_b.load(Ordering::Relaxed);
+                    let mut win = Instant::now();
+                    loop {
+                        std::thread::sleep(Duration::from_secs(1));
+                        let ceiling = ctl_b.ceiling_kbps.load(Ordering::Relaxed);
+                        let conn = streamer_b.connected_addr();
+                        // New client (or disconnect): snap the target back to the ceiling
+                        // so a fresh session never inherits a prior WAN client's rate.
+                        if conn != last_conn {
+                            last_conn = conn.clone();
+                            recv_fps_ewma = 0.0;
+                            low_ticks = 0;
+                            clear_ticks = 0;
+                            stale_ticks = 0;
+                            allowed = ceiling;
+                            pushed = ceiling;
+                            if ceiling > 0 {
+                                ctl_b.target_kbps.store(ceiling, Ordering::Relaxed);
+                            }
+                            while qos_rx.try_recv().is_ok() {}
+                            last_frames = frames_b.load(Ordering::Relaxed);
+                            win = Instant::now();
+                            continue;
+                        }
+                        // No client, or the pipeline hasn't published a ceiling yet.
+                        if conn.is_none() || ceiling == 0 {
+                            while qos_rx.try_recv().is_ok() {}
+                            last_frames = frames_b.load(Ordering::Relaxed);
+                            win = Instant::now();
+                            continue;
+                        }
+                        if allowed == 0 {
+                            allowed = ceiling;
+                            pushed = ceiling;
+                        }
+                        let floor = zerocopy::MIN_ADAPTIVE_KBPS.min(ceiling);
+                        let secs = win.elapsed().as_secs_f32().max(1e-3);
+                        win = Instant::now();
+                        // Host send-rate this window (the "expected" fps the client is
+                        // measured against), from the shared AU counter.
+                        let f = frames_b.load(Ordering::Relaxed);
+                        let send_fps = f.saturating_sub(last_frames) as f32 / secs;
+                        last_frames = f;
+                        // Client-reported delivered fps, EWMA α=0.5 (mirrors Linux).
+                        let mut got_qos = false;
+                        while let Ok(q) = qos_rx.try_recv() {
+                            recv_fps_ewma = if recv_fps_ewma <= 0.0 {
+                                q.recv_fps
+                            } else {
+                                0.5 * q.recv_fps + 0.5 * recv_fps_ewma
+                            };
+                            got_qos = true;
+                        }
+                        if got_qos {
+                            stale_ticks = 0;
+                        } else {
+                            stale_ticks = stale_ticks.saturating_add(1);
+                        }
+                        // Congestion signal: delivered/sent deficit while fresh QoS is
+                        // flowing; host-side path loss once QoS has been stale ≥3s.
+                        let (lossy, deficit) = if stale_ticks >= 3 {
+                            let loss = streamer_b.loss_permille();
+                            (
+                                loss >= LOSSY_PERMILLE,
+                                (1.0 - loss as f32 / 1000.0).clamp(0.3, 1.0),
+                            )
+                        } else if recv_fps_ewma > 2.0 && send_fps > 2.0 {
+                            let d = recv_fps_ewma / send_fps;
+                            (d < 0.85, d)
+                        } else {
+                            (false, 1.0)
+                        };
+                        if lossy {
+                            clear_ticks = 0;
+                            low_ticks += 1;
+                        } else {
+                            low_ticks = 0;
+                            clear_ticks += 1;
+                        }
+                        allowed = adapt_bitrate_step(
+                            allowed,
+                            floor,
+                            ceiling,
+                            lossy,
+                            deficit,
+                            low_ticks,
+                            clear_ticks,
+                        );
+                        // Actuator debounce: only reconfigure on a >8% move, so a healthy
+                        // link pinned at the ceiling never churns the encoder.
+                        if allowed != pushed
+                            && (allowed.abs_diff(pushed) as u64) * 100 > (pushed as u64) * 8
+                        {
+                            ctl_b.target_kbps.store(allowed, Ordering::Relaxed);
+                            info!(
+                                "adaptive bitrate: {pushed} -> {allowed} kbps \
+                                 (recv_fps~{recv_fps_ewma:.0} send_fps~{send_fps:.0} \
+                                 lossy={lossy} ceiling={ceiling})"
+                            );
+                            pushed = allowed;
+                        }
+                    }
+                })?;
+        }
+    }
+
     'supervisor: loop {
         // ── In-process WGC→NVENC generation (issue #12) ───────────────────
         // Same ladder as the ffmpeg path below, minus the subprocess: build,
@@ -959,37 +1113,41 @@ fn run_stream(
             // create): sampled from the connected client's wants_hdr at each
             // generation build, so a preference change applies on the next
             // respawn (the Linux host's HDR-flip-is-a-relaunch rule).
-            let pipeline =
-                match zerocopy::ZcPipeline::start(output_idx as usize, fps, streamer.wants_hdr()) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        warn!("pipeline build failed (gen {generation}): {e:#}");
-                        if breaker.record_and_check() {
-                            set_health(
-                                &gpu_health,
-                                control_ipc::GpuHealth::Faulted {
-                                    reason: format!(
-                                        "encoder build failed after {} tries: {e}",
-                                        breaker.max
-                                    ),
-                                    last_xid: None,
-                                },
-                            );
-                            break 'supervisor;
-                        }
+            let pipeline = match zerocopy::ZcPipeline::start(
+                output_idx as usize,
+                fps,
+                streamer.wants_hdr(),
+                bitrate_ctl.clone(),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("pipeline build failed (gen {generation}): {e:#}");
+                    if breaker.record_and_check() {
                         set_health(
                             &gpu_health,
-                            control_ipc::GpuHealth::Degraded {
-                                reason: format!("encoder restarting: {e}"),
-                                throttle: None,
+                            control_ipc::GpuHealth::Faulted {
+                                reason: format!(
+                                    "encoder build failed after {} tries: {e}",
+                                    breaker.max
+                                ),
+                                last_xid: None,
                             },
                         );
-                        std::thread::sleep(backoff);
-                        backoff = (backoff * 2).min(backoff_cap);
-                        generation += 1;
-                        continue 'supervisor;
+                        break 'supervisor;
                     }
-                };
+                    set_health(
+                        &gpu_health,
+                        control_ipc::GpuHealth::Degraded {
+                            reason: format!("encoder restarting: {e}"),
+                            throttle: None,
+                        },
+                    );
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(backoff_cap);
+                    generation += 1;
+                    continue 'supervisor;
+                }
+            };
             let (w, h) = pipeline.size;
             streamer.set_geometry(w, h);
             // Colorimetry: announce THIS generation's real HDR-ness so the client
@@ -1818,7 +1976,61 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_status, pack_wh, parse_win_fault_inject, unpack_wh, RespawnBreaker};
+    use super::{
+        adapt_bitrate_step, build_status, pack_wh, parse_win_fault_inject, unpack_wh,
+        RespawnBreaker,
+    };
+
+    #[test]
+    fn adaptive_drops_fast_when_sustained_lossy() {
+        // deficit 0.5 for ≥2 lossy ticks → current × 0.5.
+        assert_eq!(
+            adapt_bitrate_step(20000, 2000, 25000, true, 0.5, 2, 0),
+            10000
+        );
+    }
+
+    #[test]
+    fn adaptive_drop_needs_two_ticks() {
+        assert_eq!(
+            adapt_bitrate_step(20000, 2000, 25000, true, 0.5, 1, 0),
+            20000
+        );
+    }
+
+    #[test]
+    fn adaptive_raises_slowly_when_clean() {
+        // ≥3 clean ticks → +20%.
+        assert_eq!(
+            adapt_bitrate_step(10000, 2000, 25000, false, 1.0, 0, 3),
+            12000
+        );
+    }
+
+    #[test]
+    fn adaptive_raise_needs_three_ticks_and_caps_at_ceiling() {
+        assert_eq!(
+            adapt_bitrate_step(10000, 2000, 25000, false, 1.0, 0, 2),
+            10000
+        );
+        // 24000 × 1.2 = 28800, capped to the ceiling.
+        assert_eq!(
+            adapt_bitrate_step(24000, 2000, 25000, false, 1.0, 0, 3),
+            25000
+        );
+    }
+
+    #[test]
+    fn adaptive_clamps_to_floor() {
+        // 3000 × 0.1 = 300 → floor.
+        assert_eq!(adapt_bitrate_step(3000, 2000, 25000, true, 0.1, 2, 0), 2000);
+    }
+
+    #[test]
+    fn adaptive_floor_never_exceeds_ceiling() {
+        // Ceiling below the nominal floor: the effective floor is the ceiling.
+        assert_eq!(adapt_bitrate_step(1500, 2000, 1500, true, 0.5, 2, 0), 1500);
+    }
 
     #[test]
     fn status_reflects_connected_client() {
