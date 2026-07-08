@@ -1318,7 +1318,10 @@ impl ApplicationHandler<UserEvent> for App {
             // spawn the capture thread ONCE (issue #14). The thread outlives every
             // reconnect; only the shared sink is re-pointed as sources cycle.
             self.refresh_gamepad_sink();
-            crate::gamepad::run_gamepad_capture(self.gamepad_sink.clone(), self.input_source.clone());
+            crate::gamepad::run_gamepad_capture(
+                self.gamepad_sink.clone(),
+                self.input_source.clone(),
+            );
         }
     }
 
@@ -1484,8 +1487,10 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.grab_wanted != captured {
                     self.grab_wanted = captured;
                     self.apply_grab();
-                    tracing::info!("host cursor {} → client grab_wanted={captured}",
-                        if captured { "CAPTURED" } else { "FREE" });
+                    tracing::info!(
+                        "host cursor {} → client grab_wanted={captured}",
+                        if captured { "CAPTURED" } else { "FREE" }
+                    );
                 }
             }
         }
@@ -1649,8 +1654,8 @@ impl App {
     /// have one source). Multi-source routing follows the pointer: the source
     /// the cursor is currently over receives the events, falling back to 0.
     fn send_to_active(&self, ev: core_proto::InputEvent) {
-        use core_proto::InputEvent as IE;
         use crate::gamepad::SRC_KBDMOUSE;
+        use core_proto::InputEvent as IE;
         use std::sync::atomic::Ordering;
         // Last-used-device arbitration (matches the pad side in `gamepad.rs`):
         // bare pointer motion is the flood a free cursor generates (edge-escape,
@@ -3004,7 +3009,9 @@ pub fn run(cfg: PlayerCfg) -> Result<()> {
         fullscreen: false,
         suspended: false,
         gamepad_sink: Arc::new(Mutex::new(None)),
-        input_source: Arc::new(std::sync::atomic::AtomicU8::new(crate::gamepad::SRC_KBDMOUSE)),
+        input_source: Arc::new(std::sync::atomic::AtomicU8::new(
+            crate::gamepad::SRC_KBDMOUSE,
+        )),
         held_keys: std::collections::HashSet::new(),
         held_buttons: std::collections::HashSet::new(),
         grab_wanted: false,
