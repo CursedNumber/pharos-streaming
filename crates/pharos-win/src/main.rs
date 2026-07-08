@@ -1763,6 +1763,23 @@ fn run_pad_test(secs: u64) -> anyhow::Result<()> {
 
 #[cfg(windows)]
 fn init_tracing() {
+    // Enable the Windows console's virtual-terminal processing so the ANSI colour
+    // codes tracing emits render as colours, not literal `<ESC>[2m` garbage in the
+    // pharos-host PowerShell/cmd window. Old conhost defaults VT off; Win10 1511+
+    // supports enabling it. Best-effort: on failure we just keep the raw output.
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Console::{
+            GetConsoleMode, GetStdHandle, SetConsoleMode, CONSOLE_MODE,
+            ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE,
+        };
+        if let Ok(h) = GetStdHandle(STD_OUTPUT_HANDLE) {
+            let mut mode = CONSOLE_MODE(0);
+            if GetConsoleMode(h, &mut mode).is_ok() {
+                let _ = SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            }
+        }
+    }
     if let Ok(filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
         tracing_subscriber::fmt().with_env_filter(filter).init();
     } else {

@@ -59,6 +59,9 @@ windows = { version = "0.52", features = [
     "Win32_System_WinRT_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
     "Win32_System_Com",
+    # Enable the console's virtual-terminal processing so tracing's ANSI colours
+    # render instead of showing as literal escape sequences in the host console.
+    "Win32_System_Console",
 ] }
 
 [[bin]]
