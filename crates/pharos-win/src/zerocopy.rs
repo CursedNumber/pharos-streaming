@@ -528,6 +528,7 @@ fn blob_bytes(blob: &ID3DBlob) -> &[u8] {
 
 /// The capture+encode thread body. Owns every COM/NVENC object; returns Err
 /// only for init or fatal runtime faults (recorded by the spawn wrapper).
+#[allow(clippy::too_many_arguments)]
 fn zc_loop(
     hmon: windows::Win32::Graphics::Gdi::HMONITOR,
     fps: u32,
