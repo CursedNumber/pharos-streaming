@@ -1207,6 +1207,13 @@ struct App {
     /// forwarding while a controller is in use, so a free cursor drifting to the
     /// window edge stops fighting the pad for the game's active-device focus.
     input_source: crate::gamepad::InputSource,
+    /// Keys/pointer-buttons we have forwarded a press for and not yet a release,
+    /// so we can release them all when the window loses focus. Without this an
+    /// alt-tab loses the key-up events (they fire while unfocused, or the OS eats
+    /// the alt-tab chord), leaving the host's virtual keyboard with a stuck key
+    /// (e.g. Alt) so the next focus session reads every keystroke as Alt+key.
+    held_keys: std::collections::HashSet<u32>,
+    held_buttons: std::collections::HashSet<u8>,
     /// The user's cursor-grab intent (issue #5) — flipped by the `toggle_grab`
     /// hotkey. Persists across focus loss so alt-tab-and-back resumes mouselook.
     grab_wanted: bool,
@@ -1520,15 +1527,21 @@ impl ApplicationHandler<UserEvent> for App {
             WE::RedrawRequested => self.render(),
             WE::Focused(f) => {
                 self.focused = f;
-                // On focus loss, release modifier state so a stuck Shift /
-                // Alt doesn't get carried over to the next focus session.
+                // On focus loss, release every key/button we still hold on the
+                // host: their up events fire while unfocused (or the OS ate the
+                // alt-tab chord), so without this the host keeps them pressed and
+                // the next focus session is stuck-key broken (a held Alt turns
+                // every keystroke into Alt+key). Also clear the local modifier
+                // state so a stuck Shift/Alt isn't carried over.
                 if !f {
+                    self.release_all_held();
                     self.mods = core_proto::Modifiers::default();
                 }
                 // Reconcile the grab: release when we lose focus (don't trap the
                 // cursor on alt-tab), re-grab when we regain it if the user still
                 // wants mouselook.
                 self.apply_grab();
+                self.reconcile_cursor();
             }
             WE::ModifiersChanged(m) => {
                 let st = m.state();
@@ -1543,16 +1556,25 @@ impl ApplicationHandler<UserEvent> for App {
             WE::CursorMoved { position, .. } => {
                 let (x, y) = (position.x as f32, position.y as f32);
                 self.cursor = Some((x, y));
-                self.cursor_cell = self
+                let new_cell = self
                     .cells
                     .iter()
                     .find(|c| x >= c.x && x < c.x + c.w && y >= c.y && y < c.y + c.h)
                     .map(|c| c.source);
+                let cell_changed = new_cell != self.cursor_cell;
+                self.cursor_cell = new_cell;
                 self.handle_pointer_move();
+                // Only on enter/leave a cell (not every move): toggle the local
+                // cursor so it's hidden over the video (the host cursor shows
+                // there) and visible over the client's chrome.
+                if cell_changed {
+                    self.reconcile_cursor();
+                }
             }
             WE::CursorLeft { .. } => {
                 self.cursor = None;
                 self.cursor_cell = None;
+                self.reconcile_cursor();
             }
             WE::MouseInput { state, button, .. } => self.handle_mouse_button(state, button),
             WE::MouseWheel { delta, .. } => self.handle_mouse_wheel(delta),
@@ -1671,7 +1693,20 @@ impl App {
             self.mods,
         );
         match decision {
-            KeyDecision::Forward(input_ev) => self.send_to_active(input_ev),
+            KeyDecision::Forward(input_ev) => {
+                // Track the held set so a focus loss can release it (stuck-key fix).
+                if let core_proto::InputEvent::Key {
+                    scancode, pressed, ..
+                } = input_ev
+                {
+                    if pressed {
+                        self.held_keys.insert(scancode);
+                    } else {
+                        self.held_keys.remove(&scancode);
+                    }
+                }
+                self.send_to_active(input_ev);
+            }
             KeyDecision::Hotkey(name) => self.handle_hotkey(el, name),
             KeyDecision::Local | KeyDecision::Drop => {
                 // Local: let winit's default take over (which on Windows means
@@ -1686,6 +1721,7 @@ impl App {
             "toggle_capture" => {
                 self.capture_toggle_on = !self.capture_toggle_on;
                 tracing::info!("capture toggle = {}", self.capture_toggle_on);
+                self.reconcile_cursor();
             }
             "toggle_fullscreen" => {
                 self.fullscreen = !self.fullscreen;
@@ -1731,9 +1767,47 @@ impl App {
             } else {
                 let _ = win.set_cursor_grab(CursorGrabMode::None);
             }
-            win.set_cursor_visible(!want);
         }
+        self.reconcile_cursor();
         tracing::info!("cursor grab (relative mouse) = {want}");
+    }
+
+    /// Send a release for every key/pointer-button with an outstanding press
+    /// ([`Self::held_keys`]/[`Self::held_buttons`]), then clear both. Called on
+    /// focus loss so an alt-tab can never strand a key/button held down on the
+    /// host's virtual input.
+    fn release_all_held(&mut self) {
+        let keys: Vec<u32> = self.held_keys.drain().collect();
+        for scancode in keys {
+            self.send_to_active(core_proto::InputEvent::Key {
+                scancode,
+                pressed: false,
+                mods: core_proto::Modifiers::default(),
+            });
+        }
+        let buttons: Vec<u8> = self.held_buttons.drain().collect();
+        for button in buttons {
+            self.send_to_active(core_proto::InputEvent::PointerButton {
+                button,
+                pressed: false,
+            });
+        }
+    }
+
+    /// Hide the local OS cursor when the host's own cursor is the one that
+    /// matters: while grabbed (relative/FPS), or while forwarding absolute
+    /// pointer motion over a source cell. Otherwise both the local cursor and the
+    /// host cursor rendered into the video show at once (a double pointer). Stays
+    /// visible over the client's own chrome, when capture is off, and in view-only
+    /// mode. Cheap and idempotent; call on any state transition.
+    fn reconcile_cursor(&self) {
+        if let Some(win) = &self.window {
+            let hide = self.grabbed
+                || (self.capture_active()
+                    && self.cfg.input.forward_mouse
+                    && self.cursor_cell.is_some());
+            win.set_cursor_visible(!hide);
+        }
     }
 
     fn handle_pointer_move(&mut self) {
@@ -1766,6 +1840,14 @@ impl App {
         }
         if let Some(ev) = crate::input::classify_mouse_button(&self.cfg.input, true, button, state)
         {
+            // Track held buttons so a focus loss releases them (stuck-button fix).
+            if let core_proto::InputEvent::PointerButton { button, pressed } = ev {
+                if pressed {
+                    self.held_buttons.insert(button);
+                } else {
+                    self.held_buttons.remove(&button);
+                }
+            }
             self.send_to_active(ev);
         }
     }
@@ -2923,6 +3005,8 @@ pub fn run(cfg: PlayerCfg) -> Result<()> {
         suspended: false,
         gamepad_sink: Arc::new(Mutex::new(None)),
         input_source: Arc::new(std::sync::atomic::AtomicU8::new(crate::gamepad::SRC_KBDMOUSE)),
+        held_keys: std::collections::HashSet::new(),
+        held_buttons: std::collections::HashSet::new(),
         grab_wanted: false,
         grabbed: false,
     };
