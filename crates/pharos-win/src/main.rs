@@ -737,6 +737,11 @@ fn run_stream(
     let hostname = host_info::hostname();
     let (encoder_label, codec_label) = encoder_labels(encoder);
     let frames = Arc::new(AtomicU64::new(0));
+    // Encoded bytes actually handed to the transport — the encoder's GROUND-TRUTH
+    // output rate. The adaptive-bitrate loop logs it per window: at very low
+    // targets 4K60 HEVC has a physical rate floor CBR cannot go under, and only
+    // this counter (not the requested target) shows the real offered load.
+    let sent_bytes = Arc::new(AtomicU64::new(0));
     // P6 GPU-health plane: the supervisor loop below is the SOLE writer; the ~4Hz
     // status thread reads it into HostStatus.gpu_health.
     let gpu_health = Arc::new(Mutex::new(control_ipc::GpuHealth::Healthy));
@@ -1022,8 +1027,12 @@ fn run_stream(
     let bitrate_ctl = zerocopy::BitrateCtl::default();
     if matches!(capture, CaptureBackend::WgcZc) {
         if let Some(mut qos_rx) = streamer.take_qos_rx() {
-            let (streamer_b, frames_b, ctl_b) =
-                (streamer.clone(), frames.clone(), bitrate_ctl.clone());
+            let (streamer_b, frames_b, bytes_b, ctl_b) = (
+                streamer.clone(),
+                frames.clone(),
+                sent_bytes.clone(),
+                bitrate_ctl.clone(),
+            );
             std::thread::Builder::new()
                 .name("wgc-bitrate-ctl".into())
                 .spawn(move || {
@@ -1043,6 +1052,12 @@ fn run_stream(
                     // Ticks left in the post-respawn grace window (no adaptation).
                     let mut grace_ticks = 0u32;
                     let mut last_frames = frames_b.load(Ordering::Relaxed);
+                    // Encoded bytes last seen — per-window delta = the encoder's TRUE
+                    // output rate. At a very low target this diverges from the target
+                    // (4K60 HEVC has a physical rate floor CBR cannot go under), and
+                    // that divergence is the difference between "the link is weak" and
+                    // "we are asking the impossible".
+                    let mut last_bytes = bytes_b.load(Ordering::Relaxed);
                     // Cumulative transport queue drops last seen (P + keyframes). The
                     // per-tick DELTA is the first-order local congestion signal: the
                     // queue sheds the moment offered rate exceeds the path, with zero
@@ -1073,6 +1088,7 @@ fn run_stream(
                             }
                             while qos_rx.try_recv().is_ok() {}
                             last_frames = frames_b.load(Ordering::Relaxed);
+                            last_bytes = bytes_b.load(Ordering::Relaxed);
                             last_drops = {
                                 let (p, k) = streamer_b.dropped_frames();
                                 p + k
@@ -1084,6 +1100,7 @@ fn run_stream(
                         if conn.is_none() || ceiling == 0 {
                             while qos_rx.try_recv().is_ok() {}
                             last_frames = frames_b.load(Ordering::Relaxed);
+                            last_bytes = bytes_b.load(Ordering::Relaxed);
                             last_drops = {
                                 let (p, k) = streamer_b.dropped_frames();
                                 p + k
@@ -1113,6 +1130,7 @@ fn run_stream(
                             grace_ticks = 3;
                             while qos_rx.try_recv().is_ok() {}
                             last_frames = frames_b.load(Ordering::Relaxed);
+                            last_bytes = bytes_b.load(Ordering::Relaxed);
                             last_drops = {
                                 let (p, k) = streamer_b.dropped_frames();
                                 p + k
@@ -1128,6 +1146,7 @@ fn run_stream(
                             grace_ticks -= 1;
                             while qos_rx.try_recv().is_ok() {}
                             last_frames = frames_b.load(Ordering::Relaxed);
+                            last_bytes = bytes_b.load(Ordering::Relaxed);
                             last_drops = {
                                 let (p, k) = streamer_b.dropped_frames();
                                 p + k
@@ -1149,6 +1168,11 @@ fn run_stream(
                         let send_fps = f.saturating_sub(last_frames) as f32 / secs;
                         let sent_frames = f.saturating_sub(last_frames).max(1);
                         last_frames = f;
+                        // The encoder's true output rate this window (see `last_bytes`).
+                        let b = bytes_b.load(Ordering::Relaxed);
+                        let send_kbps = (b.saturating_sub(last_bytes) as f32 * 8.0 / 1000.0
+                            / secs) as u32;
+                        last_bytes = b;
                         // Transport-queue drops this window: the local, zero-latency
                         // congestion signal. Any shed frame means offered > path RIGHT
                         // NOW — no waiting for the client's next QoS datagram (which
@@ -1216,13 +1240,30 @@ fn run_stream(
                         {
                             ctl_b.target_kbps.store(allowed, Ordering::Relaxed);
                             info!(
-                                "adaptive bitrate: {pushed} -> {allowed} kbps (recv_fps~{recv_fps_ewma:.0} \
-                                 send_fps~{send_fps:.0} qdrops={q_drops} loss={loss}permille rtt={}ms \
-                                 base={}ms bloat={bloat} ssthresh={ssthresh} ceiling={ceiling})",
+                                "adaptive bitrate: {pushed} -> {allowed} kbps (true_send={send_kbps} \
+                                 kbps recv_fps~{recv_fps_ewma:.0} send_fps~{send_fps:.0} \
+                                 qdrops={q_drops} loss={loss}permille rtt={}ms base={}ms \
+                                 bloat={bloat} ssthresh={ssthresh} ceiling={ceiling})",
                                 rtt / 1000,
                                 base_rtt_us / 1000
                             );
                             pushed = allowed;
+                        } else if q_drops > 0 {
+                            // The queue is shedding but the actuator has nowhere to move
+                            // (typically parked at the floor). Without this line every
+                            // printed sample comes from a clean window — the sampling
+                            // bias that made a sustained floor-overflow look like
+                            // "qdrops=0 the whole time". `true_send` vs the target is
+                            // the key readout: 4K60 HEVC cannot be compressed below a
+                            // physical rate floor, so a big divergence here means the
+                            // fix is fewer pixels (the resolution ladder), not fewer
+                            // bits.
+                            tracing::warn!(
+                                "adaptive bitrate: HOLDING {allowed} kbps but still shedding \
+                                 (true_send={send_kbps} kbps qdrops={q_drops} loss={loss}permille \
+                                 rtt={}ms bloat={bloat})",
+                                rtt / 1000,
+                            );
                         }
                     }
                 })?;
@@ -1291,7 +1332,14 @@ fn run_stream(
                 m.publish_state("state", "streaming");
             }
 
-            let reason = inner_pump_zc(&pipeline, &frames, &streamer, inject.as_ref(), generation);
+            let reason = inner_pump_zc(
+                &pipeline,
+                &frames,
+                &sent_bytes,
+                &streamer,
+                inject.as_ref(),
+                generation,
+            );
             pipeline.stop();
 
             if gen_start.elapsed() >= Duration::from_secs(3) {
@@ -1827,6 +1875,7 @@ fn inner_pump(
 fn inner_pump_zc(
     pipeline: &zerocopy::ZcPipeline,
     frames: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    sent_bytes: &std::sync::Arc<std::sync::atomic::AtomicU64>,
     streamer: &std::sync::Arc<transport::QuicStreamer>,
     inject: Option<&InjectSpec>,
     generation: u64,
@@ -1855,6 +1904,7 @@ fn inner_pump_zc(
         match pipeline.recv_timeout(Duration::from_millis(200)) {
             zerocopy::ZcRecv::Au(au) => {
                 frames.fetch_add(1, Ordering::Relaxed);
+                sent_bytes.fetch_add(au.bytes.len() as u64, Ordering::Relaxed);
                 gen_frames += 1;
                 streamer.send_frame(au.bytes, au.keyframe);
                 if let Some(spec) = inject {
