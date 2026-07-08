@@ -280,10 +280,21 @@ const WINDOW_START_BYTES: u32 = 2 * 1024 * 1024;
 /// than the ≤1s until the next resize (64KB per ~10ms LAN RTT ≈ 50 Mbps).
 const WINDOW_FLOOR_BYTES: u32 = 64 * 1024;
 
-/// The adaptive receive-window target for a measured video byte rate: ~250ms
-/// of buffer at that rate, clamped to [floor, cap]. Pure for unit tests.
-fn adaptive_window_target(rate_bytes_per_sec: f32) -> u32 {
-    ((rate_bytes_per_sec / 4.0) as u32).clamp(WINDOW_FLOOR_BYTES, WINDOW_CAP_BYTES)
+/// The adaptive receive-window target: ~250ms of buffer at the measured video
+/// rate, but never smaller than 3× the largest recent AU, clamped to
+/// [floor, cap]. The AU term breaks the floor-rate IDR limit cycle found live
+/// 2026-07-09: at a floor-braked 2 Mbps the 250ms budget (~64KB) is about ONE
+/// 4K IDR, so every forced IDR filled the whole window, blocked the sender,
+/// shed a few frames from the host queue — and the shed requested the next
+/// forced IDR a second later, forever (a clean 1-2ms wire showing single-digit
+/// qdrops every second, controller parked at the floor). Sizing for the real
+/// AUs in flight keeps keyframes swallowable at every rate; at high rates the
+/// rate budget dominates (60 Mbps: ~1.9MB budget vs ~1.5MB for 3× a VBV-capped
+/// 500KB IDR). Pure for unit tests.
+fn adaptive_window_target(rate_bytes_per_sec: f32, max_au_bytes: u32) -> u32 {
+    ((rate_bytes_per_sec / 4.0) as u32)
+        .max(max_au_bytes.saturating_mul(3))
+        .clamp(WINDOW_FLOOR_BYTES, WINDOW_CAP_BYTES)
 }
 
 /// Insecure verifier — accepts any server cert. Loopback/testing only; the real
@@ -4168,6 +4179,9 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
         // Video bytes received this QoS window — feeds the adaptive receive-window
         // sizing (the receiver-side latency bound; see `transport_config`).
         let recv_bytes = std::sync::atomic::AtomicU64::new(0);
+        // Largest AU seen this QoS window — the window must always be able to
+        // swallow a whole keyframe (see `adaptive_window_target`).
+        let recv_max_au = std::sync::atomic::AtomicU64::new(0);
 
         // Video on the uni stream; audio as unreliable datagrams. Both run
         // concurrently on this one task (no spawn → no Send/'static bound on the
@@ -4196,6 +4210,7 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
                 on_frame(buf);
                 recv_count.fetch_add(1, Ordering::Relaxed);
                 recv_bytes.fetch_add(4 + len as u64, Ordering::Relaxed);
+                recv_max_au.fetch_max(len as u64, Ordering::Relaxed);
             }
             // The stream ended. If the host CLOSED us with one of its deliberate
             // application codes (preempt / reserved-by-primary / unpaired),
@@ -4244,6 +4259,11 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
             let window_adaptive = stream_window_pin().is_none();
             let mut rate_ewma: f32 = 0.0;
             let mut window_applied: u32 = WINDOW_START_BYTES;
+            // Rolling per-tick maxima of the largest AU, spanning ~5s — longer
+            // than the host's 4s IDR period, so the window never shrinks below
+            // keyframe size just because the last second happened to hold none.
+            let mut au_maxes = [0u64; 5];
+            let mut au_ix = 0usize;
             loop {
                 tokio::select! {
                     biased;
@@ -4376,7 +4396,11 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
                             } else {
                                 0.5 * rate_ewma + 0.5 * bytes // slow down: decay over ~3-4s
                             };
-                            let target = adaptive_window_target(rate_ewma);
+                            au_maxes[au_ix] = recv_max_au.swap(0, Ordering::Relaxed);
+                            au_ix = (au_ix + 1) % au_maxes.len();
+                            let max_au = au_maxes.iter().copied().max().unwrap_or(0);
+                            let target =
+                                adaptive_window_target(rate_ewma, max_au.min(u64::from(u32::MAX)) as u32);
                             if target.abs_diff(window_applied).saturating_mul(4) > window_applied {
                                 conn.set_receive_window(quinn::VarInt::from_u32(target));
                                 tracing::debug!(
@@ -5275,21 +5299,27 @@ mod tests {
     fn adaptive_window_target_tracks_rate_within_clamps() {
         use super::{adaptive_window_target, WINDOW_CAP_BYTES, WINDOW_FLOOR_BYTES};
         // Idle / tiny rates clamp to the floor.
-        assert_eq!(adaptive_window_target(0.0), WINDOW_FLOOR_BYTES);
-        assert_eq!(adaptive_window_target(100_000.0), WINDOW_FLOOR_BYTES);
+        assert_eq!(adaptive_window_target(0.0, 0), WINDOW_FLOOR_BYTES);
+        assert_eq!(adaptive_window_target(100_000.0, 0), WINDOW_FLOOR_BYTES);
         // A braked 2 Mbps stream (250 KB/s) sits just at/above the floor — the
         // live regression: a 512KB floor here was 2s of standing buffer (~5s
         // pointer lag measured); the floor must track the ~250ms budget.
-        assert_eq!(adaptive_window_target(250_000.0), WINDOW_FLOOR_BYTES);
+        assert_eq!(adaptive_window_target(250_000.0, 0), WINDOW_FLOOR_BYTES);
         assert!(u64::from(WINDOW_FLOOR_BYTES) * 4 <= 1_000_000); // ≤ ~1s at 2 Mbps
-                                                                 // 10 Mbps couch stream = 1.25 MB/s → ~312KB of 250ms budget.
-        assert_eq!(adaptive_window_target(1_250_000.0), 1_250_000 / 4);
-        // 60 Mbps (the hosts' encode ceiling) = 7.5 MB/s → ~1.9MB of 250ms budget.
-        let at_ceiling = adaptive_window_target(7_500_000.0);
+                                                                 // …but a keyframe must always fit: with 40KB IDRs in flight the window
+                                                                 // is 3× the IDR, not the bare rate budget (the floor-rate IDR limit
+                                                                 // cycle: window ≈ one IDR → every keyframe stalls the sender → shed →
+                                                                 // another forced IDR → parked at the floor forever).
+        assert_eq!(adaptive_window_target(250_000.0, 40_000), 120_000);
+        // 10 Mbps couch stream = 1.25 MB/s → ~312KB of 250ms budget.
+        assert_eq!(adaptive_window_target(1_250_000.0, 0), 1_250_000 / 4);
+        // 60 Mbps (the hosts' encode ceiling) = 7.5 MB/s → ~1.9MB of 250ms
+        // budget, which dominates 3× even a VBV-capped 500KB IDR.
+        let at_ceiling = adaptive_window_target(7_500_000.0, 500_000);
         assert_eq!(at_ceiling, 7_500_000 / 4);
         assert!(at_ceiling > WINDOW_FLOOR_BYTES && at_ceiling < WINDOW_CAP_BYTES);
         // Absurd rates clamp to the memory cap.
-        assert_eq!(adaptive_window_target(1e9), WINDOW_CAP_BYTES);
+        assert_eq!(adaptive_window_target(1e9, 0), WINDOW_CAP_BYTES);
     }
 
     /// Issue #13: the pure input-coalescing logic. Under backpressure motion is
