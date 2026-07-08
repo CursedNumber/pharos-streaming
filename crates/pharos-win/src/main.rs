@@ -1746,14 +1746,19 @@ fn inner_pump_zc(
     let mut gen_frames: u64 = 0;
     let mut last_log = Instant::now();
     loop {
-        // Forward a client's DG_REQUEST_IDR (set on the streamer by the
-        // transport's datagram task, also self-set on a queue drop) to the
-        // encoder thread so the next picture is an IDR — a client rebuilding
-        // its decode chain (issue #32) resyncs in ~1 RTT instead of waiting
-        // out the periodic IDR. Polled every AU (~1 frame) or 200ms timeout;
-        // the encode loop applies its own min-interval coalescing.
-        if streamer.take_idr_request() {
+        // Forward pending on-demand IDR requests to the encoder thread, kept
+        // separate by source: a client's DG_REQUEST_IDR (it is rebuilding its
+        // decode chain, issue #32) is honoured fast (~150ms coalesce), while
+        // the host's own drop-recovery trigger coalesces at ~1s — under
+        // sustained congestion every queued frame drops, and honouring each at
+        // the client rate is a 4-6Hz forced-IDR storm that feeds itself.
+        // Polled every AU (~1 frame) or 200ms timeout.
+        let (client_idr, drop_idr) = streamer.take_idr_requests_split();
+        if client_idr {
             pipeline.request_idr();
+        }
+        if drop_idr {
+            pipeline.request_idr_after_drop();
         }
         match pipeline.recv_timeout(Duration::from_millis(200)) {
             zerocopy::ZcRecv::Au(au) => {

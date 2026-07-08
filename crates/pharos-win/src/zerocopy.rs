@@ -104,6 +104,12 @@ pub struct ZcPipeline {
     /// by the supervisor pump). The encode loop swaps it false and forces the
     /// next picture to an IDR, rate-limited like the Linux host.
     idr_req: Arc<AtomicBool>,
+    /// One-shot drop-recovery keyframe request (the transport queue shed an AU).
+    /// Coalesced much harder than `idr_req` (~1s vs ~150ms): under sustained
+    /// congestion every frame drops, and honouring each at the client-request
+    /// rate is a 4-6Hz forced-IDR storm whose oversized keyframes deepen the
+    /// congestion (the live "quality pulse" on the 4K HDR path).
+    drop_idr_req: Arc<AtomicBool>,
     fault: Arc<Mutex<Option<String>>>,
     thread: Option<std::thread::JoinHandle<()>>,
     /// The off-encode-thread HDR-active poll (issue #29), if this generation watches
@@ -163,6 +169,7 @@ impl ZcPipeline {
 
         let stop = Arc::new(AtomicBool::new(false));
         let idr_req = Arc::new(AtomicBool::new(false));
+        let drop_idr_req = Arc::new(AtomicBool::new(false));
         let fault = Arc::new(Mutex::new(None));
         // Latched by the poll thread when the monitor's HDR-active state diverges from
         // what this generation built; zc_loop reads it cheaply each tick and faults so
@@ -175,6 +182,7 @@ impl ZcPipeline {
         let hdr_changed_z = hdr_changed.clone();
         let ctl_z = ctl.clone();
         let idr_t = idr_req.clone();
+        let drop_idr_t = drop_idr_req.clone();
         // Captured for the poll thread below, before `hmon`/`hdr` move into the encode
         // closure (HMONITOR travels as its raw isize; `hdr` is Copy).
         let (hmon_isize, built_hdr) = (hmon.0, hdr);
@@ -188,6 +196,7 @@ impl ZcPipeline {
                     &hdr_changed_z,
                     &stop_t,
                     &idr_t,
+                    &drop_idr_t,
                     &ctl_z,
                     init_tx.clone(),
                     au_tx,
@@ -247,6 +256,7 @@ impl ZcPipeline {
             au_rx: Some(au_rx),
             stop,
             idr_req,
+            drop_idr_req,
             fault,
             thread: Some(thread),
             poll_thread,
@@ -255,9 +265,16 @@ impl ZcPipeline {
 
     /// Ask the encode loop to make the next picture an IDR (on-demand keyframe,
     /// e.g. a client resyncing after a decode-chain rebuild — issue #32). The
-    /// loop coalesces requests within its min-IDR interval.
+    /// loop coalesces requests within its min-IDR interval (~150ms).
     pub fn request_idr(&self) {
         self.idr_req.store(true, Ordering::Relaxed);
+    }
+
+    /// Ask for a drop-recovery IDR (the transport queue shed an AU and the
+    /// client will smear until a keyframe). Coalesced far harder (~1s) than
+    /// [`Self::request_idr`] so sustained congestion cannot IDR-storm.
+    pub fn request_idr_after_drop(&self) {
+        self.drop_idr_req.store(true, Ordering::Relaxed);
     }
 
     /// Next AU, waiting up to `dur`.
@@ -554,8 +571,13 @@ fn zc_loop(
     hdr_changed: &AtomicBool,
     stop: &AtomicBool,
     // One-shot on-demand keyframe request (client `DG_REQUEST_IDR`, issue #32):
-    // swapped false each tick; forces the next picture to an IDR, coalesced.
+    // swapped false each tick; forces the next picture to an IDR, coalesced at
+    // ~150ms (client requests deserve speed — a decode-chain rebuild is waiting).
     idr_req: &AtomicBool,
+    // One-shot drop-recovery keyframe request (the transport queue shed an AU):
+    // swapped false each tick; coalesced at ~1s so sustained congestion cannot
+    // become a 4-6Hz forced-IDR storm that feeds itself.
+    drop_idr_req: &AtomicBool,
     // Adaptive-bitrate cell (issue #30): read `target_kbps` each tick and reconfigure
     // the live NVENC session in place; publish `ceiling_kbps` at build (in the config
     // block above).
@@ -728,16 +750,25 @@ fn zc_loop(
     // Adaptive bitrate (issue #30): the CBR value NVENC is currently configured for;
     // reconfigured in place below when the control loop moves `ctl.target_kbps`.
     let mut applied_kbps = kbps;
-    // On-demand IDR coalescing, mirroring the Linux host (multi.rs): honour a
-    // client `DG_REQUEST_IDR` by forcing the next picture to an IDR, but drop
-    // requests landing within the min interval of the last keyframe (periodic
-    // or forced) — a fresh IDR already gave a clean reference, and this caps
-    // the IDR-byte cost under sustained loss. Same env lever as Linux.
+    // On-demand IDR coalescing: honour a client `DG_REQUEST_IDR` by forcing the
+    // next picture to an IDR, but drop requests landing within the min interval
+    // of the last keyframe (periodic or forced) — a fresh IDR already gave a
+    // clean reference. Same env lever as Linux. Drop-recovery requests get a
+    // much LONGER interval: under sustained congestion every queued frame
+    // drops, and honouring each at the client rate is a 4-6Hz forced-IDR storm
+    // whose oversized keyframes deepen the very congestion that caused the
+    // drops (the live 4K HDR "quality pulse"). 1s still beats the 4s periodic.
     let min_idr_interval = Duration::from_millis(
         std::env::var("PHAROS_MIN_IDR_INTERVAL_MS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(150),
+    );
+    let drop_idr_interval = Duration::from_millis(
+        std::env::var("PHAROS_DROP_IDR_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000),
     );
     let mut last_idr_at: Option<Instant> = None;
     loop {
@@ -821,9 +852,15 @@ fn zc_loop(
         // queue). HDR attaches the SEI to forced IDRs too, so a mid-GOP joiner
         // still gets the mastering/CLL metadata.
         let periodic = frame_no.is_multiple_of(u64::from(idr_period_frames(fps)));
-        let forced = idr_req.swap(false, Ordering::Relaxed)
-            && !periodic
-            && last_idr_at.is_none_or(|t| t.elapsed() >= min_idr_interval);
+        // Both swaps run unconditionally (consume = coalesce, never queue).
+        let (client_req, drop_req) = (
+            idr_req.swap(false, Ordering::Relaxed),
+            drop_idr_req.swap(false, Ordering::Relaxed),
+        );
+        let idr_ok = |min: Duration| last_idr_at.is_none_or(|t| t.elapsed() >= min);
+        let forced = !periodic
+            && ((client_req && idr_ok(min_idr_interval))
+                || (drop_req && idr_ok(drop_idr_interval)));
         let params = if hdr && (periodic || forced) {
             sei_idr_params(&sei)
         } else if forced {
@@ -837,7 +874,12 @@ fn zc_loop(
         if forced {
             // The observable for validating on-demand resync (issue #32): one
             // line per honoured request, absent when coalesced.
-            tracing::info!("wgc-zc: forced IDR at frame {frame_no} (client DG_REQUEST_IDR)");
+            let why = if client_req && idr_ok(min_idr_interval) {
+                "client DG_REQUEST_IDR"
+            } else {
+                "drop recovery"
+            };
+            tracing::info!("wgc-zc: forced IDR at frame {frame_no} ({why})");
         }
         if periodic || forced {
             last_idr_at = Some(Instant::now());

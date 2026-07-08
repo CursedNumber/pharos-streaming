@@ -580,13 +580,22 @@ pub struct QuicStreamer {
     /// (previously it was a completely silent `let _ = try_send`).
     dropped_pframes: Arc<std::sync::atomic::AtomicU64>,
     dropped_keyframes: std::sync::atomic::AtomicU64,
-    /// Set when an on-demand IDR is wanted: by the host itself whenever it drops
-    /// a video AU (the reference chain just broke), and by the client via
-    /// `DG_REQUEST_IDR`. The compositor swaps it out each frame
-    /// ([`Self::take_idr_request`], rate-limited) and forces the next encode to
-    /// be a keyframe, collapsing the post-loss smear from ~1s (next periodic IDR)
-    /// to ~1 frame. `Arc` so the serve thread's datagram task can set it too.
+    /// Set when the CLIENT explicitly asks for an on-demand IDR via
+    /// `DG_REQUEST_IDR` (e.g. it is rebuilding its decode chain, issue #32).
+    /// The host swaps it out each frame ([`Self::take_idr_request`],
+    /// rate-limited) and forces the next encode to be a keyframe. `Arc` so the
+    /// serve thread's datagram task can set it too.
     request_idr: Arc<AtomicBool>,
+    /// Set by the host itself whenever it DROPS a video AU (the reference chain
+    /// just broke; the client will smear until a keyframe). Kept SEPARATE from
+    /// `request_idr` so a host can coalesce drop-recovery IDRs much harder than
+    /// client requests: under sustained congestion every queued frame drops, and
+    /// honouring each drop at the client-request rate (~150ms) turns into a
+    /// 4-6Hz forced-IDR storm whose oversized keyframes feed the very
+    /// congestion that caused the drops (seen live on the 4K HDR wgc-zc path).
+    /// [`Self::take_idr_request`] still folds both (the Linux compositor's
+    /// existing behaviour); [`Self::take_idr_requests_split`] reads them apart.
+    drop_idr: AtomicBool,
     /// Opus packets, sent as unreliable QUIC datagrams (see [`Self::send_audio`]).
     /// BOUNDED (drop-newest) so audio latency can't grow without limit when the
     /// datagram sender is briefly starved by a slow video `write_all` (they share
@@ -939,6 +948,7 @@ impl QuicStreamer {
             dropped_pframes,
             dropped_keyframes: std::sync::atomic::AtomicU64::new(0),
             request_idr,
+            drop_idr: AtomicBool::new(false),
             audio_tx,
             gyro_tx,
             connected,
@@ -1103,9 +1113,10 @@ impl QuicStreamer {
             }
         }
         // The reference chain just broke — ask the encoder for an on-demand IDR so
-        // the client resyncs in ~1 frame instead of waiting for the periodic one.
-        // The compositor rate-limits the actual force (see `take_idr_request`).
-        self.request_idr.store(true, Relaxed);
+        // the client resyncs instead of waiting for the periodic one. Recorded on
+        // the DROP flag (not `request_idr`) so hosts can coalesce drop-recovery
+        // separately from client requests; the caller rate-limits the force.
+        self.drop_idr.store(true, Relaxed);
     }
 
     /// Video AUs the bounded queue has dropped since start: `(p_frames, keyframes)`.
@@ -1122,10 +1133,28 @@ impl QuicStreamer {
     /// Take (and clear) a pending on-demand IDR request — returns true if the
     /// compositor should force the next encode to be a keyframe. Set by the host
     /// on a queue drop ([`Self::note_drop`]) and by the client via `DG_REQUEST_IDR`.
-    /// The compositor rate-limits how often it actually forces one.
+    /// The compositor rate-limits how often it actually forces one. Folds BOTH
+    /// sources (the Linux compositor's historical behaviour); a host that wants
+    /// to coalesce drop-recovery harder uses [`Self::take_idr_requests_split`].
     pub fn take_idr_request(&self) -> bool {
-        self.request_idr
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        use std::sync::atomic::Ordering::Relaxed;
+        // Swap both — `|` (not `||`) so the second flag is consumed even when
+        // the first is already true.
+        self.request_idr.swap(false, Relaxed) | self.drop_idr.swap(false, Relaxed)
+    }
+
+    /// Take (and clear) the pending on-demand IDR requests by source:
+    /// `(client_requested, drop_recovery)`. The first is a client's explicit
+    /// `DG_REQUEST_IDR` (resync fast — it is rebuilding its decode chain); the
+    /// second is the host's own note-a-drop trigger, which the caller should
+    /// coalesce much harder (see `drop_idr`'s field docs for the storm this
+    /// prevents).
+    pub fn take_idr_requests_split(&self) -> (bool, bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.request_idr.swap(false, Relaxed),
+            self.drop_idr.swap(false, Relaxed),
+        )
     }
 
     /// Queue one Opus audio packet. Delivered as an unreliable QUIC datagram
