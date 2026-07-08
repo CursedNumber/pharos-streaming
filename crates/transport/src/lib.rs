@@ -176,26 +176,80 @@ fn transport_config() -> Result<Arc<quinn::TransportConfig>> {
         std::time::Duration::from_secs(20),
     )?));
     t.keep_alive_interval(Some(std::time::Duration::from_secs(2)));
-    // Bound the QUIC flow-control windows. quinn's default per-stream receive
-    // window (~1.25MB) lets the sender buffer ~1-2s of encoded video before
-    // flow-control blocks it — a fixed *byte* buffer, so a LOWER bitrate makes the
-    // latency WORSE in seconds (window/bitrate). Capping the window bounds the
-    // in-flight+buffered video to ~window/bitrate. PHAROS_STREAM_WINDOW_KB tunes it
-    // (default 256KB ≈ 200ms @10Mbps; lower = less latency, less jitter tolerance).
-    // The window must comfortably exceed the bandwidth-delay product (~75KB at
-    // 20Mbps over WiFi) or throughput throttles.
-    let win_kb: u32 = std::env::var("PHAROS_STREAM_WINDOW_KB")
+    // Bound the QUIC flow-control windows. An unbounded (or oversized) receive
+    // window lets the sender buffer seconds of encoded video before flow-control
+    // pushes back — a fixed *byte* buffer, so a LOWER bitrate makes the latency
+    // WORSE in seconds (window/bitrate). But a fixed SMALL window strangles a
+    // high-bitrate stream instead: a single 4K IDR can exceed the whole window,
+    // serializing every keyframe over multiple credit round-trips (the
+    // `write_all slow` stalls seen live at 45-60 Mbps against the old 256KB
+    // default, which was tuned for a 10 Mbps 1080p couch stream).
+    //
+    // So the split is: the per-stream window and the sender's send-window are
+    // plain MEMORY CAPS set high enough for any stream this project encodes
+    // (the hosts clamp at 60 Mbps; 8MB ≈ 1s at that ceiling), while the
+    // LATENCY bound lives at the receiver, which resizes the connection-level
+    // receive window at runtime to ~250ms of its MEASURED video rate (see the
+    // QoS tick in `run_video_client_with_input`) — the one place the true rate
+    // is known. `PHAROS_STREAM_WINDOW_KB` remains as a pin: when set, all three
+    // windows take that fixed value and the runtime adaptation stays off
+    // (compat with the documented SBC tuning recipes).
+    match stream_window_pin() {
+        Some(win_kb) => {
+            let win_bytes = win_kb.saturating_mul(1024);
+            let win = quinn::VarInt::from_u32(win_bytes);
+            t.stream_receive_window(win);
+            t.receive_window(win);
+            t.send_window(u64::from(win_bytes));
+            tracing::info!(
+                "QUIC flow-control window: pinned {win_kb} KB (PHAROS_STREAM_WINDOW_KB; \
+                 adaptive sizing off)"
+            );
+        }
+        None => {
+            t.stream_receive_window(quinn::VarInt::from_u32(WINDOW_CAP_BYTES));
+            t.receive_window(quinn::VarInt::from_u32(WINDOW_START_BYTES));
+            t.send_window(u64::from(WINDOW_CAP_BYTES));
+            tracing::info!(
+                "QUIC flow-control window: adaptive ({}KB start, {}KB cap, ~250ms at the \
+                 measured rate; PHAROS_STREAM_WINDOW_KB pins a fixed size)",
+                WINDOW_START_BYTES / 1024,
+                WINDOW_CAP_BYTES / 1024,
+            );
+        }
+    }
+    Ok(Arc::new(t))
+}
+
+/// The `PHAROS_STREAM_WINDOW_KB` pin, if set: a fixed size for all three QUIC
+/// flow-control windows AND the off-switch for the receiver's runtime window
+/// adaptation. Kept for the documented SBC recipes (e.g. the Pi couch stream
+/// pins 128KB) and for A/B experiments.
+fn stream_window_pin() -> Option<u32> {
+    std::env::var("PHAROS_STREAM_WINDOW_KB")
         .ok()
         .and_then(|s| s.parse().ok())
-        .filter(|&k| k > 0)
-        .unwrap_or(256);
-    let win_bytes = win_kb.saturating_mul(1024);
-    let win = quinn::VarInt::from_u32(win_bytes);
-    t.stream_receive_window(win);
-    t.receive_window(win);
-    t.send_window(u64::from(win_bytes));
-    tracing::info!("QUIC flow-control window: {win_kb} KB (PHAROS_STREAM_WINDOW_KB to tune)");
-    Ok(Arc::new(t))
+        .filter(|&k: &u32| k > 0)
+}
+
+/// Memory cap for the per-stream receive window and the send window, and the
+/// upper clamp for the adaptive connection receive window: ~1s at the hosts'
+/// 60 Mbps encode ceiling. Never the operative latency bound — that's the
+/// adaptive connection window below it.
+const WINDOW_CAP_BYTES: u32 = 8 * 1024 * 1024;
+/// Connection receive window before the first rate measurement lands: ~250ms
+/// at the 60 Mbps encode ceiling, so a full-rate stream starts unthrottled.
+const WINDOW_START_BYTES: u32 = 2 * 1024 * 1024;
+/// Lower clamp for the adaptive window (an idle stream decays to this).
+/// Comfortably above any LAN/WAN bandwidth-delay product this project meets
+/// (60 Mbps at 40ms RTT ≈ 300KB), so a sudden idle→busy burst is never
+/// throughput-throttled during the ≤1s until the next resize.
+const WINDOW_FLOOR_BYTES: u32 = 512 * 1024;
+
+/// The adaptive receive-window target for a measured video byte rate: ~250ms
+/// of buffer at that rate, clamped to [floor, cap]. Pure for unit tests.
+fn adaptive_window_target(rate_bytes_per_sec: f32) -> u32 {
+    ((rate_bytes_per_sec / 4.0) as u32).clamp(WINDOW_FLOOR_BYTES, WINDOW_CAP_BYTES)
 }
 
 /// Insecure verifier — accepts any server cert. Loopback/testing only; the real
@@ -3418,8 +3472,10 @@ async fn serve_stream(
                                 // log line, with chunk size + window setting for one-grep triage.
                                 let write_ms = write_t0.elapsed().as_millis();
                                 if write_ms > 200 {
-                                    let win_kb: String = std::env::var("PHAROS_STREAM_WINDOW_KB")
-                                        .unwrap_or_else(|_| "256(default)".into());
+                                    let win_kb: String = match stream_window_pin() {
+                                        Some(kb) => kb.to_string(),
+                                        None => "adaptive".into(),
+                                    };
                                     tracing::warn!(
                                         "quic write_all slow ms={write_ms} stream_window_kb={win_kb} chunk_bytes={chunk_bytes}"
                                     );
@@ -4056,6 +4112,9 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
         // can see the delivered rate (both blocks run on this one task, so a shared
         // atomic suffices — no lock, no spawn bound).
         let recv_count = std::sync::atomic::AtomicU32::new(0);
+        // Video bytes received this QoS window — feeds the adaptive receive-window
+        // sizing (the receiver-side latency bound; see `transport_config`).
+        let recv_bytes = std::sync::atomic::AtomicU64::new(0);
 
         // Video on the uni stream; audio as unreliable datagrams. Both run
         // concurrently on this one task (no spawn → no Send/'static bound on the
@@ -4083,6 +4142,7 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
                 }
                 on_frame(buf);
                 recv_count.fetch_add(1, Ordering::Relaxed);
+                recv_bytes.fetch_add(4 + len as u64, Ordering::Relaxed);
             }
             // The stream ended. If the host CLOSED us with one of its deliberate
             // application codes (preempt / reserved-by-primary / unpaired),
@@ -4120,6 +4180,17 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
             // host coalesces forced IDRs via PHAROS_MIN_IDR_INTERVAL_MS (no storm).
             let mut idr_tick = tokio::time::interval(std::time::Duration::from_millis(100));
             idr_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Adaptive receive window (see `transport_config`): resize the
+            // connection-level flow-control window each QoS tick to ~250ms at the
+            // measured video rate — the receiver-side latency bound that replaces
+            // the old one-size 256KB static window. EWMA is fast-up / slow-down:
+            // a burst after an idle desktop re-expands the window within one tick,
+            // while a rate drop (bitrate brake, idle) decays it over a few seconds
+            // so the bound tightens without thrashing. Inert when
+            // PHAROS_STREAM_WINDOW_KB pins a fixed size.
+            let window_adaptive = stream_window_pin().is_none();
+            let mut rate_ewma: f32 = 0.0;
+            let mut window_applied: u32 = WINDOW_START_BYTES;
             loop {
                 tokio::select! {
                     biased;
@@ -4242,6 +4313,27 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
                         }
                     }
                     _ = qos_tick.tick() => {
+                        // Adaptive receive window: ~250ms at the measured video rate.
+                        // Applied only on a >25% move so a steady stream never churns
+                        // MAX_DATA frames.
+                        if window_adaptive {
+                            let bytes = recv_bytes.swap(0, Ordering::Relaxed) as f32;
+                            rate_ewma = if bytes > rate_ewma {
+                                bytes // fast up: react to a burst within one tick
+                            } else {
+                                0.5 * rate_ewma + 0.5 * bytes // slow down: decay over ~3-4s
+                            };
+                            let target = adaptive_window_target(rate_ewma);
+                            if target.abs_diff(window_applied).saturating_mul(4) > window_applied {
+                                conn.set_receive_window(quinn::VarInt::from_u32(target));
+                                tracing::debug!(
+                                    "receive window → {}KB (video ~{:.1} Mbps)",
+                                    target / 1024,
+                                    rate_ewma * 8.0 / 1e6,
+                                );
+                                window_applied = target;
+                            }
+                        }
                         // ~1s window, so the drained count is ≈ delivered fps.
                         let recv_fps = recv_count.swap(0, Ordering::Relaxed) as f32;
                         let decode_ms =
@@ -5122,6 +5214,25 @@ impl Staging {
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
+
+    /// The adaptive receive-window sizing: ~250ms at the measured rate, clamped
+    /// to [floor, cap]. The floor keeps an idle→busy burst unthrottled until the
+    /// next 1s resize; the cap bounds worst-case buffered latency at any rate.
+    #[test]
+    fn adaptive_window_target_tracks_rate_within_clamps() {
+        use super::{adaptive_window_target, WINDOW_CAP_BYTES, WINDOW_FLOOR_BYTES};
+        // Idle / tiny rates clamp to the floor.
+        assert_eq!(adaptive_window_target(0.0), WINDOW_FLOOR_BYTES);
+        assert_eq!(adaptive_window_target(100_000.0), WINDOW_FLOOR_BYTES);
+        // 60 Mbps (the hosts' encode ceiling) = 7.5 MB/s → ~1.9MB of 250ms budget.
+        let at_ceiling = adaptive_window_target(7_500_000.0);
+        assert_eq!(at_ceiling, 7_500_000 / 4);
+        assert!(at_ceiling > WINDOW_FLOOR_BYTES && at_ceiling < WINDOW_CAP_BYTES);
+        // 10 Mbps couch stream = 1.25 MB/s → floor-clamped (512KB > 312KB).
+        assert_eq!(adaptive_window_target(1_250_000.0), WINDOW_FLOOR_BYTES);
+        // Absurd rates clamp to the memory cap.
+        assert_eq!(adaptive_window_target(1e9), WINDOW_CAP_BYTES);
+    }
 
     /// Issue #13: the pure input-coalescing logic. Under backpressure motion is
     /// coalesced (absolute=latest, accumulative=summed) but transitions are never

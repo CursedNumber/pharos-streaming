@@ -300,7 +300,7 @@ tracing `EnvFilter`) is honored by every binary.
 |---|---|---|
 | `PHAROS_BITRATE_KBPS` | unset | target average encoder bitrate (kbit/s); overrides config |
 | `PHAROS_MAX_BITRATE_KBPS` | unset (= avg → CBR) | bitrate ceiling (kbit/s); clamped ≥ average |
-| `PHAROS_STREAM_WINDOW_KB` | 256 | QUIC per-stream receive window (KB); caps in-flight video |
+| `PHAROS_STREAM_WINDOW_KB` | unset (adaptive) | pins ALL QUIC flow-control windows to a fixed size (KB) and disables the adaptive sizing. Unset, the windows auto-size: 8MB memory cap, and the client resizes its receive window each second to ~250ms of the measured video rate (512KB floor). Set on BOTH ends when pinning |
 | `PHAROS_QUEUE_FRAMES` | 8 | bounded video-frame channel depth (P-frames drop-newest) |
 | `PHAROS_AUDIO_QUEUE_PACKETS` | 8 | bounded audio-packet channel depth (drop-newest) |
 | `PHAROS_AUDIO_CAPTURE_MS` | 15 | `parec` fragment buffer (ms) for null-sink capture |
