@@ -379,12 +379,20 @@ fn adapt_bitrate_step(
                 .min(ssthresh_kbps)
                 .clamp(floor, ceiling_kbps);
             (allowed, ssthresh_kbps)
-        } else {
-            // At/above the mark: probe up slowly (additive), raising the mark as we go.
+        } else if clear_ticks.is_multiple_of(5) {
+            // At/above the mark: probe up slowly (additive), raising the mark as we
+            // go — but only every ~5th clean second, not every tick. On a link whose
+            // capacity FLUCTUATES (WiFi), a per-second probe re-hits the ceiling
+            // every few seconds forever, and every overshoot sheds frames = a
+            // visible glitch; a 5s cadence makes the steady state mostly-still with
+            // occasional gentle probes.
             let allowed = allowed_kbps
                 .saturating_add(probe_step_kbps)
                 .clamp(floor, ceiling_kbps);
             (allowed, allowed.max(ssthresh_kbps))
+        } else {
+            // Clean and at the mark, between probes: hold.
+            (allowed_kbps.clamp(floor, ceiling_kbps), ssthresh_kbps)
         }
     } else {
         (allowed_kbps.clamp(floor, ceiling_kbps), ssthresh_kbps)
@@ -1035,6 +1043,15 @@ fn run_stream(
                     // Ticks left in the post-respawn grace window (no adaptation).
                     let mut grace_ticks = 0u32;
                     let mut last_frames = frames_b.load(Ordering::Relaxed);
+                    // Cumulative transport queue drops last seen (P + keyframes). The
+                    // per-tick DELTA is the first-order local congestion signal: the
+                    // queue sheds the moment offered rate exceeds the path, with zero
+                    // latency and no dependence on client QoS datagrams surviving the
+                    // very congestion being measured.
+                    let mut last_drops = {
+                        let (p, k) = streamer_b.dropped_frames();
+                        p + k
+                    };
                     let mut win = Instant::now();
                     loop {
                         std::thread::sleep(Duration::from_secs(1));
@@ -1056,6 +1073,10 @@ fn run_stream(
                             }
                             while qos_rx.try_recv().is_ok() {}
                             last_frames = frames_b.load(Ordering::Relaxed);
+                            last_drops = {
+                                let (p, k) = streamer_b.dropped_frames();
+                                p + k
+                            };
                             win = Instant::now();
                             continue;
                         }
@@ -1063,6 +1084,10 @@ fn run_stream(
                         if conn.is_none() || ceiling == 0 {
                             while qos_rx.try_recv().is_ok() {}
                             last_frames = frames_b.load(Ordering::Relaxed);
+                            last_drops = {
+                                let (p, k) = streamer_b.dropped_frames();
+                                p + k
+                            };
                             win = Instant::now();
                             continue;
                         }
@@ -1088,6 +1113,10 @@ fn run_stream(
                             grace_ticks = 3;
                             while qos_rx.try_recv().is_ok() {}
                             last_frames = frames_b.load(Ordering::Relaxed);
+                            last_drops = {
+                                let (p, k) = streamer_b.dropped_frames();
+                                p + k
+                            };
                             win = Instant::now();
                             info!(
                                 "adaptive bitrate: pipeline respawn (gen {gen}) — re-armed at \
@@ -1099,6 +1128,10 @@ fn run_stream(
                             grace_ticks -= 1;
                             while qos_rx.try_recv().is_ok() {}
                             last_frames = frames_b.load(Ordering::Relaxed);
+                            last_drops = {
+                                let (p, k) = streamer_b.dropped_frames();
+                                p + k
+                            };
                             win = Instant::now();
                             continue;
                         }
@@ -1114,7 +1147,18 @@ fn run_stream(
                         // measured against it), from the shared AU counter.
                         let f = frames_b.load(Ordering::Relaxed);
                         let send_fps = f.saturating_sub(last_frames) as f32 / secs;
+                        let sent_frames = f.saturating_sub(last_frames).max(1);
                         last_frames = f;
+                        // Transport-queue drops this window: the local, zero-latency
+                        // congestion signal. Any shed frame means offered > path RIGHT
+                        // NOW — no waiting for the client's next QoS datagram (which
+                        // rides the same congested air and may itself be lost).
+                        let drops_total = {
+                            let (p, k) = streamer_b.dropped_frames();
+                            p + k
+                        };
+                        let q_drops = drops_total.saturating_sub(last_drops);
+                        last_drops = drops_total;
                         // Client-reported delivered fps, EWMA α=0.5.
                         let mut got_qos = false;
                         while let Ok(q) = qos_rx.try_recv() {
@@ -1143,12 +1187,19 @@ fn run_stream(
                             && rtt > base_rtt_us.saturating_add((base_rtt_us / 2).max(15_000));
                         // Delivered-fps deficit while QoS is fresh; forward loss always.
                         let loss = streamer_b.loss_permille();
-                        let deficit = if stale_ticks < 3 && recv_fps_ewma > 2.0 && send_fps > 2.0 {
+                        let qos_deficit = if stale_ticks < 3 && recv_fps_ewma > 2.0 && send_fps > 2.0
+                        {
                             recv_fps_ewma / send_fps
                         } else {
                             1.0
                         };
-                        let congested = deficit < 0.85 || loss >= LOSSY_PERMILLE || bloat;
+                        // Fold queue drops into the deficit so the brake severity scales
+                        // with how much of the window the queue actually shed — a burst
+                        // of drops brakes hard even before the client's QoS reflects it.
+                        let drop_deficit = 1.0 - (q_drops as f32 / sent_frames as f32).min(1.0);
+                        let deficit = qos_deficit.min(drop_deficit);
+                        let congested =
+                            q_drops > 0 || deficit < 0.85 || loss >= LOSSY_PERMILLE || bloat;
                         clear_ticks = if congested { 0 } else { clear_ticks.saturating_add(1) };
                         // Additive probe step above the brake: ~4% of the ceiling.
                         let probe = (ceiling / 25).max(1000);
@@ -1166,8 +1217,8 @@ fn run_stream(
                             ctl_b.target_kbps.store(allowed, Ordering::Relaxed);
                             info!(
                                 "adaptive bitrate: {pushed} -> {allowed} kbps (recv_fps~{recv_fps_ewma:.0} \
-                                 send_fps~{send_fps:.0} loss={loss}permille rtt={}ms base={}ms bloat={bloat} \
-                                 ssthresh={ssthresh} ceiling={ceiling})",
+                                 send_fps~{send_fps:.0} qdrops={q_drops} loss={loss}permille rtt={}ms \
+                                 base={}ms bloat={bloat} ssthresh={ssthresh} ceiling={ceiling})",
                                 rtt / 1000,
                                 base_rtt_us / 1000
                             );
@@ -2096,10 +2147,21 @@ mod tests {
 
     #[test]
     fn adaptive_probes_additively_above_the_brake() {
-        // At/above ssthresh + clean → additive probe, raising the brake with it.
+        // At/above ssthresh + clean → additive probe on the 5-tick cadence,
+        // raising the brake with it.
+        assert_eq!(
+            adapt_bitrate_step(51000, 51000, 2000, 60000, false, 1.0, 5, 2400),
+            (53400, 53400)
+        );
+        // Between probe ticks: clean but HOLD (a fluctuating link — WiFi — gets a
+        // mostly-still steady state instead of a glitch every few seconds).
         assert_eq!(
             adapt_bitrate_step(51000, 51000, 2000, 60000, false, 1.0, 3, 2400),
-            (53400, 53400)
+            (51000, 51000)
+        );
+        assert_eq!(
+            adapt_bitrate_step(51000, 51000, 2000, 60000, false, 1.0, 6, 2400),
+            (51000, 51000)
         );
     }
 
