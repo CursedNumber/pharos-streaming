@@ -510,6 +510,45 @@ fn run_stream(
     // pipeline, and matches this project's "HDR is a per-build property" rule.
     streamer.set_hdr(false);
 
+    // Cursor-mode poll: the foreground game's own cursor-capture state, announced to
+    // the client as DG_CURSOR_MODE so the desktop cursor mirrors it (auto-locks to
+    // relative mouselook during gameplay, frees to absolute in menus; no manual
+    // toggle). A windowed FPS that grabs the mouse HIDES the system cursor, so a
+    // CURSORINFO whose flags lack CURSOR_SHOWING (flags.0 == 0) means CAPTURED; the
+    // cursor showing means FREE. GetCursorInfo is process-global + cheap, so a small
+    // dedicated ~60 Hz thread is fine (folding it into the capture loop would gate it
+    // on the encode cadence). Initialised to FREE; on a GetCursorInfo failure we leave
+    // the last state (don't thrash). Only changes matter — the announce layer bursts
+    // on change and steadies ~1×/s.
+    streamer.set_cursor_captured(false);
+    {
+        let streamer_cursor = streamer.clone();
+        std::thread::Builder::new()
+            .name("cursor-mode-poll".into())
+            .spawn(move || {
+                use windows::Win32::UI::WindowsAndMessaging::{GetCursorInfo, CURSORINFO};
+                loop {
+                    let mut ci = CURSORINFO {
+                        cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+                        ..Default::default()
+                    };
+                    // SAFETY: `ci` is a live, correctly-sized CURSORINFO; GetCursorInfo
+                    // only writes into it. On failure we skip the store (leave the last
+                    // announced state) so a transient error can't flap the client grab.
+                    if unsafe { GetCursorInfo(&mut ci) }.is_ok() {
+                        // `flags` lacking CURSOR_SHOWING (i.e. flags.0 == 0, the cursor
+                        // is hidden) means the game captured/hid the mouse => CAPTURED
+                        // / relative. CURSOR_SHOWING set (flags.0 != 0) => FREE /
+                        // absolute. CURSORINFO_FLAGS is a newtype with no BitAnd/PartialEq
+                        // in this `windows` build, so test the raw bit directly.
+                        let captured = ci.flags.0 == 0;
+                        streamer_cursor.set_cursor_captured(captured);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(16));
+                }
+            })?;
+    }
+
     // Optional MQTT / Home-Assistant telemetry — off unless enabled in config.toml.
     let mqtt = start_mqtt(encoder, capture, fps);
 

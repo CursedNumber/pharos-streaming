@@ -1053,6 +1053,13 @@ enum UserEvent {
     /// A native (VNC/SPICE) source reported its native resolution `(w, h)`. The
     /// player adopts it as the source's aspect so the cell letterboxes correctly.
     SourceSize(usize, u32, u32),
+    /// The host game's cursor-capture state changed (from the `DG_CURSOR_MODE`
+    /// announce, decoded in the reader thread): `true` = CAPTURED (the game grabbed
+    /// the mouse for relative mouselook), `false` = FREE (a menu/desktop absolute
+    /// pointer). The player mirrors it into its own OS cursor grab so a windowed FPS
+    /// auto-locks the client cursor during gameplay and frees it in menus, with no
+    /// manual toggle. Sent only on a CHANGE (not every frame).
+    CursorMode(bool),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1447,6 +1454,31 @@ impl ApplicationHandler<UserEvent> for App {
                             let _ = proxy.send_event(UserEvent::Reconnect(i));
                         });
                     }
+                }
+            }
+            // The host game's cursor-capture state changed: mirror it into our OS
+            // cursor grab so a windowed FPS auto-locks the cursor (relative mouselook)
+            // during gameplay and frees it (absolute) in menus, no manual toggle.
+            // `grab_wanted` is the SAME intent the Ctrl+Alt+Home `toggle_grab` hotkey
+            // drives; setting it here means the manual toggle stays a MANUAL OVERRIDE:
+            // it flips the intent as before, and the NEXT host CursorMode change simply
+            // re-syncs it. Acceptable for v1. Gate on the user's mute: if input capture
+            // is CaptureMode::Off we never auto-grab (respect the mute); `apply_grab`
+            // itself further gates on window focus. If the host never announces (older
+            // host, or the not-yet-done Linux host), no CursorMode ever arrives and the
+            // client behaves exactly as today (manual grab only).
+            UserEvent::CursorMode(captured) => {
+                use crate::input::CaptureMode;
+                if matches!(self.cfg.input.mode, CaptureMode::Off) {
+                    // Muted: don't auto-grab. (A later un-mute + host re-announce, or
+                    // the manual hotkey, still engages it.)
+                    return;
+                }
+                if self.grab_wanted != captured {
+                    self.grab_wanted = captured;
+                    self.apply_grab();
+                    tracing::info!("host cursor {} → client grab_wanted={captured}",
+                        if captured { "CAPTURED" } else { "FREE" });
                 }
             }
         }
@@ -2548,7 +2580,24 @@ fn spawn_decode(
                     }
                 }
             };
+            // Last host-announced cursor-capture state we forwarded to the app (from
+            // DG_CURSOR_MODE, stashed in the taps). Starts unset so the FIRST announce
+            // — including the connect-time one — is always forwarded; thereafter only a
+            // CHANGE fires a UserEvent, so we never spam the event loop each frame.
+            let mut last_cursor: Option<bool> = None;
             loop {
+                // Cursor-mode follow: mirror the host game's own cursor-capture state
+                // into the client's OS cursor grab. On a CHANGE (or the first announce)
+                // hand it to the app via the proxy; `user_event` reconciles it into the
+                // real grab (game CAPTURED → locked+relative, FREE → released+absolute).
+                // Only on change — never every frame.
+                let cur = taps_dec.cursor_captured();
+                if cur.is_some() && cur != last_cursor {
+                    last_cursor = cur;
+                    if let Some(captured) = cur {
+                        let _ = proxy_r.send_event(UserEvent::CursorMode(captured));
+                    }
+                }
                 // Colorimetry flip (issue #16): the host toggled HDR↔SDR (e.g. a wgc-zc
                 // pipeline respawn as the other colorimetry) and re-announced via
                 // DG_STREAM_HDR, OR the initial request-based guess was wrong. If the

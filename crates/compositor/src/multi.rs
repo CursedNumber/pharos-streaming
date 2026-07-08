@@ -1858,6 +1858,13 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
         if let Some(s) = &streamer {
             s.set_geometry(oc.w, oc.h);
             s.set_hdr(hdr);
+            // TODO(cursor-mode): Linux host should set_cursor_captured from the
+            // smithay pointer-constraints protocol / null-cursor-surface state, so the
+            // desktop client auto-locks its cursor during gameplay and frees it in
+            // menus (same DG_CURSOR_MODE follow the Windows host already drives). This
+            // pass wired the Windows host + client only; the compositor stays FREE
+            // here (never announces), so a Linux-host client keeps today's manual-grab
+            // behaviour until this is done.
         }
 
         info!(
