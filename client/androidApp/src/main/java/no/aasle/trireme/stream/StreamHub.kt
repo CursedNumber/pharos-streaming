@@ -229,6 +229,12 @@ object StreamHub {
         @Volatile var status: ConnStatus = ConnStatus.Connecting
         @Volatile var active: Boolean = false
         @Volatile var apps: List<AppInfo> = emptyList()
+        // Kind of the app this client last launched/switched-to on this host
+        // (core_proto::apps::app_kind: 1=game, 2=desktop, 3=media, else app).
+        // Drives desktop-only touch gestures (long-press right-click, double-tap
+        // drag) — those are enabled only for a desktop stream. Null until the
+        // user launches something (fresh connect / idle → treated as non-desktop).
+        @Volatile var launchedKind: Int? = null
         @Volatile var userStopped: Boolean = false
         @Volatile var backoffMs: Long = INITIAL_BACKOFF_MS
         // Generation guards stale callbacks: a re-dial bumps this, so a late
@@ -433,6 +439,7 @@ object StreamHub {
             }
             Log.i(TAG, "launchApp '$appId' on ${s.name} (gp=${s.gamepad != null})")
             s.gamepad?.launchApp(appId)
+            s.launchedKind = s.apps.find { it.id == appId }?.kind?.toInt()
             recordAppUse(appId)
             setActiveLocked(hostId)
             publishLocked()
@@ -449,6 +456,7 @@ object StreamHub {
             val s = sessions[hostId] ?: return
             Log.i(TAG, "switchTo '$appId' on ${s.name}")
             s.gamepad?.switchTo(appId)
+            s.launchedKind = s.apps.find { it.id == appId }?.kind?.toInt()
             recordAppUse(appId)
             setActiveLocked(hostId)
             publishLocked()
@@ -650,6 +658,14 @@ object StreamHub {
     /** Touch-pointer mode: true = absolute (tap-to-position), false = trackpad
      *  (relative drag + PointerRel). Read at gesture time by MainActivity. */
     fun isTouchAbsolute(): Boolean = touchAbsolute
+
+    /** True when the active stream is the host DESKTOP / mirror (the last app this
+     *  client launched/switched-to on the active host was desktop-kind). Gates the
+     *  desktop-only trackpad gestures (long-press → right-click, double-tap-hold →
+     *  drag) so they can't fire mid-game. False on a fresh/idle session until a
+     *  desktop app is launched. */
+    fun isDesktopStream(): Boolean =
+        synchronized(lock) { activeSessionLocked()?.launchedKind == 2 }
 
     /** Persist + apply the touch-pointer mode. Takes effect immediately (it only
      *  changes how the Activity maps touches — no re-dial). Safe on any thread. */

@@ -8,9 +8,12 @@ import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import android.view.Display
+import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.SurfaceHolder
@@ -101,6 +104,16 @@ private const val TAP_SLOP = 24f
 private const val TRACKPAD_SENS = 1.5f
 /** Two-finger scroll: screen px of drag per wheel notch. */
 private const val SCROLL_DIV = 48f
+/** Hold duration (ms) for a still trackpad press to fire a right-click (desktop only). */
+private const val LONG_PRESS_MS = 500L
+/** Movement (px) that CANCELS a pending long-press. Deliberately larger than
+ *  [TAP_SLOP] so small finger jitter is tolerated during the hold. */
+private const val LONG_PRESS_SLOP = 48f
+/** Max gap (ms) between the first tap's UP and the second tap's DOWN for a
+ *  double-tap. A second tap that then holds/drags becomes a left-button drag. */
+private const val DOUBLE_TAP_MS = 280L
+/** Max distance (px) between the two taps of a double-tap. */
+private const val DOUBLE_TAP_SLOP = 48f
 
 /**
  * Trireme shell — a SINGLE full-screen, immersive Activity that is the launcher.
@@ -152,6 +165,15 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     private var tScrolling = false // two-finger scroll active
     private var tScrollLastY = 0f
     private var tPressed = false // a left button is held down (absolute drag)
+    // Trackpad advanced gestures (desktop-only): long-press → right-click,
+    // double-tap-hold → left-drag. All driven from handleTrackpadTouch.
+    private val touchHandler by lazy { Handler(Looper.getMainLooper()) }
+    private var tLongPressRunnable: Runnable? = null
+    private var tLongPressFired = false // right-click already fired this gesture
+    private var tDragging = false // left button held for a double-tap drag
+    private var tLastTapUpTime = 0L // for double-tap detection
+    private var tLastTapUpX = 0f
+    private var tLastTapUpY = 0f
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -523,7 +545,9 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     }
 
     /** Trackpad: one-finger drag → PointerRel; quick tap → left click; two-finger
-     *  drag → scroll. */
+     *  drag → scroll. Desktop/mirror streams add: long-press → right-click, and
+     *  double-tap-then-hold → left-button drag (both gated by
+     *  [StreamHub.isDesktopStream] so they never fire mid-game). */
     private fun handleTrackpadTouch(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
@@ -537,10 +561,36 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                 tLastY = event.y
                 tMoved = false
                 tScrolling = false
+                tLongPressFired = false
+                cancelLongPress()
+                val desktop = StreamHub.isDesktopStream()
+                // Second tap of a double-tap that lands close in time+space → begin a
+                // left-button drag: press now, hold through MOVE, release on UP. A
+                // quick second tap (no hold/move) then reads as press+release = the
+                // second click of a double-click. Desktop-only.
+                val isDoubleDown = desktop &&
+                    (event.eventTime - tLastTapUpTime) < DOUBLE_TAP_MS &&
+                    kotlin.math.abs(event.x - tLastTapUpX) < DOUBLE_TAP_SLOP &&
+                    kotlin.math.abs(event.y - tLastTapUpY) < DOUBLE_TAP_SLOP
+                if (isDoubleDown) {
+                    tDragging = true
+                    tLastTapUpTime = 0L // consume so a 3rd tap doesn't chain
+                    StreamHub.pointerButton(0, true)
+                } else {
+                    tDragging = false
+                    // Arm long-press → right-click (desktop only).
+                    if (desktop) armLongPress()
+                }
             }
             MotionEvent.ACTION_POINTER_DOWN -> if (event.pointerCount >= 2) {
                 tScrolling = true
                 tScrollLastY = (event.getY(0) + event.getY(1)) / 2f
+                cancelLongPress()
+                // Going to two-finger scroll — abandon any single-finger drag cleanly.
+                if (tDragging) {
+                    StreamHub.pointerButton(0, false)
+                    tDragging = false
+                }
             }
             MotionEvent.ACTION_MOVE -> {
                 if (tScrolling && event.pointerCount >= 2) {
@@ -559,6 +609,15 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                     ) {
                         tMoved = true
                     }
+                    // Cancel a pending long-press only once motion leaves the (larger)
+                    // tolerance window, so a small drift during the hold is forgiven.
+                    if (kotlin.math.abs(event.x - tDownX) > LONG_PRESS_SLOP ||
+                        kotlin.math.abs(event.y - tDownY) > LONG_PRESS_SLOP
+                    ) {
+                        cancelLongPress()
+                    }
+                    // Motion moves the cursor; if a drag is in progress the left button
+                    // is held, so the host sees a click-drag.
                     StreamHub.pointerRel(dx * TRACKPAD_SENS, dy * TRACKPAD_SENS)
                 }
             }
@@ -567,16 +626,64 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                 // remaining finger doesn't dump a relative jump.
             }
             MotionEvent.ACTION_UP -> {
-                val quick = event.eventTime - tDownTime < TAP_MS
-                if (!tScrolling && !tMoved && quick) {
-                    StreamHub.pointerButton(0, true)
-                    StreamHub.pointerButton(0, false)
+                cancelLongPress()
+                when {
+                    tDragging -> {
+                        StreamHub.pointerButton(0, false)
+                        tDragging = false
+                    }
+                    // Right-click already fired on the timer → UP emits no left click.
+                    tLongPressFired -> {}
+                    else -> {
+                        val quick = event.eventTime - tDownTime < TAP_MS
+                        if (!tScrolling && !tMoved && quick) {
+                            StreamHub.pointerButton(0, true)
+                            StreamHub.pointerButton(0, false)
+                            // Remember this tap so a fast follow-up becomes a double.
+                            tLastTapUpTime = event.eventTime
+                            tLastTapUpX = tDownX
+                            tLastTapUpY = tDownY
+                        }
+                    }
                 }
                 tScrolling = false
             }
-            MotionEvent.ACTION_CANCEL -> tScrolling = false
+            MotionEvent.ACTION_CANCEL -> {
+                cancelLongPress()
+                if (tDragging) {
+                    StreamHub.pointerButton(0, false)
+                    tDragging = false
+                }
+                tScrolling = false
+            }
         }
         return true
+    }
+
+    /** Arm the long-press → right-click timer for the current trackpad press.
+     *  Fires a discrete right-click (press+release) plus haptic feedback after
+     *  [LONG_PRESS_MS] if the finger is still down, roughly still, and not
+     *  scrolling/dragging. Cancelled by [cancelLongPress] on motion/lift/scroll. */
+    private fun armLongPress() {
+        val r = Runnable {
+            if (!tScrolling && !tDragging) {
+                tLongPressFired = true
+                StreamHub.pointerButton(1, true)
+                StreamHub.pointerButton(1, false)
+                window.decorView.performHapticFeedback(
+                    HapticFeedbackConstants.LONG_PRESS,
+                    HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING,
+                )
+            }
+            tLongPressRunnable = null
+        }
+        tLongPressRunnable = r
+        touchHandler.postDelayed(r, LONG_PRESS_MS)
+    }
+
+    private fun cancelLongPress() {
+        tLongPressRunnable?.let { touchHandler.removeCallbacks(it) }
+        tLongPressRunnable = null
     }
 
     // ============================================================
