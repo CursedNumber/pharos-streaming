@@ -3142,11 +3142,16 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                         match crate::control::launch_app(&id, &socket_name, launch_fps) {
                             Ok(child) => {
                                 info!("client: launched app '{id}'");
-                                let mode = app_launcher::config::load_with_builtins()
-                                    .find(&id)
-                                    .map(|e| e.gyro_mode)
-                                    .unwrap_or_default();
+                                let catalog = app_launcher::config::load_with_builtins();
+                                let entry = catalog.find(&id);
+                                let mode = entry.map(|e| e.gyro_mode).unwrap_or_default();
                                 host_input.set_app_gyro_mode(mode);
+                                // Desktop-mirror (issue #6): same reconciliation
+                                // the panel-side LaunchApp handler does — a
+                                // Trireme tile launch must flip the capture
+                                // source too, not just the panel's own verb.
+                                #[cfg(feature = "portal-mirror")]
+                                apply_capture_target(&mut pipelines, entry.map(|e| &e.target));
                                 if let Some(c) = child {
                                     host_input.track_app_child(id, c);
                                 }

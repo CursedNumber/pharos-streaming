@@ -616,10 +616,44 @@ pub fn load_compositor_layout() -> CompositorLayout {
 /// the panel doesn't model** (`frames`, `launch`, `mode`, …). Read-merge-write
 /// that overwrites only `fps` + the `[[output]]` array (the shape `to_multi_toml`
 /// owns); `multi.toml` is shared with the compositor.
+///
+/// **Safety guard**: refuses to write an EMPTY layout over an on-disk
+/// `multi.toml` that still has output(s) configured. A host with zero
+/// outputs can't stream to anyone, so there's no legitimate reason to
+/// persist that silently — and an empty in-memory `CompositorLayout` is far
+/// more often a load race (the panel started before the host wrote
+/// `multi.toml`, or read it mid-update) than a deliberate "delete every
+/// output" action. This took the host down once already (`multi.toml` lost
+/// its whole `[[output]]` array on a routine Save-all); see
+/// `layout_wipe_is_refused_when_disk_has_outputs` below.
 pub fn save_compositor_layout(l: &CompositorLayout) -> Result<()> {
     let p = path("multi.toml");
     let existing = std::fs::read_to_string(&p).unwrap_or_default();
+    if would_wipe_configured_outputs(&existing, l) {
+        anyhow::bail!(
+            "refusing to save: the compositor layout in the panel has NO outputs, but \
+             multi.toml on disk still has one or more configured — saving would delete \
+             them and the host would fail to start. Drag your device(s) back onto the \
+             Compositor canvas before saving, or edit multi.toml by hand if you really \
+             want zero outputs."
+        );
+    }
     atomic_write(&p, &merge_multi_toml(&existing, l)?, None)
+}
+
+/// True when persisting `l` over `existing` would silently delete a real,
+/// on-disk output configuration (see [`save_compositor_layout`]'s doc for
+/// why this is refused rather than allowed). Pure + filesystem-free so it's
+/// unit-testable without touching `$PHAROS_CONFIG_DIR`.
+fn would_wipe_configured_outputs(existing: &str, l: &CompositorLayout) -> bool {
+    if !l.outputs.is_empty() {
+        return false;
+    }
+    toml::from_str::<toml::Table>(existing)
+        .ok()
+        .and_then(|t| t.get("output").cloned())
+        .and_then(|v| v.as_array().map(|a| !a.is_empty()))
+        .unwrap_or(false)
 }
 
 /// Flush every dirty section to disk, clearing each `dirty_*` flag as its write
@@ -1180,6 +1214,44 @@ addr = \"quic://0.0.0.0:9000\"
             !parsed.contains_key("output"),
             "an empty layout must drop the [[output]] array"
         );
+    }
+
+    /// The bug that took the host down: a panel session whose in-memory
+    /// layout never got populated (or was cleared) must NOT be allowed to
+    /// silently overwrite a `multi.toml` that still has real outputs —
+    /// `save_compositor_layout` guards this via `would_wipe_configured_outputs`.
+    #[test]
+    fn layout_save_is_refused_when_it_would_wipe_configured_outputs() {
+        let existing = "fps = 30\n\n[[output]]\nname = \"x\"\nw = 1\nh = 1\naddr = \"a\"\n";
+        let empty_layout = CompositorLayout::default();
+        assert!(would_wipe_configured_outputs(existing, &empty_layout));
+
+        // A layout that still has an output is always safe to save.
+        let non_empty_layout = CompositorLayout {
+            outputs: vec![OutputTile {
+                id: 1,
+                name: "virtual-0".into(),
+                addr: "quic://0.0.0.0:7000".into(),
+                peer_pubkey: None,
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080,
+                refresh_mhz: 60_000,
+                input_enabled: true,
+            }],
+            ..CompositorLayout::default()
+        };
+        assert!(!would_wipe_configured_outputs(existing, &non_empty_layout));
+
+        // An empty layout over an ALREADY-empty (or missing/garbled) file is
+        // fine — there's nothing real to lose.
+        assert!(!would_wipe_configured_outputs("fps = 30\n", &empty_layout));
+        assert!(!would_wipe_configured_outputs("", &empty_layout));
+        assert!(!would_wipe_configured_outputs(
+            "not valid toml {{{",
+            &empty_layout
+        ));
     }
 
     #[test]
