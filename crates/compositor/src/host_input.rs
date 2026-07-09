@@ -214,23 +214,34 @@ impl HostInput {
             } => self.pads.button(slot, button, pressed),
             InputEvent::GamepadAxis { slot, axis, value } => self.pads.axis(slot, axis, value),
             InputEvent::GamepadMotion { gx, gy, gz, .. } => {
-                let (dx, dy) = self.pads.gyro.delta(gx, gy, gz);
-                if dx != 0.0 || dy != 0.0 {
-                    self.gyro_log = self.gyro_log.wrapping_add(1);
-                    if self.gyro_log % 30 == 1 {
-                        info!(
-                            "gyro→mouse: dx={dx:.1} dy={dy:.1} (gx={gx:.2} gy={gy:.2} gz={gz:.2})"
+                // A client pad's gyro becomes mouse aim ONLY when the active app opted
+                // into GyroMode::Mouse (apps.toml). Enabled (the default) and Disabled
+                // must NOT wander the cursor — and a virtual Xbox pad has no gyro axes,
+                // so there's nothing to forward raw to the game either; we just drop.
+                // This mirrors the USB/IP IMU path's gate in `drain_gyro_per_frame`;
+                // without it this arm ran unconditionally, so a phone-attached gyro pad
+                // flooded the host cursor regardless of GyroMode or the client's
+                // wants_gyro opt-in. `GyroMouse::delta` is stateless, so there's no
+                // accumulator to keep drained in the non-Mouse modes.
+                if self.active_app_gyro_mode == GyroMode::Mouse {
+                    let (dx, dy) = self.pads.gyro.delta(gx, gy, gz);
+                    if dx != 0.0 || dy != 0.0 {
+                        self.gyro_log = self.gyro_log.wrapping_add(1);
+                        if self.gyro_log % 30 == 1 {
+                            info!(
+                                "gyro→mouse: dx={dx:.1} dy={dy:.1} (gx={gx:.2} gy={gy:.2} gz={gz:.2})"
+                            );
+                        }
+                        dispatch_gyro_mouse(
+                            data,
+                            width,
+                            height,
+                            focus_surface,
+                            &mut self.gyro_cursor,
+                            dx,
+                            dy,
                         );
                     }
-                    dispatch_gyro_mouse(
-                        data,
-                        width,
-                        height,
-                        focus_surface,
-                        &mut self.gyro_cursor,
-                        dx,
-                        dy,
-                    );
                 }
             }
             InputEvent::ControllerTuning {
