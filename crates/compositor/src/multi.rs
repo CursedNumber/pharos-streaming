@@ -443,6 +443,13 @@ fn write_mirror_restore_token(token: &str) {
 /// session. This function returns immediately with the pipeline in
 /// `MirrorPending`; the render loop's `poll_mirror_pending` installs the live
 /// `PhysicalMirror` (or reverts to `Virtual`) once the keeper reports back.
+/// How long the portal keeper waits for the user to answer the "Share your
+/// screen?" dialog before giving up and reverting to `Virtual`. Generous enough
+/// to walk to the host and click, short enough that an abandoned dialog doesn't
+/// wedge desktop-mirror until a host restart.
+#[cfg(feature = "portal-mirror")]
+const MIRROR_DIALOG_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[cfg(feature = "portal-mirror")]
 fn activate_physical_mirror(pipeline: &mut Pipeline) -> Result<()> {
     use crate::portal_mirror::MirrorSession;
@@ -472,7 +479,13 @@ fn activate_physical_mirror(pipeline: &mut Pipeline) -> Result<()> {
             rt.block_on(async move {
                 // Negotiate: open the session (this await blocks on the user's
                 // "Share" dialog click), persist any restore token, connect input.
-                let opened = async {
+                // Bounded by MIRROR_DIALOG_TIMEOUT so an UNANSWERED dialog (user
+                // never clicked Share, or didn't see it) self-clears: the keeper
+                // gives up, the render loop reverts to Virtual, and a fresh
+                // Desktop tap starts a new attempt — no host restart needed. A
+                // dialog the user actively CANCELS returns an Err sooner (no
+                // wait for the timeout).
+                let opened = tokio::time::timeout(MIRROR_DIALOG_TIMEOUT, async {
                     let restore_token = read_mirror_restore_token();
                     let session = MirrorSession::open(restore_token.as_deref()).await?;
                     if let Some(token) = &session.restore_token {
@@ -491,12 +504,20 @@ fn activate_physical_mirror(pipeline: &mut Pipeline) -> Result<()> {
                         }
                     };
                     Ok::<_, anyhow::Error>((session, stream_info, input_fd))
-                }
+                })
                 .await;
                 let (session, stream_info, input_fd) = match opened {
-                    Ok(v) => v,
-                    Err(e) => {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => {
                         let _ = ready_tx.send(Err(format!("{e:#}")));
+                        return;
+                    }
+                    Err(_elapsed) => {
+                        let _ = ready_tx.send(Err(format!(
+                            "no response to the screen-share dialog within {}s (abandoned?) — \
+                             reverting; tap Desktop again to retry",
+                            MIRROR_DIALOG_TIMEOUT.as_secs()
+                        )));
                         return;
                     }
                 };
