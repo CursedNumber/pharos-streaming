@@ -14,6 +14,7 @@ import android.util.Log
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
+import no.aasle.trireme.stream.StreamHub
 import uniffi.core_ffi.GamepadInput
 import uniffi.core_ffi.classifyController
 import uniffi.core_ffi.defaultControllerProfile
@@ -142,10 +143,16 @@ class ControllerManager(
                 "${"%04x:%04x".format(d.vendorId, d.productId)} = ${info?.label} " +
                 "(${if (managed) "managed" else "raw"})",
         )
-        // Register gyro only when controller handling is on; raw mode forwards
-        // sticks/buttons but no motion. The host's active-app GyroMode (apps.toml)
-        // still gates dispatch when on.
-        if (managed) registerGyro(d, slot)
+        // Register gyro only when controller handling is on AND the user opted in
+        // via Settings → "Send controller gyro to host". Raw mode forwards
+        // sticks/buttons but no motion. This gate is essential, not just an
+        // optimisation: the host's GamepadMotion→mouse path (host_input.rs) runs
+        // UNCONDITIONALLY — unlike its USB/IP IMU path it honours neither wants_gyro
+        // nor the per-app GyroMode — so a phone-attached pad's gyro would flood the
+        // host cursor (fighting the pad, "wild" motion) with the toggle off. Read at
+        // attach; a live flip applies on the next reconnect, matching the wants_gyro
+        // handshake contract (the setting "applies on next dial").
+        if (managed && StreamHub.isGyroEnabled()) registerGyro(d, slot)
     }
 
     private fun detach(deviceId: Int) {
@@ -189,7 +196,10 @@ class ControllerManager(
             else -> -1
         }
         if (trig >= 0) {
-            if (event.repeatCount == 0) sink.axis(slot.toUByte(), trig.toUByte(), if (pressed) 1f else 0f)
+            if (event.repeatCount == 0) {
+                StreamHub.claimGamepadSource()
+                sink.axis(slot.toUByte(), trig.toUByte(), if (pressed) 1f else 0f)
+            }
             return true
         }
 
@@ -211,6 +221,7 @@ class ControllerManager(
         val key = stateKey(slot, idx)
         if (lastButton[key] == pressed) return true
         lastButton[key] = pressed
+        StreamHub.claimGamepadSource()
         sink.button(slot.toUByte(), idx.toUByte(), pressed)
         return true
     }
@@ -222,6 +233,7 @@ class ControllerManager(
 
     /** Track held d-pad directions per slot and emit the resolved hat axes. */
     private fun updateDpad(slot: Int, kc: Int, pressed: Boolean) {
+        StreamHub.claimGamepadSource()
         val held = dpadHeld.getOrPut(slot) { mutableSetOf() }
         if (pressed) held.add(kc) else held.remove(kc)
         val hx = (if (KeyEvent.KEYCODE_DPAD_RIGHT in held) 1f else 0f) +
@@ -254,6 +266,10 @@ class ControllerManager(
         val last = lastAxis[key]
         if (last != null && abs(last - v) < AXIS_EPSILON) return
         lastAxis[key] = v
+        // A real, past-deadzone axis change (this only runs when the value actually
+        // moved — jitter is deduped above) is deliberate pad use, so claim the
+        // gamepad source to mute a stray/gyro cursor fighting the pad.
+        StreamHub.claimGamepadSource()
         sink.axis(slot.toUByte(), idx.toUByte(), v)
     }
 

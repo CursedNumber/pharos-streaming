@@ -13,6 +13,7 @@ import android.util.Log
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.Surface
+import java.util.concurrent.atomic.AtomicInteger
 import no.aasle.trireme.ControllerManager
 import no.aasle.trireme.GyroTelemetry
 import no.aasle.trireme.OpusAudioPlayer
@@ -31,6 +32,18 @@ import uniffi.core_ffi.StreamMode
 import uniffi.core_ffi.startVideoStream
 
 private const val TAG = "TriremeHub"
+
+// Last-deliberately-used input source, for pad-vs-pointer arbitration (mirrors the
+// desktop client's gamepad.rs/play.rs SRC_KBDMOUSE/SRC_GAMEPAD). The host turns
+// both touch pointer motion AND controller gyro into MOUSE events, so a touch (or
+// gyro) flood fights the virtual gamepad for the game's "active device" focus and
+// the game starts ignoring the pad. We forward bare touch pointer motion ONLY while
+// TOUCH is the active source: real pad use (a button or a past-deadzone stick)
+// claims [SRC_GAMEPAD] and a deliberate touch gesture claims [SRC_TOUCH]. A pad
+// merely connecting does not claim, and bare motion never switches the source
+// (idle motion can't steal focus back).
+private const val SRC_TOUCH = 0
+private const val SRC_GAMEPAD = 1
 
 /// One host's app catalog, surfaced for the pooled Apps pane.
 data class HostApps(val hostId: String, val hostName: String, val apps: List<AppInfo>)
@@ -163,6 +176,11 @@ object StreamHub {
     // (relative drag → PointerRel). Seeded in [init]; flipped live via
     // [setTouchAbsolute] (takes effect immediately, no re-dial).
     @Volatile private var touchAbsolute: Boolean = true
+    // Which device most recently DELIBERATELY drove input (SRC_TOUCH / SRC_GAMEPAD).
+    // Written from the input threads (ControllerManager) and the main thread (touch),
+    // read on every pointer send — an atomic keeps that lock-free and consistent.
+    // Starts on TOUCH so a touch-only session works before any pad activity.
+    private val inputSource = AtomicInteger(SRC_TOUCH)
     // Controller-handling master switch (Settings / Controllers pane). Default
     // false: pads are forwarded RAW (host default profile, no gyro/swaps). When
     // on, ControllerManager applies the per-controller profile. Seeded in [init];
@@ -577,27 +595,52 @@ object StreamHub {
     fun dispatchControllerMotion(event: MotionEvent): Boolean =
         controllers?.onMotion(event) == true
 
+    // --- Pad-vs-pointer input-source arbitration (see SRC_TOUCH/SRC_GAMEPAD) ---
+
+    /** Real controller activity (a button, or a stick past the deadzone) claims the
+     *  gamepad as the active source, muting stray touch/gyro pointer motion so it
+     *  can't fight the pad for the game's active-device focus. Called by
+     *  [ControllerManager]; a pad merely connecting must NOT call this. */
+    fun claimGamepadSource() {
+        inputSource.set(SRC_GAMEPAD)
+    }
+
+    /** A deliberate touch gesture (a finger going down on the stream) claims touch
+     *  as the active source, so its pointer motion is forwarded again after the pad
+     *  had muted it. Called by MainActivity at gesture start. */
+    fun claimTouchSource() {
+        inputSource.set(SRC_TOUCH)
+    }
+
     // --- Touch → host pointer (MainActivity drives these from onTouchEvent) ---
     // Always route through activeGamepad() per-call: a reconnect swaps the
     // session's GamepadInput for a fresh handle, and a cached one silently drops.
 
-    /** Absolute pointer position, normalised 0..=1 over the video content rect. */
+    /** Absolute pointer position, normalised 0..=1 over the video content rect.
+     *  Gated on TOUCH being the active source (bare motion never claims), so a pad
+     *  in use isn't fought by a stray or gyro-driven cursor. */
     fun pointerAbs(x: Float, y: Float) {
+        if (inputSource.get() != SRC_TOUCH) return
         runCatching { activeGamepad()?.pointerAbs(x, y) }
     }
 
-    /** Relative pointer motion in pixels (trackpad drag). */
+    /** Relative pointer motion in pixels (trackpad drag). Gated like [pointerAbs]. */
     fun pointerRel(dx: Float, dy: Float) {
+        if (inputSource.get() != SRC_TOUCH) return
         runCatching { activeGamepad()?.pointerRel(dx, dy) }
     }
 
-    /** Pointer button (0=Left, 1=Right, 2=Middle). */
+    /** Pointer button (0=Left, 1=Right, 2=Middle). Buttons (incl. releases) are NOT
+     *  gated — the deliberate gesture already claimed touch at DOWN, and a release
+     *  must always reach the host so a held button never sticks. */
     fun pointerButton(button: Int, pressed: Boolean) {
         runCatching { activeGamepad()?.pointerButton(button.toUByte(), pressed) }
     }
 
-    /** Wheel scroll in notches (dy>0 = up, dx>0 = right). */
+    /** Wheel scroll in notches (dy>0 = up, dx>0 = right). A deliberate action, so it
+     *  claims touch (matching the desktop client, where scroll claims kbd/mouse). */
     fun pointerScroll(dx: Float, dy: Float) {
+        inputSource.set(SRC_TOUCH)
         runCatching { activeGamepad()?.scroll(dx, dy) }
     }
 

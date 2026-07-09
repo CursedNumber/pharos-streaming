@@ -486,7 +486,24 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                 val x = event.x
                 val y = event.y
                 tInContent = x >= cx && x < cx + cw && y >= cy && y < cy + ch
+                if (BuildConfig.DEBUG) {
+                    // One line per touch-DOWN so a live pass can confirm the mapping:
+                    // if the host cursor lands wrong, compare the content rect/aspect
+                    // here against the decoder's "output format WxH" — a mismatch is a
+                    // stale/wrong aspect, a correct rect points at the host or gyro.
+                    Log.d(
+                        TAG,
+                        "absTouch DOWN screen=(${event.x},${event.y}) " +
+                            "rect=[$cx,$cy,$cw,$ch] aspect=${StreamHub.videoAspect.value} " +
+                            "inContent=$tInContent",
+                    )
+                }
                 if (tInContent) {
+                    // A deliberate finger-down on the video claims the touch source, so
+                    // its motion is forwarded again after a pad had muted it (and so a
+                    // stray brush while gaming with a pad doesn't — the pad reclaims on
+                    // its next input). Claim BEFORE sendAbs, which is gated on it.
+                    StreamHub.claimTouchSource()
                     sendAbs(x, y)
                     StreamHub.pointerButton(0, true)
                     tPressed = true
@@ -510,6 +527,9 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     private fun handleTrackpadTouch(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                // Deliberate touch → claim the touch source (see handleAbsoluteTouch);
+                // trackpad drag/tap is gated on it in StreamHub.pointerRel.
+                StreamHub.claimTouchSource()
                 tDownTime = event.eventTime
                 tDownX = event.x
                 tDownY = event.y
