@@ -25,3 +25,16 @@ tokio-util = { version = "0.7", features = ["rt"] }
 anyhow = "1"
 hex = "0.4"
 thiserror = { workspace = true }
+# Logging: route the shared core's `tracing` output somewhere visible. The
+# transport/core crates log via `tracing`, but the Android/iOS shells load
+# this as a bare cdylib with no subscriber installed, so all of it was
+# silently dropped — `adb logcat` saw nothing from the Rust side (only the
+# Kotlin UI thread). `init_logging()` installs a subscriber; on Android
+# `paranoid-android` bridges it into logcat.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Android-only: the `tracing` → logcat bridge (only pulls `ndk-sys` on
+# Android, so desktop/iOS builds are unaffected).
+[target.'cfg(target_os = "android")'.dependencies]
+paranoid-android = "0.2"

@@ -42,6 +42,53 @@ pub fn greet(name: String) -> String {
     format!("Trireme says hello to {name}, served by Pharos core.")
 }
 
+/// Install a `tracing` subscriber for the shared core so its logs become
+/// visible on the platform shell. Idempotent: safe to call more than once (a
+/// second call is a no-op), and the core also lazily self-initializes on the
+/// first stream/pair, so logs work even if the shell never calls this.
+///
+/// - **Android** → logcat, under the tag `Trireme` (`adb logcat -s Trireme`).
+///   Without this the core's `tracing` output was silently dropped: the shell
+///   loads a bare `cdylib` with no subscriber, so `adb logcat` only ever saw
+///   the Kotlin UI thread, never the decoder / transport / gamepad internals.
+/// - **Everything else** (JVM desktop shell, iOS, tests) → a plain `fmt`
+///   subscriber on stderr.
+///
+/// `level` is a `RUST_LOG`-style filter (e.g. `"info"`, `"debug"`,
+/// `"info,transport=debug"`). An unparseable value falls back to `"info"`.
+#[uniffi::export]
+pub fn init_logging(level: String) {
+    ensure_logging(Some(&level));
+}
+
+/// The shared, once-only subscriber install behind [`init_logging`]. `level`
+/// = the caller's explicit filter, or `None` for the lazy default (`info`).
+/// Whoever calls first wins (an explicit `init_logging` at shell startup
+/// beats the lazy stream/pair fallback).
+fn ensure_logging(level: Option<&str>) {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let filter = tracing_subscriber::EnvFilter::try_new(level.unwrap_or("info"))
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        #[cfg(target_os = "android")]
+        {
+            use tracing_subscriber::layer::SubscriberExt;
+            use tracing_subscriber::util::SubscriberInitExt;
+            // `try_init` (not `init`) so a stray double-install can't panic
+            // and take the whole client down over a logging setup.
+            let _ = tracing_subscriber::registry()
+                .with(filter)
+                .with(paranoid_android::layer("Trireme"))
+                .try_init();
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+        }
+    });
+}
+
 /// Sink for decoded-stream bytes, implemented on the Kotlin side. Each
 /// `on_frame` carries one HEVC access unit to hand to MediaCodec; `on_end`
 /// fires when the stream closes (with an error message on failure).
@@ -540,6 +587,9 @@ pub fn start_video_stream(
     wants_gyro: bool,
     requested_mode: StreamMode,
 ) -> std::sync::Arc<GamepadInput> {
+    // Lazy fallback so the core's logs are captured even if the shell never
+    // called `init_logging` (no-op once anything already installed one).
+    ensure_logging(None);
     // Client→host input channel (gamepad today). The handle we return holds the
     // sender; the QUIC client task drains the receiver and opens the input bidi
     // stream. Idle if the shell never forwards an event (no controller).
@@ -736,6 +786,9 @@ pub fn client_pair(
     identity_path: String,
     our_alias: Option<String>,
 ) -> Result<PairResult, PairError> {
+    // Lazy fallback (see start_video_stream) — pairing usually happens before
+    // the first stream, so init here too or a pairing failure logs nowhere.
+    ensure_logging(None);
     // LAN first, then any fallbacks (WAN/DDNS). IDNA-aware (`bücher.example` works).
     let mut candidates = vec![addr];
     candidates.extend(alt_addrs);
