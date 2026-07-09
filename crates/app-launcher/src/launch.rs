@@ -499,6 +499,34 @@ fn run_steam_handoff(spec: SteamHandoffSpec) {
     // launch on a redirect hiccup.
     if let Some(appid) = spec.redirect_appid {
         let provider = crate::redirect::provider();
+        // Pin a winewayland-capable Proton for this game (opt-in, separate gate).
+        // Only redirected games reach here, so we never touch a game the user
+        // plays on the desktop. Same Steam-closed guard as the shim inject; best-
+        // effort, never fails the launch.
+        if crate::redirect::pin_proton_enabled() {
+            match provider.pin_proton(&detect_steam(), crate::redirect::RedirectId { appid }) {
+                Ok(crate::redirect::PinOutcome::Deferred) => tracing::warn!(
+                    "steam-launch[{}]: Proton pin for appid {appid} DEFERRED — Steam is already \
+                     running; config.vdf can't be armed now. Fully quit Steam and relaunch from \
+                     Pharos and the pin arms automatically.",
+                    spec.slug
+                ),
+                Ok(crate::redirect::PinOutcome::NoSuitableProton) => tracing::warn!(
+                    "steam-launch[{}]: no winewayland-capable Proton installed to pin for appid \
+                     {appid} — install proton-cachyos (or set PHAROS_STEAM_PROTON) or the stream \
+                     may stay blank. Continuing.",
+                    spec.slug
+                ),
+                Ok(outcome) => tracing::info!(
+                    "steam-launch[{}]: Proton pin for appid {appid}: {outcome:?}",
+                    spec.slug
+                ),
+                Err(e) => tracing::warn!(
+                    "steam-launch[{}]: Proton pin for appid {appid} failed (non-fatal): {e:#}",
+                    spec.slug
+                ),
+            }
+        }
         match provider
             .ensure_shim_installed()
             .and_then(|()| provider.inject(&detect_steam(), crate::redirect::RedirectId { appid }))

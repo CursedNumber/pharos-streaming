@@ -234,15 +234,17 @@ fn is_ours(value: &str, ours_token: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Leading whitespace (indentation) of a raw line.
-fn leading_ws(raw: &str) -> String {
+/// Leading whitespace (indentation) of a raw line. Crate-visible so the
+/// `config.vdf` CompatToolMapping editor in [`super::proton`] reuses it.
+pub(crate) fn leading_ws(raw: &str) -> String {
     raw.chars()
         .take_while(|c| *c == ' ' || *c == '\t')
         .collect()
 }
 
-/// The line ending of a raw line (`\r\n`, `\n`, or empty at EOF).
-fn line_ending(raw: &str) -> &'static str {
+/// The line ending of a raw line (`\r\n`, `\n`, or empty at EOF). Crate-visible
+/// so [`super::proton`] renders inserted lines with the file's own ending.
+pub(crate) fn line_ending(raw: &str) -> &'static str {
     if raw.ends_with("\r\n") {
         "\r\n"
     } else if raw.ends_with('\n') {
@@ -286,7 +288,8 @@ pub(crate) fn quoted_tokens(line: &str) -> Vec<String> {
 }
 
 /// Escape a value for a VDF quoted string: backslash and double-quote.
-fn escape_vdf(v: &str) -> String {
+/// Crate-visible so [`super::proton`] escapes compat-tool names the same way.
+pub(crate) fn escape_vdf(v: &str) -> String {
     let mut s = String::with_capacity(v.len());
     for c in v.chars() {
         match c {

@@ -30,11 +30,14 @@
 
 use std::path::PathBuf;
 
-// The VDF editor is only used by the unix launch-options injector; gating it with
-// `linux` keeps the Windows build free of dead-code warnings until a native
-// Windows provider lands.
+// The VDF editors are only used by the unix injectors; gating them with `unix`
+// keeps the Windows build free of dead-code warnings until a native Windows
+// provider lands.
 #[cfg(unix)]
 mod vdf;
+
+#[cfg(unix)]
+mod proton;
 
 #[cfg(unix)]
 mod linux;
@@ -72,6 +75,35 @@ pub fn enabled() -> bool {
     std::env::var_os("PHAROS_STEAM_REDIRECT").is_some_and(|v| v != "0")
 }
 
+/// Is the Proton auto-pin enabled? A *separate* opt-in
+/// (`PHAROS_STEAM_PIN_PROTON`) layered on top of the redirect, since it edits a
+/// second file (`config.vdf`) and changes which Proton a game runs under — a
+/// bigger commitment than wrapping Launch Options. Only ever consulted for a game
+/// Pharos is already redirecting.
+pub fn pin_proton_enabled() -> bool {
+    std::env::var_os("PHAROS_STEAM_PIN_PROTON").is_some_and(|v| v != "0")
+}
+
+/// Outcome of an idempotent `CompatToolMapping` (Proton) pin.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PinOutcome {
+    /// The named tool was pinned for the appid (inserted or overrode a Valve
+    /// default).
+    Pinned(String),
+    /// The appid already maps to our target tool — nothing to do.
+    AlreadyPinned,
+    /// Steam is running; a `config.vdf` write would be clobbered on exit.
+    /// Recorded as pending — it arms on the next Steam start.
+    Deferred,
+    /// Left untouched: the user forced a specific custom Proton, or the config
+    /// couldn't be navigated. Carries a reason.
+    Refused(String),
+    /// No winewayland-capable Proton is installed to pin.
+    NoSuitableProton,
+    /// Steam isn't installed / no data root found.
+    NoSteam,
+}
+
 /// Platform-specific redirect provider (Launch-Options shim + marker).
 pub trait RedirectProvider {
     /// Idempotently ensure the shim exists on disk (content-diff; `0755` on unix).
@@ -80,6 +112,12 @@ pub trait RedirectProvider {
     fn ours_token(&self) -> &str;
     /// Idempotently inject `<shim> %command%` into this game's Launch Options.
     fn inject(&self, install: &SteamInstall, id: RedirectId) -> anyhow::Result<InjectOutcome>;
+    /// Idempotently pin a known-good, winewayland-capable Proton for this game in
+    /// `config.vdf`'s `CompatToolMapping` (see [`pin_proton_enabled`]). Only fills
+    /// in an absent mapping or overrides a Wayland-breaking Valve default; never
+    /// touches a Proton the user explicitly forced. Same Steam-closed clobber
+    /// guard + backup as [`RedirectProvider::inject`].
+    fn pin_proton(&self, install: &SteamInstall, id: RedirectId) -> anyhow::Result<PinOutcome>;
 }
 
 /// The active platform provider.
@@ -108,6 +146,9 @@ impl RedirectProvider for NoopProvider {
     }
     fn inject(&self, _install: &SteamInstall, _id: RedirectId) -> anyhow::Result<InjectOutcome> {
         Ok(InjectOutcome::NoSteam)
+    }
+    fn pin_proton(&self, _install: &SteamInstall, _id: RedirectId) -> anyhow::Result<PinOutcome> {
+        Ok(PinOutcome::NoSteam)
     }
 }
 

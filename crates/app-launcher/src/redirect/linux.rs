@@ -10,8 +10,9 @@ use std::sync::Mutex;
 
 use anyhow::Context;
 
+use super::proton::{self, CompatEdit, CompatTool};
 use super::vdf::{self, EditResult};
-use super::{InjectOutcome, RedirectId, RedirectProvider};
+use super::{InjectOutcome, PinOutcome, RedirectId, RedirectProvider};
 use crate::env::SteamInstall;
 
 /// The shim basename — also the VDF "ours" token.
@@ -147,6 +148,101 @@ impl RedirectProvider for LinuxShimProvider {
             }
         }
     }
+
+    fn pin_proton(&self, install: &SteamInstall, id: RedirectId) -> anyhow::Result<PinOutcome> {
+        let Some(root) = install.root() else {
+            return Ok(PinOutcome::NoSteam);
+        };
+        let config = root.join("config").join("config.vdf");
+        if !config.is_file() {
+            return Ok(PinOutcome::Refused(format!(
+                "{} not found — cannot pin Proton",
+                config.display()
+            )));
+        }
+
+        // Which Proton to pin. An explicit `PHAROS_STEAM_PROTON=<internal-name>`
+        // wins verbatim (the user knows their install); otherwise auto-pick the
+        // best winewayland-capable tool discovered under the compatibilitytools.d
+        // dirs. Nothing suitable installed ⇒ decline rather than pin a Proton that
+        // would also fall back to XWayland.
+        let tools = discover_compat_tools(root);
+        let target = match std::env::var("PHAROS_STEAM_PROTON")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            Some(forced) => forced,
+            None => match proton::choose_tool(&tools) {
+                Some(t) => t.internal.clone(),
+                None => return Ok(PinOutcome::NoSuitableProton),
+            },
+        };
+
+        // Serialize config.vdf read-modify-write for the same lost-update reason as
+        // the localconfig injector (each game launch runs its own worker).
+        static WRITE_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let text = std::fs::read_to_string(&config)
+            .with_context(|| format!("read {}", config.display()))?;
+
+        match proton::set_compat_tool(&text, id.appid, &target) {
+            CompatEdit::AlreadyOurs => Ok(PinOutcome::AlreadyPinned),
+            CompatEdit::Refused => Ok(PinOutcome::Refused(format!(
+                "appid {} is force-set to a specific custom Proton — leaving it alone",
+                id.appid
+            ))),
+            CompatEdit::NoSteamBlock => Ok(PinOutcome::Refused(format!(
+                "{} has no Software>Valve>Steam block — not editing",
+                config.display()
+            ))),
+            CompatEdit::Changed(new_text) => {
+                // Same clobber guard as the launch-options write: a running Steam
+                // holds config.vdf in memory and rewrites it on exit.
+                if steam_is_running() {
+                    return Ok(PinOutcome::Deferred);
+                }
+                backup_once(&config)?;
+                atomic_write(&config, &new_text)?;
+                Ok(PinOutcome::Pinned(target))
+            }
+        }
+    }
+}
+
+/// Discover the custom compat tools installed under every `compatibilitytools.d`
+/// Steam consults: the user dir (both `<root>/compatibilitytools.d` and the
+/// canonical `~/.steam/root/compatibilitytools.d`, which may differ from `root`
+/// on flatpak/snap) and the system dir `/usr/share/steam/compatibilitytools.d`.
+/// Deduped by internal name (first occurrence wins, mirroring Steam's user-over-
+/// system precedence).
+fn discover_compat_tools(root: &Path) -> Vec<CompatTool> {
+    let mut dirs: Vec<PathBuf> = vec![root.join("compatibilitytools.d")];
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        dirs.push(home.join(".steam/root/compatibilitytools.d"));
+    }
+    dirs.push(PathBuf::from("/usr/share/steam/compatibilitytools.d"));
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<CompatTool> = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let manifest = entry.path().join("compatibilitytool.vdf");
+            let Ok(text) = std::fs::read_to_string(&manifest) else {
+                continue;
+            };
+            for tool in proton::parse_compat_tools(&text) {
+                if seen.insert(tool.internal.clone()) {
+                    out.push(tool);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// `$XDG_DATA_HOME/pharos/pharos-redirect` (default `~/.local/share/…`).
