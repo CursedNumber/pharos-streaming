@@ -321,7 +321,7 @@ impl Pipeline {
     fn mirror_input(&self) -> Option<&crate::mirror_input::MirrorInput> {
         match &self.source {
             CaptureSource::PhysicalMirror(m) => m.input.as_ref(),
-            CaptureSource::Virtual => None,
+            CaptureSource::Virtual | CaptureSource::MirrorPending(_) => None,
         }
     }
 }
@@ -333,21 +333,53 @@ enum CaptureSource {
     /// only behavior before issue #6; still the default for every output
     /// except the one flipped to a physical-mirror target.
     Virtual,
-    /// Stream the REAL host desktop session instead. Holds the live portal
-    /// session (dropping it tears the mirror down — the portal session
-    /// closes, the PipeWire + libei threads stop) plus the frame channel,
-    /// the persistent GL importer, and the libei input sink.
+    /// The portal handshake is running on a dedicated worker thread and hasn't
+    /// finished yet. That handshake BLOCKS on the user clicking "Share" in the
+    /// KDE permission dialog — which can take seconds — so it must never run on
+    /// the render loop (a >1.5s stall trips the P4 heartbeat watchdog and kills
+    /// the host before the dialog can even be read). The render loop polls this
+    /// channel each tick and flips to `PhysicalMirror` on success / back to
+    /// `Virtual` on failure (see `poll_mirror_pending`). Until then the pipeline
+    /// renders as `Virtual` (idle screen / app windows), stream stays live.
+    MirrorPending(std::sync::mpsc::Receiver<std::result::Result<MirrorReady, String>>),
+    /// Stream the REAL host desktop session instead. Holds the frame channel,
+    /// the persistent GL importer, the libei input sink, and the teardown
+    /// handle for the keeper thread that owns the portal session + PipeWire
+    /// stream + tokio runtime (dropping `MirrorState` drops that handle, which
+    /// signals the keeper to tear everything down — see `MirrorReady`).
     PhysicalMirror(Box<MirrorState>),
+}
+
+/// The Send-safe ingredients the portal keeper thread hands back to the render
+/// loop once negotiation succeeds. Everything that is NOT `Send` or must stay
+/// pinned to the runtime that created it (the `ashpd` session + the tokio
+/// runtime driving its zbus connection) stays on the keeper thread; only these
+/// cross the channel.
+#[cfg(feature = "portal-mirror")]
+pub struct MirrorReady {
+    frame_rx: std::sync::mpsc::Receiver<crate::portal_mirror::MirrorFrame>,
+    /// The libei socket from `ConnectToEIS`, spawned into a `MirrorInput` on the
+    /// render thread (spawn is cheap + non-blocking; the fd is `Send`, the input
+    /// thread is not required to be). `None` = view-only (portal too old / EIS
+    /// failed).
+    input_fd: Option<std::os::fd::OwnedFd>,
+    /// Dropping the matching `MirrorState._shutdown` resolves the keeper's
+    /// `await` on the receiver half (with `Err(RecvError)`), which tears the
+    /// session down. A tokio oneshot (not std mpsc) so the keeper can await it
+    /// INSIDE `block_on`, keeping the current-thread runtime driving zbus the
+    /// whole time it's parked.
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
 }
 
 /// Live state for a pipeline currently mirroring the real desktop.
 #[cfg(feature = "portal-mirror")]
 struct MirrorState {
-    /// Keeps the portal's RemoteDesktop+ScreenCast session (and thus the
-    /// PipeWire node + EIS socket) alive; dropped when the pipeline flips
-    /// back to `Virtual`.
-    _session: crate::portal_mirror::MirrorSession,
-    _stream: crate::portal_mirror::StreamHandle,
+    /// Teardown signal to the keeper thread: dropping this `Sender` (when the
+    /// pipeline flips back to `Virtual`, or the whole `MirrorState` is dropped)
+    /// resolves the keeper's awaited receiver, which then drops the portal
+    /// session, the PipeWire stream, and the tokio runtime — closing the mirror
+    /// cleanly.
+    _shutdown: tokio::sync::oneshot::Sender<()>,
     frame_rx: std::sync::mpsc::Receiver<crate::portal_mirror::MirrorFrame>,
     importer: crate::portal_mirror::MirrorImporter,
     /// `None` until the libei handshake/thread spawn succeeds (or if it
@@ -392,74 +424,183 @@ fn write_mirror_restore_token(token: &str) {
     }
 }
 
-/// Flip `pipeline` from `Virtual` to `PhysicalMirror`: negotiate the portal
-/// session (reusing a persisted restore token so a repeat launch doesn't
-/// re-prompt), start the PipeWire frame stream, and spawn the libei input
-/// bridge. Video and input degrade independently — a libei failure logs and
-/// leaves the mirror view-only rather than aborting the whole activation
-/// (matching the "Err = mirror source unavailable, not fatal" contract the
-/// rest of `portal_mirror` follows).
+/// Begin flipping `pipeline` from `Virtual` toward `PhysicalMirror`: spawn a
+/// dedicated keeper thread that negotiates the portal session (reusing a
+/// persisted restore token so a repeat launch doesn't re-prompt), starts the
+/// PipeWire frame stream, and connects the libei input socket. Video and input
+/// degrade independently — a libei failure logs and leaves the mirror view-only
+/// rather than aborting the whole activation.
 ///
-/// Synchronous by design: this runs from the render loop / `LaunchApp`
-/// control-thread handler, neither of which has an ambient async runtime, so
-/// a throwaway current-thread runtime drives the one-shot portal handshake.
+/// **NON-blocking by design.** The portal handshake blocks until the user clicks
+/// "Share" in the KDE permission dialog (seconds), so it CANNOT run on the render
+/// loop — a >1.5s stall trips the P4 heartbeat watchdog and kills the host before
+/// the dialog is even readable (the original synchronous version did exactly
+/// this). Instead the handshake runs on a keeper thread that also OWNS the tokio
+/// runtime for the mirror's whole lifetime: `ashpd` speaks D-Bus over zbus's
+/// tokio integration, so the session stays alive only while a runtime keeps
+/// driving its background reader — the old code's throwaway current-thread
+/// runtime (dropped when activation returned) would have silently killed the
+/// session. This function returns immediately with the pipeline in
+/// `MirrorPending`; the render loop's `poll_mirror_pending` installs the live
+/// `PhysicalMirror` (or reverts to `Virtual`) once the keeper reports back.
 #[cfg(feature = "portal-mirror")]
 fn activate_physical_mirror(pipeline: &mut Pipeline) -> Result<()> {
     use crate::portal_mirror::MirrorSession;
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| anyhow::anyhow!("mirror: build tokio runtime: {e}"))?;
+    let (ready_tx, ready_rx) =
+        std::sync::mpsc::channel::<std::result::Result<MirrorReady, String>>();
 
-    let restore_token = read_mirror_restore_token();
-    let session = rt.block_on(MirrorSession::open(restore_token.as_deref()))?;
-    if let Some(token) = &session.restore_token {
-        write_mirror_restore_token(token);
-    }
-    let stream_info = session
-        .streams
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("mirror: portal granted zero streams"))?
-        .clone();
+    std::thread::Builder::new()
+        .name("pharos-mirror-portal".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(format!("build tokio runtime: {e}")));
+                    return;
+                }
+            };
 
-    let (tx, frame_rx) = std::sync::mpsc::sync_channel(4);
-    let stream = crate::portal_mirror::spawn_frame_stream(stream_info.node_id, tx)?;
+            // The ENTIRE session lifetime runs inside one `block_on`: negotiate,
+            // hand back the Send ingredients, then await teardown. Staying inside
+            // `block_on` keeps the current-thread runtime driving zbus for the
+            // whole time the mirror is up — a runtime that stopped being driven
+            // would let the portal session go unresponsive.
+            rt.block_on(async move {
+                // Negotiate: open the session (this await blocks on the user's
+                // "Share" dialog click), persist any restore token, connect input.
+                let opened = async {
+                    let restore_token = read_mirror_restore_token();
+                    let session = MirrorSession::open(restore_token.as_deref()).await?;
+                    if let Some(token) = &session.restore_token {
+                        write_mirror_restore_token(token);
+                    }
+                    let stream_info = session
+                        .streams
+                        .first()
+                        .ok_or_else(|| anyhow::anyhow!("portal granted zero streams"))?
+                        .clone();
+                    let input_fd = match session.connect_input().await {
+                        Ok(fd) => Some(fd),
+                        Err(e) => {
+                            tracing::warn!("mirror: ConnectToEIS failed: {e:#} (view-only)");
+                            None
+                        }
+                    };
+                    Ok::<_, anyhow::Error>((session, stream_info, input_fd))
+                }
+                .await;
+                let (session, stream_info, input_fd) = match opened {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(format!("{e:#}")));
+                        return;
+                    }
+                };
 
-    let input = match rt.block_on(session.connect_input()) {
-        Ok(fd) => match crate::mirror_input::MirrorInput::spawn(fd) {
-            Ok(mi) => Some(mi),
-            Err(e) => {
-                tracing::warn!("mirror: libei thread failed to start: {e:#} (view-only)");
-                None
+                // PipeWire frame stream (its own MainLoop thread, independent of
+                // the runtime). Built here so a failure cancels the activation.
+                let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel(4);
+                let stream =
+                    match crate::portal_mirror::spawn_frame_stream(stream_info.node_id, frame_tx) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(format!("spawn frame stream: {e:#}")));
+                            return;
+                        }
+                    };
+
+                let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+                info!(
+                    "mirror: portal negotiated (stream {}x{:?}, input {})",
+                    stream_info.node_id,
+                    stream_info.size,
+                    if input_fd.is_some() {
+                        "live"
+                    } else {
+                        "unavailable"
+                    }
+                );
+                if ready_tx
+                    .send(Ok(MirrorReady {
+                        frame_rx,
+                        input_fd,
+                        shutdown_tx,
+                    }))
+                    .is_err()
+                {
+                    // Render loop gave up on us (deactivated before the dialog was
+                    // answered). Fall through: `stream` + `session` drop here.
+                    return;
+                }
+
+                // Park until the render loop drops the matching `MirrorState`
+                // (its `_shutdown` sender resolves this await with `Err`). The
+                // runtime keeps zbus serviced meanwhile; nothing spins.
+                let _ = shutdown_rx.await;
+                drop(stream);
+                drop(session);
+                tracing::info!("mirror: portal session torn down");
+            });
+        })
+        .map_err(|e| anyhow::anyhow!("mirror: spawn portal keeper thread: {e}"))?;
+
+    pipeline.source = CaptureSource::MirrorPending(ready_rx);
+    Ok(())
+}
+
+/// Render-loop step: if `pipeline` is `MirrorPending`, poll the keeper thread's
+/// channel and, on a result, flip to a live `PhysicalMirror` (spawning the
+/// libei input thread from the handed-back fd) or revert to `Virtual`. A no-op
+/// for any other source, and while the handshake is still in flight (the
+/// pipeline keeps rendering `Virtual` — idle screen / app windows — so the
+/// stream never freezes waiting on the dialog). Cheap: one `try_recv` per tick.
+#[cfg(feature = "portal-mirror")]
+fn poll_mirror_pending(pipeline: &mut Pipeline) {
+    // Scope the borrow of `pipeline.source` (via `rx`) so it ends before the
+    // reassignment below; `next` owns everything it needs.
+    let next: CaptureSource = {
+        let CaptureSource::MirrorPending(rx) = &pipeline.source else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(ready)) => {
+                let input = ready.input_fd.and_then(|fd| {
+                    match crate::mirror_input::MirrorInput::spawn(fd) {
+                        Ok(mi) => Some(mi),
+                        Err(e) => {
+                            tracing::warn!(
+                                "mirror: libei thread failed to start: {e:#} (view-only)"
+                            );
+                            None
+                        }
+                    }
+                });
+                info!("mirror: activated on output '{}'", pipeline.name);
+                CaptureSource::PhysicalMirror(Box::new(MirrorState {
+                    _shutdown: ready.shutdown_tx,
+                    frame_rx: ready.frame_rx,
+                    importer: crate::portal_mirror::MirrorImporter::default(),
+                    input,
+                    latest: None,
+                }))
             }
-        },
-        Err(e) => {
-            tracing::warn!("mirror: ConnectToEIS failed: {e:#} (view-only)");
-            None
+            Ok(Err(e)) => {
+                tracing::warn!("mirror: activation failed: {e}; staying on the virtual display");
+                CaptureSource::Virtual
+            }
+            // Still negotiating (dialog open / restore in flight): keep waiting.
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                tracing::warn!("mirror: portal keeper exited without a result; staying virtual");
+                CaptureSource::Virtual
+            }
         }
     };
-
-    info!(
-        "mirror: activated (stream {}x{:?}, input {})",
-        stream_info.node_id,
-        stream_info.size,
-        if input.is_some() {
-            "live"
-        } else {
-            "unavailable"
-        }
-    );
-
-    pipeline.source = CaptureSource::PhysicalMirror(Box::new(MirrorState {
-        _session: session,
-        _stream: stream,
-        frame_rx,
-        importer: crate::portal_mirror::MirrorImporter::default(),
-        input,
-        latest: None,
-    }));
-    Ok(())
+    pipeline.source = next;
 }
 
 /// Forward one keyboard/pointer `InputEvent` to the libei bridge instead of
@@ -511,7 +652,13 @@ fn apply_capture_target(
             target,
             Some(app_launcher::config::LaunchTarget::DuplicatePhysical)
         );
-    let is_mirroring = matches!(p0.source, CaptureSource::PhysicalMirror(_));
+    // `MirrorPending` counts as "already mirroring" — a repeat DuplicatePhysical
+    // launch while the dialog is still open must not spawn a second keeper /
+    // second permission prompt.
+    let is_mirroring = matches!(
+        p0.source,
+        CaptureSource::PhysicalMirror(_) | CaptureSource::MirrorPending(_)
+    );
     match (wants_mirror, is_mirroring) {
         (true, false) => {
             if let Err(e) = activate_physical_mirror(p0) {
@@ -523,14 +670,23 @@ fn apply_capture_target(
     }
 }
 
-/// Flip `pipeline` back to `Virtual`. Dropping the outgoing `MirrorState`
-/// tears everything down: the portal session closes (ending ScreenCast +
-/// RemoteDesktop), the PipeWire thread stops (`StreamHandle::drop`), and the
-/// libei thread stops (`MirrorInput::drop`).
+/// Flip `pipeline` back to `Virtual`. Dropping the outgoing source tears
+/// everything down: for a live `PhysicalMirror`, dropping `MirrorState`'s
+/// `_shutdown` sender wakes the keeper thread, which drops the portal session
+/// (ending ScreenCast + RemoteDesktop), the PipeWire stream, the tokio runtime,
+/// and the libei thread (`MirrorInput::drop`); for a `MirrorPending`, dropping
+/// the receiver makes the keeper's `ready_tx.send` fail and it tears itself down
+/// (cancelling an unanswered dialog).
 #[cfg(feature = "portal-mirror")]
 fn deactivate_physical_mirror(pipeline: &mut Pipeline) {
-    if matches!(pipeline.source, CaptureSource::PhysicalMirror(_)) {
-        info!("mirror: deactivated on output '{}'", pipeline.name);
+    match pipeline.source {
+        CaptureSource::PhysicalMirror(_) => {
+            info!("mirror: deactivated on output '{}'", pipeline.name)
+        }
+        CaptureSource::MirrorPending(_) => {
+            info!("mirror: activation cancelled on output '{}'", pipeline.name)
+        }
+        CaptureSource::Virtual => {}
     }
     pipeline.source = CaptureSource::Virtual;
 }
@@ -543,9 +699,15 @@ fn deactivate_physical_mirror(pipeline: &mut Pipeline) {
 /// can ever exist).
 #[cfg(feature = "portal-mirror")]
 fn primary_is_mirroring(pipelines: &[Option<Pipeline>]) -> bool {
+    // A pending activation counts as mirroring: the user intends the real
+    // desktop, so suppress the redirect marker now rather than briefly writing
+    // it for the seconds the dialog is open.
     matches!(
         pipelines.first(),
-        Some(Some(p)) if matches!(p.source, CaptureSource::PhysicalMirror(_))
+        Some(Some(p)) if matches!(
+            p.source,
+            CaptureSource::PhysicalMirror(_) | CaptureSource::MirrorPending(_)
+        )
     )
 }
 #[cfg(not(feature = "portal-mirror"))]
@@ -3790,6 +3952,14 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
         let mut frame_wire_us: u64 = 0;
         for (idx, slot) in pipelines.iter_mut().enumerate() {
             let Some(p) = slot.as_mut() else { continue };
+            // Desktop-mirror (issue #6): install a finished portal handshake (or
+            // revert a failed one) before rendering. Off-thread activation means
+            // this may flip `MirrorPending` → `PhysicalMirror`/`Virtual` on any
+            // tick. Runs even for a not-yet-streaming pipeline so a mirror armed
+            // at startup (enable_virtual_displays=false) settles before a client
+            // connects.
+            #[cfg(feature = "portal-mirror")]
+            poll_mirror_pending(p);
             if !p.is_streaming_target_ready() {
                 continue;
             }
@@ -3838,7 +4008,10 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                             .ok()
                     })
                 }
-                CaptureSource::Virtual => None,
+                // Virtual, or a portal handshake still in flight: render the
+                // ordinary app/idle composite this tick (the mirror installs
+                // via `poll_mirror_pending` once the user answers the dialog).
+                CaptureSource::Virtual | CaptureSource::MirrorPending(_) => None,
             };
             #[cfg(not(feature = "portal-mirror"))]
             let mirror_el: Option<
