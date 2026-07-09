@@ -4001,9 +4001,12 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                     while let Ok(f) = m.frame_rx.try_recv() {
                         m.latest = Some(f);
                     }
+                    // Best-fit into THIS output's logical canvas so a wide host
+                    // desktop letterboxes instead of cropping (issue #6).
+                    let dst = smithay::utils::Size::from((p.width as i32, p.height as i32));
                     m.latest.as_ref().and_then(|f| {
                         m.importer
-                            .element(&mut renderer, f)
+                            .element(&mut renderer, f, dst)
                             .map_err(|e| tracing::debug!("output[{}] mirror import: {e:#}", p.name))
                             .ok()
                     })

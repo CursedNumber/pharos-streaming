@@ -641,6 +641,12 @@ impl MirrorImporter {
     /// frame, ready to hand to `render_output` alongside (or instead of) the
     /// app-window elements.
     ///
+    /// `dst` is the target output's logical size. The element is **best-fit
+    /// scaled** into it, preserving aspect ratio and centered — so a wide host
+    /// desktop (e.g. 5120×1440) letterboxes into a 16:9 stream instead of being
+    /// cropped to its middle band. The uncovered bars are left to the caller's
+    /// clear color (`idle::BG`).
+    ///
     /// SHM frames only for now — a `DmaBuf` frame returns `Err`; its
     /// zero-copy EGLImage import is the deferred perf pass (see the module
     /// docs). Treat an `Err` as "mirror source unavailable this frame", not
@@ -650,6 +656,7 @@ impl MirrorImporter {
         &mut self,
         renderer: &mut GlesRenderer,
         frame: &MirrorFrame,
+        dst: smithay::utils::Size<i32, smithay::utils::Logical>,
     ) -> Result<MemoryRenderBufferRenderElement<GlesRenderer>> {
         let MirrorFrame::Shm {
             width,
@@ -719,13 +726,33 @@ impl MirrorImporter {
             .unwrap_or_else(|e: std::convert::Infallible| match e {});
         }
 
+        // Best-fit: scale the source into `dst` preserving aspect ratio, then
+        // center it (letterbox/pillarbox on the short axis). `size = Some(..)`
+        // on the element scales the full buffer to that logical size; `location`
+        // is the top-left of the fitted rect. Degenerate dst (0×0, before the
+        // first real output geometry) falls back to a 1:1 draw at the origin.
+        let (location, size) = if dst.w > 0 && dst.h > 0 {
+            let scale =
+                (f64::from(dst.w) / f64::from(*width)).min(f64::from(dst.h) / f64::from(*height));
+            let fit_w = ((f64::from(*width) * scale).round() as i32).max(1);
+            let fit_h = ((f64::from(*height) * scale).round() as i32).max(1);
+            let off_x = f64::from(dst.w - fit_w) / 2.0;
+            let off_y = f64::from(dst.h - fit_h) / 2.0;
+            (
+                (off_x.max(0.0), off_y.max(0.0)),
+                Some(smithay::utils::Size::from((fit_w, fit_h))),
+            )
+        } else {
+            ((0.0, 0.0), None)
+        };
+
         MemoryRenderBufferRenderElement::from_buffer(
             renderer,
-            (0.0, 0.0),
+            location,
             buffer,
             None,
             None,
-            None,
+            size,
             Kind::Unspecified,
         )
         .map_err(|e| anyhow::anyhow!("portal-mirror: import mirror frame into GL: {e:?}"))
