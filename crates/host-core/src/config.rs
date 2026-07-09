@@ -23,6 +23,34 @@ pub struct HostConfig {
     pub network: NetworkConfig,
     #[serde(default)]
     pub encode: EncodeConfig,
+    #[serde(default)]
+    pub compositor: CompositorConfig,
+}
+
+/// Compositor-wide toggles that aren't per-output (those live in `multi.toml`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompositorConfig {
+    /// Master switch (issue #6 desktop-mirror): when `true` (default), the
+    /// compositor builds the configured headless virtual output(s) as it
+    /// always has. When `false`, it builds NO virtual outputs at all —
+    /// every stream instead mirrors the host's REAL desktop session
+    /// (`LaunchTarget::DuplicatePhysical`), same as if every app entry
+    /// targeted the physical desktop. Off is for hosts that only ever want
+    /// "stream my actual screen," never an isolated per-app display.
+    #[serde(default = "default_true")]
+    pub enable_virtual_displays: bool,
+}
+
+impl Default for CompositorConfig {
+    fn default() -> Self {
+        Self {
+            enable_virtual_displays: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Encode-envelope limits. Today just the **pixel-throughput budget**: the

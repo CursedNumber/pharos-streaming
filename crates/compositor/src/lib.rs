@@ -72,10 +72,14 @@ pub mod idle;
 pub mod color_mgmt;
 pub mod cuegl;
 pub mod multi;
+// Desktop-mirror: keyboard/pointer injection into the real desktop session
+// via libei, fed from `portal_mirror::MirrorSession::connect_input`.
+#[cfg(feature = "portal-mirror")]
+pub mod mirror_input;
 pub mod nvenc;
 pub mod pairing;
-// Session-mirror capture scaffold (mirror the user's real desktop via the
-// xdg-desktop-portal + PipeWire); experimental, off by default.
+// Desktop-mirror capture (mirror the user's real desktop via the
+// xdg-desktop-portal + PipeWire); on by default on Linux (issue #6).
 #[cfg(feature = "portal-mirror")]
 pub mod portal_mirror;
 pub mod preview;

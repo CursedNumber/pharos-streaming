@@ -161,6 +161,26 @@ struct HostConfigToml {
     mqtt: MqttToml,
     #[serde(default)]
     network: NetworkToml,
+    #[serde(default)]
+    compositor: CompositorToml,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompositorToml {
+    #[serde(default = "default_true")]
+    enable_virtual_displays: bool,
+}
+
+impl Default for CompositorToml {
+    fn default() -> Self {
+        Self {
+            enable_virtual_displays: default_true(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -276,14 +296,16 @@ pub fn load_host_config() -> HostConfigUi {
         mqtt_publish_interval_secs: cfg.mqtt.publish_interval_secs,
         bind_mac: cfg.network.bind_mac.unwrap_or_default(),
         ipv6: cfg.network.ipv6,
+        enable_virtual_displays: cfg.compositor.enable_virtual_displays,
     }
 }
 
-/// Write `config.toml`'s `[mqtt]` + `[network]` tables, **preserving any other
-/// section a host may have authored** (`config.toml` is shared with the host).
-/// Read-merge-write: parse the on-disk file generically, replace only the two
-/// tables we own, re-serialize. Empty Strings serialize as absent (`None`),
-/// matching the host's "missing == unset" convention.
+/// Write `config.toml`'s `[mqtt]` + `[network]` + `[compositor]` tables,
+/// **preserving any other section a host may have authored** (`config.toml`
+/// is shared with the host). Read-merge-write: parse the on-disk file
+/// generically, replace only the tables we own, re-serialize. Empty Strings
+/// serialize as absent (`None`), matching the host's "missing == unset"
+/// convention.
 pub fn save_host_config(c: &HostConfigUi) -> Result<()> {
     let p = path("config.toml");
     let existing = std::fs::read_to_string(&p).unwrap_or_default();
@@ -291,9 +313,9 @@ pub fn save_host_config(c: &HostConfigUi) -> Result<()> {
     atomic_write(&p, &merge_host_config_toml(&existing, c)?, Some(0o600))
 }
 
-/// Merge the panel-owned `[mqtt]`/`[network]` tables into `existing` (parsed as a
-/// generic table so sections the panel doesn't model survive). Pure + filesystem-
-/// free so it can be unit-tested directly.
+/// Merge the panel-owned `[mqtt]`/`[network]`/`[compositor]` tables into
+/// `existing` (parsed as a generic table so sections the panel doesn't model
+/// survive). Pure + filesystem-free so it can be unit-tested directly.
 fn merge_host_config_toml(existing: &str, c: &HostConfigUi) -> Result<String> {
     fn opt(s: &str) -> Option<&str> {
         let t = s.trim();
@@ -339,6 +361,14 @@ fn merge_host_config_toml(existing: &str, c: &HostConfigUi) -> Result<String> {
         network.insert("ipv6".into(), true.into());
     }
     root.insert("network".into(), network.into());
+
+    let mut compositor = toml::Table::new();
+    // On is the default (host reads a missing key as true); only write it
+    // when off, same "omit the default" convention as `[network] ipv6` above.
+    if !c.enable_virtual_displays {
+        compositor.insert("enable_virtual_displays".into(), false.into());
+    }
+    root.insert("compositor".into(), compositor.into());
 
     toml::to_string_pretty(&root).context("serialize config.toml")
 }

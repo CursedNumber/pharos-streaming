@@ -187,10 +187,16 @@ PIN. Packaging sources live in [`packaging/`](packaging/README.md).
 sudo apt-get install -y \
   libwayland-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev \
   libdrm-dev libudev-dev libusb-1.0-0-dev libxkbcommon-dev \
-  libinput-dev libxcb1-dev libopus-dev pkg-config
+  libinput-dev libxcb1-dev libopus-dev pkg-config \
+  clang libclang-dev libpipewire-0.3-dev
 ```
 
 `ffmpeg` is required at **runtime** (client decode / some capture paths).
+`clang`/`libpipewire-0.3-dev` are for the compositor's desktop-mirror capture
+(issue #6, `portal-mirror` feature — on by default on Linux); at runtime it
+also needs `xdg-desktop-portal` plus a backend for your desktop (e.g.
+`xdg-desktop-portal-kde`/`-gnome`/`-wlr`) to actually mirror the real screen —
+without one, the host just falls back to virtual displays.
 
 **Build.** The `compositor` crate needs an NVIDIA driver + CUDA (it links
 `libnvidia-encode` / `libnvcuvid`). Without them, build everything else:

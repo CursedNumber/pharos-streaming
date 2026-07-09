@@ -293,12 +293,16 @@ en = "Extend the physical desktop (coming soon)"
 nb = "Utvid det fysiske skrivebordet (kommer snart)"
 
 ["apps.target.duplicate"]
-en = "Duplicate the physical desktop (coming soon)"
-nb = "Dupliser det fysiske skrivebordet (kommer snart)"
+en = "Mirror the real desktop"
+nb = "Speil det virkelige skrivebordet"
 
 ["apps.target.physical_note"]
-en = "Physical-desktop targets aren't wired into the compositor yet — the choice is saved, but launching one reports it's unavailable for now."
-nb = "Fysisk-skrivebord-mål er ikke koblet inn i compositoren ennå — valget lagres, men å starte ett rapporterer at det er utilgjengelig foreløpig."
+en = "Extending the physical desktop isn't wired into the compositor yet — the choice is saved, but launching this app reports it's unavailable for now. Duplicate (mirror) works today."
+nb = "Å utvide det fysiske skrivebordet er ikke koblet inn i compositoren ennå — valget lagres, men å starte denne appen rapporterer at det er utilgjengelig foreløpig. Dupliser (speil) fungerer allerede."
+
+["apps.target.mirror_note"]
+en = "This app streams your REAL desktop (issue #6) — the first launch after a host restart shows a one-time permission prompt, and keyboard/mouse control it directly."
+nb = "Denne appen strømmer ditt VIRKELIGE skrivebord (sak #6) — første oppstart etter en vertsomstart viser en engangs tillatelsesforespørsel, og tastatur/mus styrer det direkte."
 
 # --- status notes ---------------------------------------------------------
 ["apps.saved"]

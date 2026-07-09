@@ -80,6 +80,15 @@ pub fn ui(ui: &mut egui::Ui, state: &mut PanelState) {
     .default_open(true)
     .show(ui, |ui| streaming_section(ui, state));
 
+    // Desktop mirror (issue #6): the master switch between the usual
+    // per-app virtual displays and mirroring the real host desktop.
+    egui::CollapsingHeader::new(
+        egui::RichText::new(format!("{}  {}", ph::MONITOR, tr("settings.desktop.title"))).strong(),
+    )
+    .id_salt("set_desktop")
+    .default_open(false)
+    .show(ui, |ui| desktop_section(ui, state));
+
     egui::CollapsingHeader::new(
         egui::RichText::new(format!("{}  {}", ph::LOCK, tr("settings.security.title"))).strong(),
     )
@@ -282,6 +291,33 @@ fn streaming_section(ui: &mut egui::Ui, state: &mut PanelState) {
                 .small(),
         )
         .describe(tr("settings.streaming.desc"));
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Desktop mirror (issue #6) — master switch
+// ---------------------------------------------------------------------------
+
+fn desktop_section(ui: &mut egui::Ui, state: &mut PanelState) {
+    crate::widgets::card(ui, "desktop_card", |ui| {
+        if ui
+            .checkbox(
+                &mut state.host_config.enable_virtual_displays,
+                tr("settings.desktop.enable_virtual_displays"),
+            )
+            .describe(tr("settings.desktop.enable_virtual_displays_desc"))
+            .changed()
+        {
+            state.dirty_host = true;
+        }
+
+        ui.add_space(4.0);
+        let hint = if state.host_config.enable_virtual_displays {
+            tr("settings.desktop.hint_on")
+        } else {
+            tr("settings.desktop.hint_off")
+        };
+        ui.label(egui::RichText::new(hint).weak().small());
     });
 }
 

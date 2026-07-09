@@ -18,8 +18,11 @@ url="https://github.com/CursedNumber/pharos-streaming"
 license=(GPL-3.0-or-later)
 # nvidia-utils supplies the libnvidia-encode.so / libnvcuvid.so the NVENC
 # crate links against; opus must be the system lib so pkg-config finds it
-# (otherwise the bundled copy is built, needlessly).
-makedepends=(rust nvidia-utils mesa libdrm libxkbcommon pixman expat opus libusb systemd-libs)
+# (otherwise the bundled copy is built, needlessly). clang + pipewire are for
+# the desktop-mirror capture path (issue #6, `portal-mirror` feature — ON by
+# default): pipewire-rs's sys crate needs libpipewire-0.3 headers + clang at
+# build time.
+makedepends=(rust nvidia-utils mesa libdrm libxkbcommon pixman expat opus libusb systemd-libs clang pipewire)
 source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 
@@ -40,9 +43,10 @@ build() {
 
 package_pharos() {
   pkgdesc="Pharos game-streaming host (headless Wayland compositor + NVENC)"
-  depends=(glibc gcc-libs nvidia-utils mesa libdrm libxkbcommon pixman expat opus libpulse)
+  depends=(glibc gcc-libs nvidia-utils mesa libdrm libxkbcommon pixman expat opus libpulse pipewire)
   optdepends=(
     'vulkan-driver: GPU-accelerated pharos-panel UI'
+    'xdg-desktop-portal: desktop-mirror mode (issue #6) — also needs a portal backend for your desktop (e.g. xdg-desktop-portal-kde/-gnome/-wlr)'
   )
 
   cd "$pkgbase-$pkgver"

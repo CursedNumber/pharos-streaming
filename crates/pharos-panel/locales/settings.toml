@@ -141,6 +141,27 @@ nb = "Hvor mange bilder enkoderen kan bufre. Lavere = lavere ventetid, men mer u
 en = "Tip: the encoder itself (NVENC / Quick Sync / AMF / software) is chosen on the Video tab."
 nb = "Tips: selve enkoderen (NVENC / Quick Sync / AMF / programvare) velges under Video-fanen."
 
+# --- Desktop mirror (issue #6) -----------------------------------------------
+["settings.desktop.title"]
+en = "Desktop"
+nb = "Skrivebord"
+
+["settings.desktop.enable_virtual_displays"]
+en = "Enable virtual displays"
+nb = "Aktiver virtuelle skjermer"
+
+["settings.desktop.enable_virtual_displays_desc"]
+en = "On (default): apps stream to their own isolated virtual display, as configured per app. Off: nothing gets an isolated virtual display — every stream, including the built-in Desktop tile, mirrors your REAL desktop instead, with full keyboard/mouse control of it."
+nb = "På (standard): apper strømmes til sin egen isolerte virtuelle skjerm, slik det er satt opp per app. Av: ingen får en isolert virtuell skjerm — all strømming, inkludert den innebygde Skrivebord-flisen, speiler i stedet ditt VIRKELIGE skrivebord, med full tastatur-/musekontroll over det."
+
+["settings.desktop.hint_on"]
+en = "The built-in Desktop tile still mirrors your real desktop by default — this switch controls apps with their own display."
+nb = "Den innebygde Skrivebord-flisen speiler fortsatt det virkelige skrivebordet ditt som standard — denne bryteren gjelder apper med egen skjerm."
+
+["settings.desktop.hint_off"]
+en = "Every app now streams your real desktop. Per-app display choices in the app editor are ignored while this is off."
+nb = "Alle apper strømmer nå det virkelige skrivebordet ditt. Valg av skjerm per app i appredigereren blir ignorert så lenge dette er av."
+
 # --- Security ---------------------------------------------------------------
 ["settings.security.title"]
 en = "Security"

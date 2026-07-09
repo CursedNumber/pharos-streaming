@@ -16,8 +16,8 @@ use std::process::{Child, Command};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::config::AppEntry;
-use crate::env::{classify_target, detect_steam};
+use crate::config::{AppEntry, LaunchTarget};
+use crate::env::detect_steam;
 
 /// Steam's URI handler can race with pipe creation: a `steam://` handoff fired
 /// the instant `~/.steam/steam.pipe` first appears is occasionally dropped on
@@ -130,13 +130,13 @@ pub fn launch(entry: &AppEntry, ctx: &LaunchContext) -> anyhow::Result<Option<Ch
         return Ok(None);
     }
 
-    // Physical-desktop footgun guard — LINUX ONLY. On the Linux compositor,
-    // extend/duplicate of the host's *real* session is the dangerous target: a
-    // cold-started GPU app lands on the live desktop AND can SIGSEGV NVENC (the
-    // documented libnvcuvid crash in the ffmpeg encode path). Refuse explicitly —
-    // never silently spawn onto the physical session. (When the physical seam is
-    // finally wired, this stays the cold-start refusal; a future warm/attach
-    // path would carve out its own branch rather than dropping the guard.)
+    // Extend-physical footgun guard — LINUX ONLY. `DuplicatePhysical` is wired
+    // (issue #6: the compositor mirrors the real desktop via xdg-desktop-portal
+    // + PipeWire/libei instead of cold-spawning INTO it — nothing new lands on
+    // the live session, so the NVENC libnvcuvid cold-start SIGSEGV this guard
+    // exists for doesn't apply). `ExtendPhysical` remains unwired and dangerous
+    // in the same way `DuplicatePhysical` used to be: refuse explicitly rather
+    // than silently doing the wrong thing.
     //
     // On WINDOWS (issue #22) the virtual/physical split this guard encodes does
     // not exist: the streamed surface IS a real desktop output (DDA/WGC capture
@@ -147,23 +147,22 @@ pub fn launch(entry: &AppEntry, ctx: &LaunchContext) -> anyhow::Result<Option<Ch
     // drives the NVENC SDK in-process without ever loading it — verified live on
     // the rig (2026-07-07): a cold Steam start + GPU game launch during a
     // running in-process NVENC session encodes on undisturbed. So Windows skips
-    // both this guard and the not-yet-wired gate below.
-    if cfg!(not(windows)) && classify_target(&entry.target).is_physical() {
+    // both this guard and the not-yet-supported gate below.
+    if cfg!(not(windows)) && matches!(entry.target, LaunchTarget::ExtendPhysical) {
         anyhow::bail!(
-            "app `{}` targets {:?} (the host's PHYSICAL desktop), which the \
-             launcher refuses to cold-start into: a fresh GPU app would appear on \
-             the real session being captured AND can crash the NVENC encoder \
-             (the documented libnvcuvid SIGSEGV). Extend/duplicate the physical \
-             desktop as a stream source is a planned feature; until it's wired to \
-             attach to an already-running session, launching into it is gated off. \
-             Use a virtual-display target instead.",
+            "app `{}` targets {:?} (extending the host's PHYSICAL desktop), which \
+             the launcher refuses to cold-start into: a fresh GPU app would appear \
+             on the real session being captured AND can crash the NVENC encoder \
+             (the documented libnvcuvid SIGSEGV). Duplicate/mirror the physical \
+             desktop is wired (issue #6); extending it is still a planned feature. \
+             Use DuplicatePhysical or a virtual-display target instead.",
             entry.slug,
             entry.target
         );
     }
 
     // Defense in depth (Linux only, see above): any other not-yet-supported
-    // target (should be subsumed by the physical guard, but keep the explicit
+    // target (should be subsumed by the guard above, but keep the explicit
     // gate so a new LaunchTarget variant can't silently slip through to a spawn).
     if cfg!(not(windows)) && !entry.target.is_supported() {
         anyhow::bail!(
@@ -1175,25 +1174,43 @@ mod tests {
         assert!(child.is_none());
     }
 
+    /// `ExtendPhysical` is the one target still refused (unwired) on Linux —
+    /// `DuplicatePhysical` was wired for issue #6 (desktop mirror mode) and no
+    /// longer hits this guard; see `duplicate_physical_target_launches`.
     #[cfg(not(windows))]
     #[test]
-    fn physical_target_is_refused_with_clear_reason() {
-        for target in [
-            LaunchTarget::ExtendPhysical,
-            LaunchTarget::DuplicatePhysical,
-        ] {
-            let e = AppEntry {
-                slug: "x".into(),
-                name: "X".into(),
-                command: "true".into(),
-                target,
-                ..AppEntry::new()
-            };
-            let err = launch(&e, &LaunchContext::default())
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("PHYSICAL"), "reason must be explicit: {err}");
-            assert!(err.contains("NVENC"), "reason must name the footgun: {err}");
+    fn extend_physical_target_is_refused_with_clear_reason() {
+        let e = AppEntry {
+            slug: "x".into(),
+            name: "X".into(),
+            command: "true".into(),
+            target: LaunchTarget::ExtendPhysical,
+            ..AppEntry::new()
+        };
+        let err = launch(&e, &LaunchContext::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("PHYSICAL"), "reason must be explicit: {err}");
+        assert!(err.contains("NVENC"), "reason must name the footgun: {err}");
+    }
+
+    /// Issue #6: `DuplicatePhysical` is wired (the compositor mirrors the
+    /// real desktop instead of cold-spawning into it), so `launch` no longer
+    /// refuses it on Linux — it spawns normally, same as a virtual target.
+    #[cfg(not(windows))]
+    #[test]
+    fn duplicate_physical_target_launches() {
+        let e = AppEntry {
+            slug: format!("phys-dup-{}", std::process::id()),
+            name: "X".into(),
+            command: "true".into(),
+            target: LaunchTarget::DuplicatePhysical,
+            ..AppEntry::new()
+        };
+        let child = launch(&e, &LaunchContext::default())
+            .expect("DuplicatePhysical must be wired, not refused");
+        if let Some(mut c) = child {
+            c.wait().ok();
         }
     }
 

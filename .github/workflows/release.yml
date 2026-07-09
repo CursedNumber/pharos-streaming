@@ -43,7 +43,8 @@ jobs:
             build-essential pkg-config curl ca-certificates \
             libwayland-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev \
             libdrm-dev libudev-dev libusb-1.0-0-dev libxkbcommon-dev \
-            libinput-dev libxcb1-dev libopus-dev
+            libinput-dev libxcb1-dev libopus-dev \
+            clang libclang-dev libpipewire-0.3-dev
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

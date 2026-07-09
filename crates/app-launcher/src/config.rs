@@ -39,18 +39,23 @@ pub enum AppKind {
 
 /// *Where* an app should be launched.
 ///
-/// This is the seam that keeps "duplicate / extend the **physical** desktop" a
+/// This is the seam that kept "duplicate / extend the **physical** desktop" a
 /// drop-in later rather than a rewrite: every layer (config, control-IPC, the
 /// client relay, the panel editor) carries this opaquely, and only [`launch`]
-/// matches on it. v1 implements the virtual-display targets; the physical ones
-/// are accepted, stored, and shown, but [`launch`] returns a clear "not wired
-/// yet" error instead of silently doing the wrong thing.
+/// matches on it. **`DuplicatePhysical` is wired** (issue #6, "desktop mirror
+/// mode"): the Linux compositor mirrors the real desktop session via
+/// xdg-desktop-portal + PipeWire (video) and libei (keyboard/pointer input);
+/// on Windows every target already means this (WGC/DDA capture is physical
+/// by nature — see [`launch`]'s guard). `ExtendPhysical` remains reserved —
+/// accepted, stored, and shown, but [`launch`] still returns a clear "not
+/// wired yet" error for it instead of silently doing the wrong thing.
 ///
 /// [`launch`]: crate::launch::launch
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum LaunchTarget {
-    /// The Pharos virtual display (headless Wayland output). The default.
+    /// The Pharos virtual display (headless Wayland output). The default for
+    /// every entry except the built-in `desktop` (see [`AppEntry::desktop_builtin`]).
     #[default]
     VirtualDisplay,
     /// A specific named virtual output (a `multi.toml` output name). Advisory in
@@ -59,7 +64,8 @@ pub enum LaunchTarget {
     VirtualOutput(String),
     /// Reserved: extend the host's physical desktop with the stream.
     ExtendPhysical,
-    /// Reserved: duplicate/mirror the host's physical desktop.
+    /// Duplicate/mirror the host's physical desktop (issue #6). The default
+    /// for the built-in `desktop` entry.
     DuplicatePhysical,
 }
 
@@ -140,21 +146,25 @@ impl FpsCap {
 }
 
 impl LaunchTarget {
-    /// True for the targets [`launch`](crate::launch::launch) can currently spawn
-    /// into (the virtual-display family). The physical-desktop seam is not yet
-    /// wired.
+    /// True for the targets [`launch`](crate::launch::launch) can currently
+    /// spawn into: the virtual-display family, plus `DuplicatePhysical` now
+    /// that the desktop mirror is wired (issue #6). `ExtendPhysical` remains
+    /// the one reserved/unsupported seam.
     pub fn is_supported(&self) -> bool {
         matches!(
             self,
-            LaunchTarget::VirtualDisplay | LaunchTarget::VirtualOutput(_)
+            LaunchTarget::VirtualDisplay
+                | LaunchTarget::VirtualOutput(_)
+                | LaunchTarget::DuplicatePhysical
         )
     }
 
     /// True for the targets that paint onto the host's **real** session — extend
-    /// or duplicate the physical desktop. Cold-starting a GPU app onto a
-    /// live-captured physical session is the documented footgun (it lands on the
-    /// real desktop *and* can SIGSEGV NVENC), so [`launch`](crate::launch::launch)
-    /// must refuse to spawn into these even once they're otherwise wired.
+    /// or duplicate the physical desktop. Purely descriptive (used by the panel
+    /// to label a target "real desktop"); it does NOT imply "unsupported" —
+    /// see [`is_supported`](Self::is_supported), which now allows
+    /// `DuplicatePhysical` through. [`launch`](crate::launch::launch)'s guard
+    /// bails on `ExtendPhysical` specifically, not on this predicate.
     ///
     /// Centralized here so every layer agrees on what "physical" means.
     pub fn is_physical_target(&self) -> bool {
@@ -309,7 +319,12 @@ impl AppEntry {
             cwd: None,
             env: Vec::new(),
             box_art: None,
-            target: LaunchTarget::VirtualDisplay,
+            // Desktop mirror mode (issue #6) is the default for the built-in
+            // Desktop entry: streaming "your desktop" now means the REAL
+            // host desktop, not an isolated virtual one. Per-app entries
+            // still default to `VirtualDisplay` (an app's isolated stream
+            // display); the panel's target picker lets either be overridden.
+            target: LaunchTarget::DuplicatePhysical,
             gyro_mode: GyroMode::default(),
             perf_overlay: false,
             fps_cap: FpsCap::default(),
@@ -520,7 +535,11 @@ mod tests {
         assert!(LaunchTarget::ExtendPhysical.is_physical_target());
         assert!(LaunchTarget::DuplicatePhysical.is_physical_target());
         assert!(!LaunchTarget::VirtualDisplay.is_physical_target());
+        // ExtendPhysical stays reserved/unsupported; DuplicatePhysical is
+        // wired (issue #6 desktop mirror) — `is_physical_target` describes
+        // "targets the real desktop", NOT "unsupported".
         assert!(!LaunchTarget::ExtendPhysical.is_supported());
+        assert!(LaunchTarget::DuplicatePhysical.is_supported());
         assert!(LaunchTarget::VirtualDisplay.is_supported());
     }
 

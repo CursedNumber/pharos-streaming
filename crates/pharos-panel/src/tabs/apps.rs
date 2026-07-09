@@ -686,6 +686,8 @@ fn target_picker(ui: &mut egui::Ui, draft: &mut AppEntry) {
             );
         }
         if !draft.target.is_supported() {
+            // Only `ExtendPhysical` reaches here now — `DuplicatePhysical` is
+            // wired (issue #6) and `is_supported()` returns true for it.
             ui.label(
                 egui::RichText::new(format!(
                     "{}  {}",
@@ -694,6 +696,12 @@ fn target_picker(ui: &mut egui::Ui, draft: &mut AppEntry) {
                 ))
                 .small()
                 .color(crate::theme::info()),
+            );
+        } else if matches!(draft.target, LaunchTarget::DuplicatePhysical) {
+            ui.label(
+                egui::RichText::new(format!("{}  {}", ph::INFO, tr("apps.target.mirror_note")))
+                    .small()
+                    .color(crate::theme::info()),
             );
         }
     });

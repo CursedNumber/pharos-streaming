@@ -540,11 +540,17 @@ pub struct HostConfigUi {
     pub bind_mac: String,
     /// `[network] ipv6` — bind the QUIC listener dual-stack (IPv6 + IPv4). Off by default.
     pub ipv6: bool,
+    /// `[compositor] enable_virtual_displays` (issue #6 desktop mirror) — the
+    /// master switch. On by default (today's behavior unchanged); off routes
+    /// every stream through the real-desktop mirror instead of a headless
+    /// virtual output.
+    pub enable_virtual_displays: bool,
 }
 
 impl Default for HostConfigUi {
     fn default() -> Self {
-        // Matches host-core's MqttConfig defaults (everything off, HA prefix).
+        // Matches host-core's MqttConfig/CompositorConfig defaults (MQTT off,
+        // HA prefix; virtual displays ON).
         Self {
             mqtt_enabled: false,
             mqtt_host: "127.0.0.1".into(),
@@ -556,6 +562,7 @@ impl Default for HostConfigUi {
             mqtt_publish_interval_secs: 10,
             bind_mac: String::new(),
             ipv6: false,
+            enable_virtual_displays: true,
         }
     }
 }

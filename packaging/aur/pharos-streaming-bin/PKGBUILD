@@ -25,9 +25,10 @@ sha256sums=('SKIP'
 
 package_pharos-bin() {
   pkgdesc="Pharos game-streaming host (headless Wayland compositor + NVENC, prebuilt)"
-  depends=(glibc gcc-libs nvidia-utils mesa libdrm libxkbcommon pixman expat opus libpulse)
+  depends=(glibc gcc-libs nvidia-utils mesa libdrm libxkbcommon pixman expat opus libpulse pipewire)
   optdepends=(
     'vulkan-driver: GPU-accelerated pharos-panel UI'
+    'xdg-desktop-portal: desktop-mirror mode (issue #6) — also needs a portal backend for your desktop (e.g. xdg-desktop-portal-kde/-gnome/-wlr)'
   )
   provides=(pharos)
   conflicts=(pharos)

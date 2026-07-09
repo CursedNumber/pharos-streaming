@@ -27,13 +27,16 @@
 //!    never has to change when the fast path lands.
 //!
 //! Implemented today: portal negotiation (with restore-token plumbing), the
-//! PipeWire stream thread, SHM frame delivery, and DMA-BUF plane collection
-//! (fds duplicated so they outlive the pool buffer). Not yet implemented:
-//! DMA-BUF modifier negotiation in the format pod (SHM formats only for now),
-//! the EGLImage -> GL import ([`import_frame_gl`] bails), and the libei
-//! bridge behind [`MirrorSession::connect_input`] (returns the raw fd; the
-//! `reis` protocol handling is the wiring pass). `pharos-compositor mirror`
-//! is the smoke test: negotiate, stream, print what arrives.
+//! PipeWire stream thread, SHM frame delivery, DMA-BUF plane collection (fds
+//! duplicated so they outlive the pool buffer), the SHM -> [`MemoryRenderBuffer`]
+//! import ([`MirrorImporter`], feeding the same damage-tracked memory-import
+//! path the idle screen uses — see `idle.rs`), and the libei input bridge
+//! (`mirror_input.rs`, driven off [`MirrorSession::connect_input`]'s fd). Not
+//! yet implemented: DMA-BUF modifier negotiation in the format pod (SHM
+//! formats only for now) and the DMA-BUF -> EGLImage zero-copy import (a
+//! deferred perf pass; [`MirrorImporter::element`] returns `Err` for a
+//! `DmaBuf` frame today). `pharos-compositor mirror` is the smoke test:
+//! negotiate, stream, print what arrives.
 
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -45,6 +48,13 @@ use ashpd::desktop::remote_desktop::{
 use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
 use ashpd::desktop::{CreateSessionOptions, PersistMode, Session};
 use ashpd::enumflags2::BitFlags;
+use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::element::memory::{
+    MemoryRenderBuffer, MemoryRenderBufferRenderElement,
+};
+use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::utils::{Rectangle, Transform};
 
 // ---------------------------------------------------------------------------
 // Portal session
@@ -76,11 +86,46 @@ pub struct MirrorSession {
     pub restore_token: Option<String>,
 }
 
+/// Detect the KDE-specific "a RemoteDesktop session cannot persist" portal
+/// rejection by message text (ashpd/ D-Bus don't expose a distinct error
+/// variant for it — it surfaces as a generic `InvalidArgument`). Matched
+/// loosely (case-insensitive "persist") so a differently-worded backend
+/// hitting the same limitation still falls back instead of hard-failing.
+fn is_persist_unsupported(e: &anyhow::Error) -> bool {
+    format!("{e:#}").to_ascii_lowercase().contains("persist")
+}
+
 impl MirrorSession {
     /// Negotiate the combined portal session: ask for keyboard+pointer remote
     /// control and monitor screen-cast sources, then start it (the user sees
     /// one permission/selection dialog, or none with a valid restore token).
+    ///
+    /// **Live-validated finding (2026-07-09, KDE Plasma/`xdg-desktop-portal-kde`
+    /// on Wayland):** this backend rejects `PersistMode::ExplicitlyRevoked`
+    /// outright for a session that also selects RemoteDesktop devices —
+    /// `SelectSources` fails immediately with `InvalidArgument: "Remote
+    /// desktop sessions cannot persist"`, before any dialog is even shown.
+    /// So the happy path tries persistence first (some backends DO support
+    /// it, and it's the whole point of the restore token), then falls back
+    /// to a fresh, non-persistent session (dialog every launch, no restore
+    /// token) on that specific error — rather than failing desktop-mirror
+    /// entirely on backends like this one.
     pub async fn open(restore_token: Option<&str>) -> Result<Self> {
+        match Self::try_open(restore_token, PersistMode::ExplicitlyRevoked).await {
+            Ok(s) => Ok(s),
+            Err(e) if is_persist_unsupported(&e) => {
+                tracing::warn!(
+                    "portal-mirror: this portal backend doesn't support persisting a \
+                     RemoteDesktop session ({e:#}); falling back to a non-persistent \
+                     session (you'll see the permission dialog every time)"
+                );
+                Self::try_open(None, PersistMode::DoNot).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn try_open(restore_token: Option<&str>, persist: PersistMode) -> Result<Self> {
         let remote = RemoteDesktop::new()
             .await
             .context("connect to the RemoteDesktop portal (is xdg-desktop-portal running?)")?;
@@ -98,7 +143,7 @@ impl MirrorSession {
                 &session,
                 SelectDevicesOptions::default()
                     .set_devices(DeviceType::Keyboard | DeviceType::Pointer)
-                    .set_persist_mode(PersistMode::ExplicitlyRevoked)
+                    .set_persist_mode(persist)
                     .set_restore_token(restore_token),
             )
             .await
@@ -116,7 +161,7 @@ impl MirrorSession {
                     .set_multiple(true)
                     .set_sources(BitFlags::from(SourceType::Monitor))
                     .set_cursor_mode(CursorMode::Embedded)
-                    .set_persist_mode(PersistMode::ExplicitlyRevoked)
+                    .set_persist_mode(persist)
                     .set_restore_token(restore_token),
             )
             .await
@@ -150,12 +195,13 @@ impl MirrorSession {
     }
 
     /// Input-injection seam: hand back the libei socket for this session
-    /// (`ConnectToEIS`). The wiring pass turns this fd into an EI sender
-    /// (the `reis` crate) fed from the existing `transport` input rx, giving
-    /// full KVM control of the real desktop through the SAME permission the
-    /// video came from. Until then the fd is returned raw so callers can
-    /// already structure around it. Fallback for portals without EIS v2:
-    /// `RemoteDesktop::notify_pointer_motion` / `notify_keyboard_keycode`.
+    /// (`ConnectToEIS`). Callers pass the returned fd to
+    /// [`crate::mirror_input::MirrorInput::spawn`], which speaks the libei
+    /// wire protocol over it (the `reis` crate) and is fed from the existing
+    /// `transport` input rx — full KVM control of the real desktop through
+    /// the SAME permission the video came from. Fallback for portals without
+    /// EIS v2 (not implemented): `RemoteDesktop::notify_pointer_motion` /
+    /// `notify_keyboard_keycode`.
     pub async fn connect_input(&self) -> Result<OwnedFd> {
         let fd = self
             .remote
@@ -552,22 +598,136 @@ fn run_pw_loop(
 // Encode seam
 // ---------------------------------------------------------------------------
 
-/// Import a [`MirrorFrame`] into the compositor's GL context as a texture,
-/// ready for the existing GLES -> CUDA -> NVENC path (the same route headless
-/// output frames take today).
+/// Map a [`MirrorPixelFormat`] onto the matching `smithay`/DRM [`Fourcc`] by
+/// **memory byte order**, not by name. DRM fourcc names spell channels
+/// MSB->LSB for a pixel packed as a little-endian 32-bit word, so e.g.
+/// `Fourcc::Abgr8888` is memory bytes `R,G,B,A` — the SAME convention already
+/// established (and review-verified) for the idle screen canvas; see the byte
+/// order comment on `idle.rs`'s `IdleScreen::build`. PipeWire/SPA instead
+/// names its 32-bit formats by literal memory byte order (`Bgrx` = bytes
+/// `B,G,R,X`), so the memory-equivalent pairs are:
 ///
-/// NOT YET IMPLEMENTED; this signature is the seam the wiring pass fills in:
-/// DMA-BUF planes become an `EGLImage` (`eglCreateImageKHR` with the
-/// `EXT_image_dma_buf_import` attribs from format/modifier/planes) bound to a
-/// texture; SHM bytes become a plain `glTexImage2D` upload. Callers should
-/// treat an `Err` as "mirror source unavailable", not fatal.
-pub fn import_frame_gl(
-    _renderer: &mut smithay::backend::renderer::gles::GlesRenderer,
-    frame: &MirrorFrame,
-) -> Result<smithay::backend::renderer::gles::GlesTexture> {
-    anyhow::bail!(
-        "portal-mirror: GL import of a {} frame is not wired yet (scaffold); see \
-         portal_mirror module docs",
-        frame.kind()
-    )
+/// | SPA format (memory order) | DRM Fourcc (same memory order) |
+/// |----------------------------|----------------------------------|
+/// | `Bgrx` (`B,G,R,X`)         | `Xrgb8888`                        |
+/// | `Rgbx` (`R,G,B,X`)         | `Xbgr8888`                        |
+/// | `Bgra` (`B,G,R,A`)         | `Argb8888`                        |
+/// | `Rgba` (`R,G,B,A`)         | `Abgr8888`                        |
+fn mirror_format_to_fourcc(f: MirrorPixelFormat) -> Option<Fourcc> {
+    match f {
+        MirrorPixelFormat::Bgrx => Some(Fourcc::Xrgb8888),
+        MirrorPixelFormat::Rgbx => Some(Fourcc::Xbgr8888),
+        MirrorPixelFormat::Bgra => Some(Fourcc::Argb8888),
+        MirrorPixelFormat::Rgba => Some(Fourcc::Abgr8888),
+        MirrorPixelFormat::Unknown(_) => None,
+    }
+}
+
+/// Feeds successive [`MirrorFrame`]s into ONE persistent
+/// [`MemoryRenderBuffer`], reusing smithay's damage-tracked memory-import
+/// path (`element()` on the idle screen does the same, but bakes its content
+/// once; here the content changes every call). Keep one `MirrorImporter` per
+/// mirrored output for its lifetime — recreating it would defeat the
+/// texture-reuse damage tracking does for you.
+#[derive(Default)]
+pub struct MirrorImporter {
+    buffer: Option<MemoryRenderBuffer>,
+    format: Option<MirrorPixelFormat>,
+}
+
+impl MirrorImporter {
+    /// Copy `frame`'s pixels into the backing buffer (creating/resizing/
+    /// reformatting it as needed) and return a render element for THIS
+    /// frame, ready to hand to `render_output` alongside (or instead of) the
+    /// app-window elements.
+    ///
+    /// SHM frames only for now — a `DmaBuf` frame returns `Err`; its
+    /// zero-copy EGLImage import is the deferred perf pass (see the module
+    /// docs). Treat an `Err` as "mirror source unavailable this frame", not
+    /// fatal — the caller should fall back to the idle screen / a flat fill
+    /// rather than propagate.
+    pub fn element(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        frame: &MirrorFrame,
+    ) -> Result<MemoryRenderBufferRenderElement<GlesRenderer>> {
+        let MirrorFrame::Shm {
+            width,
+            height,
+            format,
+            stride,
+            data,
+        } = frame
+        else {
+            anyhow::bail!(
+                "portal-mirror: import of a {} frame is not wired yet (DMA-BUF zero-copy \
+                 is a deferred perf pass); see portal_mirror module docs",
+                frame.kind()
+            );
+        };
+        let fourcc = mirror_format_to_fourcc(*format)
+            .with_context(|| format!("portal-mirror: unsupported pixel format {format:?}"))?;
+
+        let row_bytes = (*width as usize) * 4;
+        let src_stride = (*stride as usize).max(row_bytes);
+        anyhow::ensure!(
+            row_bytes > 0 && *height > 0 && !data.is_empty(),
+            "portal-mirror: empty/degenerate SHM frame ({width}x{height}, stride {stride}, {} bytes)",
+            data.len()
+        );
+
+        // (Re)create the buffer if this is the first frame or the format
+        // changed (a resolution change alone is handled by `ctx.resize`
+        // below without losing the damage-tracked texture cache).
+        let need_new = self.buffer.is_none() || self.format != Some(*format);
+        if need_new {
+            self.buffer = Some(MemoryRenderBuffer::new(
+                fourcc,
+                (*width as i32, *height as i32),
+                1,
+                Transform::Normal,
+                None,
+            ));
+            self.format = Some(*format);
+        }
+        let buffer = self.buffer.as_mut().expect("just created above");
+
+        {
+            let mut ctx = buffer.render();
+            ctx.resize((*width as i32, *height as i32));
+            ctx.draw(|mem| {
+                if src_stride == row_bytes {
+                    let n = data.len().min(mem.len());
+                    mem[..n].copy_from_slice(&data[..n]);
+                } else {
+                    // De-stride: PipeWire's row stride may exceed width*4
+                    // (padding); MemoryBuffer assumes tightly packed rows.
+                    for y in 0..*height as usize {
+                        let src_off = y * src_stride;
+                        let dst_off = y * row_bytes;
+                        if src_off + row_bytes > data.len() || dst_off + row_bytes > mem.len() {
+                            break;
+                        }
+                        mem[dst_off..dst_off + row_bytes]
+                            .copy_from_slice(&data[src_off..src_off + row_bytes]);
+                    }
+                }
+                let size: smithay::utils::Size<i32, smithay::utils::Buffer> =
+                    (*width as i32, *height as i32).into();
+                Ok::<_, std::convert::Infallible>(vec![Rectangle::from_size(size)])
+            })
+            .unwrap_or_else(|e: std::convert::Infallible| match e {});
+        }
+
+        MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            (0.0, 0.0),
+            buffer,
+            None,
+            None,
+            None,
+            Kind::Unspecified,
+        )
+        .map_err(|e| anyhow::anyhow!("portal-mirror: import mirror frame into GL: {e:?}"))
+    }
 }

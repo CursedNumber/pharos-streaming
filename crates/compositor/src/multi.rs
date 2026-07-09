@@ -295,6 +295,15 @@ struct Pipeline {
     /// is mapped (`win_count == 0`). `None` if it couldn't be built. Output-sized,
     /// built once — zero cost while an app is on screen.
     idle: Option<crate::idle::IdleScreen>,
+
+    /// Desktop-mirror (issue #6): whether this pipeline composites the usual
+    /// Wayland app space (`Virtual`, today's only behavior) or streams the
+    /// host's REAL desktop session instead (`PhysicalMirror`). Only pipeline
+    /// 0 (the primary/single-output case) is ever flipped — see
+    /// `ControlCmd::LaunchApp` and the `enable_virtual_displays` master
+    /// switch in `run_capture_zc_multi`.
+    #[cfg(feature = "portal-mirror")]
+    source: CaptureSource,
 }
 
 impl Pipeline {
@@ -304,6 +313,226 @@ impl Pipeline {
             None => true, // file mode is always "ready"
         }
     }
+
+    /// The live libei input sink, if this pipeline is currently mirroring the
+    /// real desktop AND its input bridge has come up. `None` routes input to
+    /// the ordinary smithay seat (today's behavior).
+    #[cfg(feature = "portal-mirror")]
+    fn mirror_input(&self) -> Option<&crate::mirror_input::MirrorInput> {
+        match &self.source {
+            CaptureSource::PhysicalMirror(m) => m.input.as_ref(),
+            CaptureSource::Virtual => None,
+        }
+    }
+}
+
+/// Where a pipeline's rendered frame comes from — see `Pipeline::source`.
+#[cfg(feature = "portal-mirror")]
+enum CaptureSource {
+    /// Composite Wayland app windows into the headless virtual output. The
+    /// only behavior before issue #6; still the default for every output
+    /// except the one flipped to a physical-mirror target.
+    Virtual,
+    /// Stream the REAL host desktop session instead. Holds the live portal
+    /// session (dropping it tears the mirror down — the portal session
+    /// closes, the PipeWire + libei threads stop) plus the frame channel,
+    /// the persistent GL importer, and the libei input sink.
+    PhysicalMirror(Box<MirrorState>),
+}
+
+/// Live state for a pipeline currently mirroring the real desktop.
+#[cfg(feature = "portal-mirror")]
+struct MirrorState {
+    /// Keeps the portal's RemoteDesktop+ScreenCast session (and thus the
+    /// PipeWire node + EIS socket) alive; dropped when the pipeline flips
+    /// back to `Virtual`.
+    _session: crate::portal_mirror::MirrorSession,
+    _stream: crate::portal_mirror::StreamHandle,
+    frame_rx: std::sync::mpsc::Receiver<crate::portal_mirror::MirrorFrame>,
+    importer: crate::portal_mirror::MirrorImporter,
+    /// `None` until the libei handshake/thread spawn succeeds (or if it
+    /// failed) — video can still flow with a dead input bridge; the mirror
+    /// just isn't controllable yet, logged once at spawn time.
+    input: Option<crate::mirror_input::MirrorInput>,
+    /// Most recent frame pulled off `frame_rx`; re-rendered as-is on ticks
+    /// where PipeWire hasn't delivered a fresh one yet (matches the video
+    /// pacer, not PipeWire's own rate).
+    latest: Option<crate::portal_mirror::MirrorFrame>,
+}
+
+/// Where the portal's restore token is persisted (next to `multi.toml`'s
+/// sibling files — same directory the codec-override sidecar and the
+/// identity live in) so a relaunch skips the permission dialog. Best-effort:
+/// a missing/unreadable file just means "ask again," never fatal.
+#[cfg(feature = "portal-mirror")]
+fn mirror_restore_token_path() -> Option<std::path::PathBuf> {
+    crate::pair::config_dir()
+        .ok()
+        .map(|d| d.join("mirror-restore-token"))
+}
+
+#[cfg(feature = "portal-mirror")]
+fn read_mirror_restore_token() -> Option<String> {
+    let p = mirror_restore_token_path()?;
+    let s = std::fs::read_to_string(p).ok()?;
+    let s = s.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+#[cfg(feature = "portal-mirror")]
+fn write_mirror_restore_token(token: &str) {
+    let Some(p) = mirror_restore_token_path() else {
+        return;
+    };
+    if let Err(e) = std::fs::write(&p, token) {
+        tracing::warn!(
+            "mirror: couldn't persist restore token at {}: {e}",
+            p.display()
+        );
+    }
+}
+
+/// Flip `pipeline` from `Virtual` to `PhysicalMirror`: negotiate the portal
+/// session (reusing a persisted restore token so a repeat launch doesn't
+/// re-prompt), start the PipeWire frame stream, and spawn the libei input
+/// bridge. Video and input degrade independently — a libei failure logs and
+/// leaves the mirror view-only rather than aborting the whole activation
+/// (matching the "Err = mirror source unavailable, not fatal" contract the
+/// rest of `portal_mirror` follows).
+///
+/// Synchronous by design: this runs from the render loop / `LaunchApp`
+/// control-thread handler, neither of which has an ambient async runtime, so
+/// a throwaway current-thread runtime drives the one-shot portal handshake.
+#[cfg(feature = "portal-mirror")]
+fn activate_physical_mirror(pipeline: &mut Pipeline) -> Result<()> {
+    use crate::portal_mirror::MirrorSession;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("mirror: build tokio runtime: {e}"))?;
+
+    let restore_token = read_mirror_restore_token();
+    let session = rt.block_on(MirrorSession::open(restore_token.as_deref()))?;
+    if let Some(token) = &session.restore_token {
+        write_mirror_restore_token(token);
+    }
+    let stream_info = session
+        .streams
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("mirror: portal granted zero streams"))?
+        .clone();
+
+    let (tx, frame_rx) = std::sync::mpsc::sync_channel(4);
+    let stream = crate::portal_mirror::spawn_frame_stream(stream_info.node_id, tx)?;
+
+    let input = match rt.block_on(session.connect_input()) {
+        Ok(fd) => match crate::mirror_input::MirrorInput::spawn(fd) {
+            Ok(mi) => Some(mi),
+            Err(e) => {
+                tracing::warn!("mirror: libei thread failed to start: {e:#} (view-only)");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!("mirror: ConnectToEIS failed: {e:#} (view-only)");
+            None
+        }
+    };
+
+    info!(
+        "mirror: activated (stream {}x{:?}, input {})",
+        stream_info.node_id,
+        stream_info.size,
+        if input.is_some() {
+            "live"
+        } else {
+            "unavailable"
+        }
+    );
+
+    pipeline.source = CaptureSource::PhysicalMirror(Box::new(MirrorState {
+        _session: session,
+        _stream: stream,
+        frame_rx,
+        importer: crate::portal_mirror::MirrorImporter::default(),
+        input,
+        latest: None,
+    }));
+    Ok(())
+}
+
+/// Forward one keyboard/pointer `InputEvent` to the libei bridge instead of
+/// the smithay seat — the mirror-mode counterpart of `dispatch_input`
+/// (`lib.rs`). Button/keycode conventions match that function's mapping
+/// exactly (see `mirror_input`'s module docs for why no xkb `+8` offset is
+/// applied here). Gamepad/gyro/tuning variants never reach this closure —
+/// `HostInput::dispatch_input_event` consumes those before calling it.
+#[cfg(feature = "portal-mirror")]
+fn route_to_mirror_input(mi: &crate::mirror_input::MirrorInput, ev: core_proto::InputEvent) {
+    match ev {
+        core_proto::InputEvent::Key {
+            scancode, pressed, ..
+        } => mi.key(scancode, pressed),
+        core_proto::InputEvent::PointerAbs { x, y } => mi.pointer_abs(x, y),
+        core_proto::InputEvent::PointerRel { dx, dy } => mi.pointer_rel(dx, dy),
+        core_proto::InputEvent::PointerButton { button, pressed } => {
+            // evdev button codes: 0x110=BTN_LEFT .. 0x114=BTN_EXTRA (same
+            // mapping as `dispatch_input`'s smithay path in `lib.rs`).
+            mi.button(0x110u32 + u32::from(button), pressed);
+        }
+        core_proto::InputEvent::Scroll { dx, dy } => mi.scroll(dx, dy),
+        _ => {}
+    }
+}
+
+/// Reconcile the primary pipeline's capture source with a just-launched
+/// app's [`app_launcher::config::LaunchTarget`] and the `enable_virtual_displays`
+/// master switch. Only pipeline 0 is ever touched — see `Pipeline::source`'s
+/// docs on why mirroring is a single-output concern.
+///
+/// Precedence: the master switch OFF wins outright ("never build a virtual
+/// output" means every app's stream — even one that still declares
+/// `VirtualDisplay` in its saved entry — mirrors the real desktop instead).
+/// With the switch ON, the app's own target decides: `DuplicatePhysical`
+/// mirrors, anything else (including a missing/unknown slug) uses the
+/// ordinary virtual composite.
+#[cfg(feature = "portal-mirror")]
+fn apply_capture_target(
+    pipelines: &mut [Option<Pipeline>],
+    target: Option<&app_launcher::config::LaunchTarget>,
+) {
+    let Some(Some(p0)) = pipelines.first_mut() else {
+        return;
+    };
+    let master_switch_on = host_core::config::load().compositor.enable_virtual_displays;
+    let wants_mirror = !master_switch_on
+        || matches!(
+            target,
+            Some(app_launcher::config::LaunchTarget::DuplicatePhysical)
+        );
+    let is_mirroring = matches!(p0.source, CaptureSource::PhysicalMirror(_));
+    match (wants_mirror, is_mirroring) {
+        (true, false) => {
+            if let Err(e) = activate_physical_mirror(p0) {
+                tracing::warn!("mirror: activation failed: {e:#}; staying on the virtual display");
+            }
+        }
+        (false, true) => deactivate_physical_mirror(p0),
+        _ => {} // already in the wanted state
+    }
+}
+
+/// Flip `pipeline` back to `Virtual`. Dropping the outgoing `MirrorState`
+/// tears everything down: the portal session closes (ending ScreenCast +
+/// RemoteDesktop), the PipeWire thread stops (`StreamHandle::drop`), and the
+/// libei thread stops (`MirrorInput::drop`).
+#[cfg(feature = "portal-mirror")]
+fn deactivate_physical_mirror(pipeline: &mut Pipeline) {
+    if matches!(pipeline.source, CaptureSource::PhysicalMirror(_)) {
+        info!("mirror: deactivated on output '{}'", pipeline.name);
+    }
+    pipeline.source = CaptureSource::Virtual;
 }
 
 /// Build a fresh NVENC session + reg + bitstreams for an existing Pipeline.
@@ -1929,6 +2158,8 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
             // here — baking it at startup (PNG decode + composite) delays the
             // host's sd_notify READY and can trip the systemd start-timeout.
             idle: None,
+            #[cfg(feature = "portal-mirror")]
+            source: CaptureSource::Virtual,
         }));
     }
 
@@ -1938,6 +2169,25 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
     // boot (tmpfs) and keep inflating the envelope even after the user shrinks their
     // configured resolution. A genuinely-bigger client just re-records it on connect.
     control_ipc::clear_stream_res();
+
+    // Desktop-mirror master switch (issue #6, `config.toml [compositor]
+    // enable_virtual_displays`, default true — unchanged behavior). When
+    // OFF, the primary output starts mirroring the REAL desktop instead of
+    // an isolated virtual one; `ControlCmd::LaunchApp` can still flip it
+    // per-app afterwards. Only the primary output is ever affected — an
+    // extend layout's secondary outputs stay virtual regardless (mirroring
+    // is a single real-desktop session, not one per output).
+    #[cfg(feature = "portal-mirror")]
+    if !host_core::config::load().compositor.enable_virtual_displays {
+        if let Some(Some(p)) = pipelines.first_mut() {
+            if let Err(e) = activate_physical_mirror(p) {
+                tracing::warn!(
+                    "mirror: enable_virtual_displays=false but mirror activation failed: {e:#}; \
+                     staying on the virtual display"
+                );
+            }
+        }
+    }
 
     let socket_name = state.socket_name.clone();
 
@@ -2618,11 +2868,18 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                             // — e.g. the built-in `desktop` slug, which has no
                             // user file). The host's IMU reader keeps running
                             // either way; this just gates dispatch.
-                            let mode = app_launcher::config::load_with_builtins()
-                                .find(&slug)
-                                .map(|e| e.gyro_mode)
-                                .unwrap_or_default();
+                            let catalog = app_launcher::config::load_with_builtins();
+                            let entry = catalog.find(&slug);
+                            let mode = entry.map(|e| e.gyro_mode).unwrap_or_default();
                             host_input.set_app_gyro_mode(mode);
+                            // Desktop-mirror (issue #6): flip the primary
+                            // output's capture source to match this app's
+                            // `LaunchTarget` (the built-in `desktop` slug
+                            // defaults to `DuplicatePhysical`; a real app
+                            // entry's own target may pull it back to
+                            // `Virtual`). See `apply_capture_target`.
+                            #[cfg(feature = "portal-mirror")]
+                            apply_capture_target(&mut pipelines, entry.map(|e| &e.target));
                             if let Some(c) = child {
                                 host_input.track_app_child(slug, c);
                             }
@@ -3279,6 +3536,18 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
         // Drain network input → keyboard/mouse to the seat. Focus the newest
         // toplevel first, so an app launched after startup (e.g. the media
         // player) receives keyboard input.
+        // Desktop-mirror (issue #6): input is single-focus (one shared
+        // `input_rx`, matching the single-client-serial host — see
+        // `lesson-host-single-client-serial`), so it's enough to ask the
+        // PRIMARY pipeline whether it's currently mirroring the real
+        // desktop. When it is, keyboard/pointer events skip the smithay
+        // seat entirely and go to libei instead (gamepad still rides the
+        // uinput pad either way — see `route_to_mirror_input`).
+        #[cfg(feature = "portal-mirror")]
+        let mirror_input_active = pipelines
+            .first()
+            .and_then(|p| p.as_ref())
+            .and_then(Pipeline::mirror_input);
         if let Some(rx) = input_rx.as_mut() {
             let win_count = data.state.space.elements().count();
             if win_count != last_win_count {
@@ -3324,6 +3593,11 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                     focus_surface.as_ref(),
                     ev,
                     |data, other| {
+                        #[cfg(feature = "portal-mirror")]
+                        if let Some(mi) = mirror_input_active {
+                            route_to_mirror_input(mi, other);
+                            return;
+                        }
                         crate::dispatch_input(
                             data,
                             input_w,
@@ -3459,7 +3733,35 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
             // A global "any window in the space" check would wrongly leave an empty
             // secondary output in an EXTEND layout on the flat fill.
             let no_app = elements.is_empty();
-            let idle_el = if no_app {
+            // Desktop-mirror (issue #6): this pipeline streams the REAL host
+            // desktop instead of the app-window composite above — takes
+            // precedence over both `elements` (nothing is ever mapped onto a
+            // mirror output) and the idle screen (a mirrored desktop is
+            // never "no app running"; the desktop itself IS the content).
+            // Drop-newest: keep only the freshest frame PipeWire delivered
+            // since our last tick, matching the channel sender's own policy.
+            #[cfg(feature = "portal-mirror")]
+            let mirror_el = match &mut p.source {
+                CaptureSource::PhysicalMirror(m) => {
+                    while let Ok(f) = m.frame_rx.try_recv() {
+                        m.latest = Some(f);
+                    }
+                    m.latest.as_ref().and_then(|f| {
+                        m.importer
+                            .element(&mut renderer, f)
+                            .map_err(|e| tracing::debug!("output[{}] mirror import: {e:#}", p.name))
+                            .ok()
+                    })
+                }
+                CaptureSource::Virtual => None,
+            };
+            #[cfg(not(feature = "portal-mirror"))]
+            let mirror_el: Option<
+                smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement<
+                    GlesRenderer,
+                >,
+            > = None;
+            let idle_el = if mirror_el.is_none() && no_app {
                 // Lazy first-idle bake (decode logo + compose), then cached — one
                 // brief hitch at app→idle instead of delaying host startup. Never
                 // runs while an app is mapped, so it's still zero-cost in-game.
@@ -3528,7 +3830,19 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                     {
                         let scratch = p.hdr_scratch.as_mut().unwrap();
                         let mut sfb = renderer.bind(scratch)?;
-                        if let Some(el) = &idle_el {
+                        if let Some(el) = &mirror_el {
+                            // Real desktop content — SDR, so it takes the
+                            // sRGB→PQ post-pass below (`surface_hdr` is
+                            // false whenever `no_app` skipped the HDR-surface
+                            // scan, which mirroring always does).
+                            p.damage.render_output(
+                                &mut renderer,
+                                &mut sfb,
+                                0,
+                                std::slice::from_ref(el),
+                                crate::idle::BG,
+                            )?;
+                        } else if let Some(el) = &idle_el {
                             p.damage.render_output(
                                 &mut renderer,
                                 &mut sfb,
@@ -3583,7 +3897,15 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                     let _ = frame.finish()?;
                 } else {
                     let mut fb = renderer.bind(&mut p.target)?;
-                    if let Some(el) = &idle_el {
+                    if let Some(el) = &mirror_el {
+                        p.damage.render_output(
+                            &mut renderer,
+                            &mut fb,
+                            0,
+                            std::slice::from_ref(el),
+                            crate::idle::BG,
+                        )?;
+                    } else if let Some(el) = &idle_el {
                         p.damage.render_output(
                             &mut renderer,
                             &mut fb,
