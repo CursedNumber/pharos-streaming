@@ -105,15 +105,17 @@ private const val TRACKPAD_SENS = 1.5f
 /** Two-finger scroll: screen px of drag per wheel notch. */
 private const val SCROLL_DIV = 48f
 /** Hold duration (ms) for a still trackpad press to fire a right-click (desktop only). */
-private const val LONG_PRESS_MS = 500L
+private const val LONG_PRESS_MS = 650L
 /** Movement (px) that CANCELS a pending long-press. Deliberately larger than
  *  [TAP_SLOP] so small finger jitter is tolerated during the hold. */
 private const val LONG_PRESS_SLOP = 48f
 /** Max gap (ms) between the first tap's UP and the second tap's DOWN for a
- *  double-tap. A second tap that then holds/drags becomes a left-button drag. */
-private const val DOUBLE_TAP_MS = 280L
+ *  double-tap. A second tap that then holds/drags becomes a left-button drag.
+ *  Generous so a deliberate double-tap-and-hold isn't missed and mis-read as a
+ *  plain double-click. */
+private const val DOUBLE_TAP_MS = 420L
 /** Max distance (px) between the two taps of a double-tap. */
-private const val DOUBLE_TAP_SLOP = 48f
+private const val DOUBLE_TAP_SLOP = 72f
 
 /**
  * Trireme shell — a SINGLE full-screen, immersive Activity that is the launcher.
