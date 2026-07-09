@@ -20,11 +20,25 @@
 # Knobs:
 #   PHAROS_LAUNCH_TRAY=0     — skip the system-tray daemon (headless boxes).
 #   PHAROS_LAUNCH_REAP_ONLY=1 — kill + exit, don't restart anything.
+#   PHAROS_STEAM_REDIRECT=0  — disable the seamless Steam-game display redirect
+#                              (on by default here). When on, a Steam game
+#                              launched via a `[app.launch] kind = "steam-game"`
+#                              apps.toml entry gets its Launch Options wrapped
+#                              in the `pharos-redirect` shim so it renders into
+#                              the Pharos virtual display instead of wherever
+#                              Steam itself is running. The shim can only ARM
+#                              while Steam is fully quit (editing a running
+#                              Steam's localconfig.vdf gets clobbered on its
+#                              next exit) — so the FIRST time you turn this on,
+#                              fully quit Steam before running this script;
+#                              Pharos then cold-starts it into the stream and
+#                              the redirect self-arms from then on.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 TRAY="${PHAROS_LAUNCH_TRAY:-1}"
 REAP_ONLY="${PHAROS_LAUNCH_REAP_ONLY:-0}"
+STEAM_REDIRECT="${PHAROS_STEAM_REDIRECT:-1}"
 UID_N="$(id -u)"
 
 # Pick the freshest of target/release/<name> vs target/debug/<name>; empty if
@@ -190,6 +204,7 @@ systemd-run --user --unit=pharos-host \
     --setenv=XDG_RUNTIME_DIR="/run/user/$UID_N" \
     --setenv=DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$UID_N/bus" \
     --setenv=RUST_LOG=info \
+    --setenv=PHAROS_STEAM_REDIRECT="$STEAM_REDIRECT" \
     "$COMPOSITOR" capture-zc-multi >/dev/null
 say "compositor started — $(basename "$(dirname "$COMPOSITOR")")/$(basename "$COMPOSITOR")"
 
