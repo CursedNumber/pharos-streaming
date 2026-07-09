@@ -535,6 +535,79 @@ fn deactivate_physical_mirror(pipeline: &mut Pipeline) {
     pipeline.source = CaptureSource::Virtual;
 }
 
+/// Whether the primary output (pipeline 0) is currently streaming the REAL
+/// desktop rather than a virtual composite. The Steam-redirect marker keys off
+/// this: in mirror mode the marker must be absent so a game the user launches
+/// from the mirrored desktop stays on wayland-0 and lands in the mirror. Always
+/// `false` when the `portal-mirror` feature is compiled out (no mirror source
+/// can ever exist).
+#[cfg(feature = "portal-mirror")]
+fn primary_is_mirroring(pipelines: &[Option<Pipeline>]) -> bool {
+    matches!(
+        pipelines.first(),
+        Some(Some(p)) if matches!(p.source, CaptureSource::PhysicalMirror(_))
+    )
+}
+#[cfg(not(feature = "portal-mirror"))]
+fn primary_is_mirroring(_pipelines: &[Option<Pipeline>]) -> bool {
+    false
+}
+
+/// Reconcile the seamless Steam-redirect marker with the live session. The
+/// marker must be present on disk iff the redirect feature is enabled, a client
+/// is actively streaming, AND the primary output is NOT mirroring the real
+/// desktop. That last clause is the desktop-mirror fix (issue #6): while the
+/// user is looking at the mirrored real desktop, a game they start there must
+/// run on wayland-0 (so it appears in the mirror), which means the shim must see
+/// NO marker and pass through. Writing the marker in mirror mode would instead
+/// shove the game onto the unwatched virtual display.
+///
+/// Idempotent and edge-tracked via [`REDIRECT_MARKER_ON`] — safe to call on
+/// every status tick; it only touches the filesystem on an actual transition.
+/// Runs entirely on the single render/control-loop thread, so reads of the
+/// pipelines' capture source never race the launch handlers that flip them.
+fn reconcile_redirect_marker(pipelines: &[Option<Pipeline>], socket_name: &std::ffi::OsStr) {
+    if !app_launcher::redirect::enabled() {
+        return;
+    }
+    let any_connected = pipelines
+        .iter()
+        .flatten()
+        .any(|p| p.streamer.as_ref().is_some_and(|s| s.is_connected()));
+    let mirroring = primary_is_mirroring(pipelines);
+    let want = any_connected && !mirroring;
+    let was = REDIRECT_MARKER_ON.swap(want, std::sync::atomic::Ordering::Relaxed);
+    if want == was {
+        return;
+    }
+    if want {
+        let marker = app_launcher::redirect::MarkerEnv::for_current(
+            socket_name.to_string_lossy().into_owned(),
+            app_launcher::session_audio_sink(),
+        );
+        if let Err(e) = app_launcher::redirect::write_marker(&marker) {
+            // Roll the edge back so the next status tick retries the write
+            // instead of leaving the marker absent for the whole session.
+            tracing::warn!("launch-redirect: write marker failed, will retry: {e:#}");
+            REDIRECT_MARKER_ON.store(was, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            tracing::info!(
+                "launch-redirect: stream active on the virtual display → games route to the stream"
+            );
+        }
+    } else {
+        app_launcher::redirect::remove_marker();
+        if mirroring {
+            tracing::info!(
+                "launch-redirect: primary output mirroring the real desktop → games stay on the \
+                 desktop (in the mirror)"
+            );
+        } else {
+            tracing::info!("launch-redirect: stream idle → games stay on the desktop");
+        }
+    }
+}
+
 /// Build a fresh NVENC session + reg + bitstreams for an existing Pipeline.
 /// The CUDA device buffer (cuda_buf) and Smithay output/target/damage are
 /// kept; only the NVENC chain is rebuilt — that's what gives the next
@@ -1182,6 +1255,13 @@ static FAULT_REASON: std::sync::Mutex<String> = std::sync::Mutex::new(String::ne
 /// True while ≥1 client is connected (set by the status push). Gates the P4
 /// watchdog heartbeat — a hung `encode_picture` can only happen while streaming.
 static STREAMING: AtomicBool = AtomicBool::new(false);
+/// True while the Steam-redirect marker is currently on disk (edge-tracked by
+/// [`reconcile_redirect_marker`]). NOT the same as `STREAMING`: the marker is
+/// suppressed while the primary output is mirroring the real desktop, so a game
+/// the user starts from the mirrored desktop passes through to wayland-0 and
+/// lands in the mirror instead of the unwatched virtual display. See
+/// `app_launcher::redirect`.
+static REDIRECT_MARKER_ON: AtomicBool = AtomicBool::new(false);
 /// Desired stream fan-out mode: `true` = mirror (one shared encode for every
 /// connected client, clamped to the weakest); `false` = single-client/pre-empt
 /// (the validated default). Set from the control thread via [`set_mirror_enabled`]
@@ -4834,35 +4914,15 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                     }
                 }
                 st.streaming = any_connected;
-                let prev_streaming = STREAMING.swap(any_connected, Ordering::Relaxed);
-                // Seamless redirect marker (opt-in): present only while a client is
-                // actively streaming, so a game launched via the Trireme lands on
-                // the stream while desktop launches (no marker) pass through
-                // untouched. Written on the false→true edge, removed on true→false.
-                if app_launcher::redirect::enabled() && any_connected != prev_streaming {
-                    if any_connected {
-                        let marker = app_launcher::redirect::MarkerEnv::for_current(
-                            socket_name.to_string_lossy().into_owned(),
-                            app_launcher::session_audio_sink(),
-                        );
-                        if let Err(e) = app_launcher::redirect::write_marker(&marker) {
-                            // Roll the edge back so the next status tick retries the
-                            // write instead of the marker being absent for the whole
-                            // session (this loop is the sole writer of STREAMING).
-                            tracing::warn!(
-                                "launch-redirect: write marker failed, will retry: {e:#}"
-                            );
-                            STREAMING.store(prev_streaming, Ordering::Relaxed);
-                        } else {
-                            tracing::info!(
-                                "launch-redirect: stream active → games route to the stream"
-                            );
-                        }
-                    } else {
-                        app_launcher::redirect::remove_marker();
-                        tracing::info!("launch-redirect: stream idle → games stay on the desktop");
-                    }
-                }
+                STREAMING.store(any_connected, Ordering::Relaxed);
+                // Seamless redirect marker (opt-in): reconcile it against BOTH the
+                // streaming state and the primary output's capture source. The
+                // marker is suppressed in desktop-mirror mode so a game the user
+                // starts from the mirrored real desktop lands in the mirror
+                // (wayland-0) rather than the unwatched virtual display. The
+                // reconcile is idempotent + edge-tracked internally, so calling it
+                // every status tick only touches disk on an actual transition.
+                reconcile_redirect_marker(&pipelines, &socket_name);
                 st.outputs = outputs;
                 st.clients = clients;
                 st.video_codec = Some(cfg.video_codec.label().into());
