@@ -1104,16 +1104,28 @@ object StreamHub {
             }
         }
         val gp = s.gamepad
-        // Bind the ControllerManager to the CURRENT session handle. Building only when
-        // `controllers == null` left a stale manager bound to a dead GamepadInput after
-        // a reconnect/re-dial swapped `s.gamepad`: onKey/onMotion returned true but the
-        // sink's events vanished into a closed input stream and never reached the host.
-        // Rebuild whenever the handle changes (`!==` = reference identity; a fresh dial
-        // makes a new GamepadInput) so the sink always targets the live stream.
+        // Keep the ControllerManager bound to the CURRENT session handle. A stale
+        // manager bound to a dead GamepadInput after a reconnect/re-dial swapped
+        // `s.gamepad` is the "pad none / no forwarding" bug: onKey/onMotion return
+        // true but the sink's events vanish into a closed input stream. The handle
+        // changes by reference identity (`!==`) on every fresh dial, so:
+        //   - no handle       → tear the manager down;
+        //   - manager absent  → build + start it against the live handle;
+        //   - manager present → REBIND (re-point sink + re-announce pads) rather than
+        //     tear down + re-detect, so the InputManager listener + NS-mode gyro
+        //     registrations survive (no re-detect churn) and the pad can never be
+        //     left forwarding into a dead handle.
         if (gp !== controllersGamepad) {
-            controllers?.stop()
-            controllers = gp?.let { h ->
-                ControllerManager(appContext, h, controllerHandling).also { it.start() }
+            val existing = controllers
+            when {
+                gp == null -> {
+                    existing?.stop()
+                    controllers = null
+                }
+                existing == null ->
+                    controllers = ControllerManager(appContext, gp, controllerHandling)
+                        .also { it.start() }
+                else -> existing.rebind(gp)
             }
             controllersGamepad = gp
         }

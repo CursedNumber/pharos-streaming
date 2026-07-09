@@ -46,7 +46,11 @@ data class PadSensorCaps(
  */
 class ControllerManager(
     context: Context,
-    private val sink: GamepadInput,
+    // The live session's GamepadInput. A `var` (not `val`): a reconnect/re-dial
+    // swaps the session handle, and [rebind] re-points every forwarded event —
+    // including the gyro-listener closure, which reads this property at call time —
+    // at the fresh one so the sink can never be left targeting a dead handle.
+    private var sink: GamepadInput,
     // Controller-handling master switch (Settings / Controllers pane). When true
     // (managed) we apply per-controller profiles, swaps and gyro; when false (raw)
     // pads are still forwarded but with the host DEFAULT profile and no gyro — see
@@ -104,6 +108,32 @@ class ControllerManager(
     fun stop() {
         inputManager.unregisterInputDeviceListener(this)
         for (id in slotOf.keys.toList()) detach(id)
+    }
+
+    /**
+     * Re-point every forwarded event at [newSink] after a reconnect/re-dial swapped
+     * the session's GamepadInput, and re-announce all currently-attached pads
+     * (connect + saved tuning) so the fresh host session registers them. Cheaper and
+     * safer than tearing the manager down and re-detecting devices: the [InputManager]
+     * listener + gyro sensor registrations survive (no NS-mode re-detect churn), and
+     * `sink` is never left pointing at a dead handle — the failure mode where
+     * onKey/onMotion return true but the events vanish into a closed input stream
+     * and the host shows "pad none". No-op when the handle is unchanged.
+     */
+    fun rebind(newSink: GamepadInput) {
+        if (newSink === sink) return
+        sink = newSink
+        // Announce every pad we currently hold to the new host session. Snapshot the
+        // slot map so a concurrent add/remove on the input thread can't CME.
+        for ((deviceId, slot) in slotOf.entries.toList()) {
+            val d = InputDevice.getDevice(deviceId) ?: continue
+            sink.connect(slot.toUByte(), d.vendorId.toUShort(), d.productId.toUShort())
+            val key = GamepadPrefs.controllerKey(d.vendorId, d.productId)
+            val profile = if (managed) prefs.profile(key) else defaultControllerProfile()
+            sink.setTuning(slot.toUByte(), d.vendorId.toUShort(), d.productId.toUShort(), profile)
+        }
+        if (managed) relayUsbExportProfiles()
+        Log.i(TAG, "controllers rebound to fresh session handle (${slotOf.size} pad(s) re-announced)")
     }
 
     override fun onInputDeviceAdded(deviceId: Int) {
