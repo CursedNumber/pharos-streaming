@@ -33,12 +33,22 @@
 #                              fully quit Steam before running this script;
 #                              Pharos then cold-starts it into the stream and
 #                              the redirect self-arms from then on.
+#   PHAROS_IDR_PERIOD_SEC=N  — keyframe period in seconds (default 1 here; code
+#                              default is 4). 1s = fast WiFi corruption recovery.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 TRAY="${PHAROS_LAUNCH_TRAY:-1}"
 REAP_ONLY="${PHAROS_LAUNCH_REAP_ONLY:-0}"
 STEAM_REDIRECT="${PHAROS_STEAM_REDIRECT:-1}"
+# Keyframe (IDR) period in seconds. The code default is 4s (chosen to space out
+# the IDR rate-control spike), but on WiFi that means a single lost reference
+# frame corrupts the picture for up to 4s — the "rave party" magenta fog. The
+# WiFi-first path wants fast recovery, so pin it to 1s here (heals in ≤1s, the
+# 2026-06-22 reference-build behaviour). Bump to 2 if 1s keyframes cost too much
+# bitrate on a given link; the code default (4) is one restart away via
+# `PHAROS_IDR_PERIOD_SEC=4 rig/launch-host.sh`.
+IDR_PERIOD_SEC="${PHAROS_IDR_PERIOD_SEC:-1}"
 UID_N="$(id -u)"
 
 # Pick the freshest of target/release/<name> vs target/debug/<name>; empty if
@@ -205,6 +215,7 @@ systemd-run --user --unit=pharos-host \
     --setenv=DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$UID_N/bus" \
     --setenv=RUST_LOG=info \
     --setenv=PHAROS_STEAM_REDIRECT="$STEAM_REDIRECT" \
+    --setenv=PHAROS_IDR_PERIOD_SEC="$IDR_PERIOD_SEC" \
     "$COMPOSITOR" capture-zc-multi >/dev/null
 say "compositor started — $(basename "$(dirname "$COMPOSITOR")")/$(basename "$COMPOSITOR")"
 

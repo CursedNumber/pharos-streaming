@@ -77,9 +77,11 @@ fn ensure_logging(level: Option<&str>) {
             use tracing_subscriber::util::SubscriberInitExt;
             // `try_init` (not `init`) so a stray double-install can't panic
             // and take the whole client down over a logging setup.
+            // `with_ansi(false)`: logcat is not a terminal, so colour codes
+            // would show as literal `\x1b[2m…` escape noise in the log lines.
             let _ = tracing_subscriber::registry()
                 .with(filter)
-                .with(paranoid_android::layer("Trireme"))
+                .with(paranoid_android::layer("Trireme").with_ansi(false))
                 .try_init();
         }
         #[cfg(not(target_os = "android"))]
