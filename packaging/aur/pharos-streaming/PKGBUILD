@@ -23,6 +23,9 @@ license=(GPL-3.0-or-later)
 # default): pipewire-rs's sys crate needs libpipewire-0.3 headers + clang at
 # build time.
 makedepends=(rust nvidia-utils mesa libdrm libxkbcommon pixman expat opus libusb systemd-libs clang pipewire)
+# !lto: makepkg's -flto=auto turns ring's C objects into GCC-LTO bitcode that
+# rust-lld cannot read -> every ring_core_* symbol undefined at link.
+options=(!lto)
 source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('1db7ef62aa6126e075f088040e7e08ab907dacc6026e3729d3bc033b8012dd7a')
 
