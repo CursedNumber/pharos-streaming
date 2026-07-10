@@ -14,6 +14,7 @@ Everything needed to turn a tagged commit into installable packages
 | `install.sh` | Ubuntu/Debian installer: fetches the latest release `.deb` and installs it with apt. |
 | `aur/pharos-streaming/` | AUR source package (split into `pharos` + `trireme`, builds from the tag tarball). |
 | `aur/pharos-streaming-bin/` | AUR binary package (repacks the release tarballs). |
+| `windows/pharos.wxs` | WiX authoring for the Windows host MSI (three exes + Start Menu shortcuts + firewall exception). The UpgradeCode inside is permanent — never regenerate it. |
 
 The `.deb` metadata itself lives in the two anchor crates:
 `crates/compositor/Cargo.toml` (`[package.metadata.deb]`, package name
@@ -40,11 +41,27 @@ package (the NVIDIA libs must stay a soft requirement).
      Ubuntu 22.04 container for the glibc 2.35 floor),
    - `pharos-<ver>-linux-x86_64.tar.gz`, `trireme-<ver>-linux-x86_64.tar.gz`
      (binaries + units + desktop files, consumed by the AUR `-bin` package),
-   - `pharos-host.exe`, `pharos-tray.exe`, `pharos-panel.exe` (Windows host
-     stack, per the release-asset convention: binaries are never committed
-     to git),
+   - `pharos-<ver>-x86_64.msi` (Windows host installer: the three exes,
+     Start Menu shortcuts, firewall exception; built with the WiX dotnet
+     tool from `packaging/windows/pharos.wxs`),
+   - `pharos-host.exe`, `pharos-tray.exe`, `pharos-panel.exe` (the same
+     Windows host stack as portable exes, per the release-asset convention:
+     binaries are never committed to git),
    - `SHA256SUMS.txt`.
-4. Update the AUR packages (first time: clone the AUR repos
+4. Build and upload the Android APKs (local; the release keystore lives only
+   on the maintainer machine at `~/.config/trireme/release.keystore`, creds
+   in `keystore.env` next to it — back both up, the app's update identity
+   dies with the key):
+
+   ```sh
+   rig/build-android-release.sh     # signed per-ABI splits + universal, into dist/
+   gh release upload v0.1.0 dist/trireme-0.1.0-*.apk
+   ```
+
+   Bump `versionCode`/`versionName` in `client/androidApp/build.gradle.kts`
+   alongside the workspace version first; devices refuse an update whose
+   `versionCode` did not increase.
+5. Update the AUR packages (first time: clone the AUR repos
    `ssh://aur@aur.archlinux.org/pharos-streaming.git` and
    `...-bin.git`, copy the matching directory from `aur/` in):
 
@@ -86,4 +103,6 @@ cargo deb -p trireme --no-build -o /tmp/dist/
   `uniffi-bindgen`.
 - The `pharos-redirect` Steam shim (embedded in the host binary; it
   self-installs to `~/.local/share/pharos/` at runtime).
-- The Android client (Play/APK story is separate; see `client/README.md`).
+- The Android client from CI — its APKs are release assets too, but they are
+  built and signed locally by `rig/build-android-release.sh` (step 4 above)
+  so the signing keystore never leaves the maintainer machine.

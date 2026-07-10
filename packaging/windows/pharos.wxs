@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Pharos host stack MSI (WiX v4+ authoring; built with the `wix` dotnet tool).
+
+  Bundles the three Windows host binaries — pharos-host.exe (capture/encode/
+  stream daemon), pharos-tray.exe (status tray), pharos-panel.exe (control
+  GUI) — into Program Files\Pharos with Start Menu shortcuts, and opens a
+  Windows Firewall exception for the host (streaming is unusable without it:
+  QUIC on udp/15777, control on tcp/15778, pairing + mDNS discovery).
+
+  Build (see .github/workflows/release.yml, "build the MSI" step):
+
+    wix build packaging/windows/pharos.wxs \
+      -ext WixToolset.Firewall.wixext \
+      -d Version=<x.y.z> -d BinDir=target/release -d IconDir=packaging/icons \
+      -arch x64 -o dist/pharos-<x.y.z>-x86_64.msi
+
+  The UpgradeCode is the product's permanent identity across versions — a
+  newer MSI replaces an older install in place (MajorUpgrade). Never change
+  it, or upgrades become side-by-side installs.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall">
+
+  <Package Name="Pharos"
+           Manufacturer="Pharos project"
+           Version="$(var.Version)"
+           UpgradeCode="908D8E2C-8190-4296-AA58-B509562B9299"
+           Scope="perMachine"
+           Compressed="yes">
+
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of Pharos is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="PharosIco" SourceFile="$(var.IconDir)/pharos.ico" />
+    <Property Id="ARPPRODUCTICON" Value="PharosIco" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/CursedNumber/pharos-streaming" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Pharos" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="PharosMenuFolder" Name="Pharos" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="HostBinaries" Directory="INSTALLFOLDER">
+      <Component Id="HostExe">
+        <File Id="PharosHostExe" Source="$(var.BinDir)/pharos-host.exe" KeyPath="yes">
+          <!-- Program-scoped exception (no port pin): covers the QUIC stream,
+               the control plane, pairing, and mDNS answers even if the ports
+               are remapped in config. -->
+          <fw:FirewallException Id="PharosHostFirewall"
+                                Name="Pharos host"
+                                Description="Pharos game-streaming host (QUIC stream, control plane, pairing, mDNS)"
+                                Scope="any" Profile="all" />
+        </File>
+      </Component>
+      <Component Id="TrayExe">
+        <File Id="PharosTrayExe" Source="$(var.BinDir)/pharos-tray.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="PanelExe">
+        <File Id="PharosPanelExe" Source="$(var.BinDir)/pharos-panel.exe" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Non-advertised shortcuts need their own component + keypath; the HKLM
+         marker value is the conventional keypath for a per-machine install. -->
+    <Component Id="StartMenuShortcuts" Directory="PharosMenuFolder">
+      <Shortcut Id="PanelShortcut" Name="Pharos Panel"
+                Description="Pharos control panel"
+                Target="[#PharosPanelExe]" WorkingDirectory="INSTALLFOLDER"
+                Icon="PharosIco" />
+      <Shortcut Id="HostShortcut" Name="Pharos Host"
+                Description="Pharos streaming host"
+                Target="[#PharosHostExe]" WorkingDirectory="INSTALLFOLDER"
+                Icon="PharosIco" />
+      <Shortcut Id="TrayShortcut" Name="Pharos Tray"
+                Description="Pharos status tray"
+                Target="[#PharosTrayExe]" WorkingDirectory="INSTALLFOLDER"
+                Icon="PharosIco" />
+      <RemoveFolder Id="RemovePharosMenuFolder" On="uninstall" />
+      <RegistryValue Root="HKLM" Key="Software\Pharos" Name="Installed"
+                     Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <Feature Id="Main">
+      <ComponentGroupRef Id="HostBinaries" />
+      <ComponentRef Id="StartMenuShortcuts" />
+    </Feature>
+
+  </Package>
+</Wix>

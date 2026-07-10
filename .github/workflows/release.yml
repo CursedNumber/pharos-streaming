@@ -8,8 +8,13 @@ name: Release
 #   trireme_<ver>-1_amd64.deb             client package
 #   pharos-<ver>-linux-x86_64.tar.gz      host tarball (AUR -bin, generic Linux)
 #   trireme-<ver>-linux-x86_64.tar.gz     client tarball
-#   pharos-host.exe / pharos-tray.exe / pharos-panel.exe   Windows host stack
+#   pharos-<ver>-x86_64.msi               Windows host installer (WiX)
+#   pharos-host.exe / pharos-tray.exe / pharos-panel.exe   Windows host stack (portable)
 #   SHA256SUMS.txt
+#
+# The Android client APKs are built and signed locally (the release keystore
+# never leaves the maintainer machine) and uploaded into the same release:
+# see rig/build-android-release.sh and packaging/README.md.
 #
 # workflow_dispatch runs the build jobs only (artifacts, no release): a dry run.
 
@@ -135,6 +140,20 @@ jobs:
           mkdir -p dist
           cp target/release/pharos-host.exe target/release/pharos-tray.exe \
              target/release/pharos-panel.exe dist/
+      # The MSI bundles the same three exes with Start Menu shortcuts and the
+      # firewall exception the host needs; the loose exes above stay as the
+      # portable/no-admin option. WiX (v4+ CLI) comes from the dotnet tool.
+      - name: build the MSI
+        shell: bash
+        run: |
+          VER="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          dotnet tool install --global wix
+          wix extension add --global WixToolset.Firewall.wixext
+          wix build packaging/windows/pharos.wxs \
+            -ext WixToolset.Firewall.wixext \
+            -d Version="$VER" -d BinDir=target/release -d IconDir=packaging/icons \
+            -arch x64 \
+            -o "dist/pharos-$VER-x86_64.msi"
       - uses: actions/upload-artifact@v4
         with:
           name: windows-binaries

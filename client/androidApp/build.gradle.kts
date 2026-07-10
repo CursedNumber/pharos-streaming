@@ -4,6 +4,11 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+// Release signing comes from the environment (rig/build-android-release.sh
+// sources ~/.config/trireme/keystore.env on the maintainer machine). Unset,
+// release builds come out unsigned and dev debug builds are untouched.
+val releaseKeystore: String? = System.getenv("TRIREME_KEYSTORE")
+
 android {
     namespace = "no.aasle.trireme"
     compileSdk = 35
@@ -12,8 +17,11 @@ android {
         applicationId = "no.aasle.trireme"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.0.0"
+        // Bump both alongside [workspace.package] version in the root
+        // Cargo.toml when cutting a release; an APK update only installs
+        // over the old one if versionCode increased.
+        versionCode = 2
+        versionName = "0.1.0"
     }
 
     sourceSets["main"].apply {
@@ -44,6 +52,18 @@ android {
     // src/debug/res override renames it "Trireme Debug" in the launcher. The
     // on-screen metrics HUD (DebugHud) is gated on BuildConfig.DEBUG, so it only
     // ships in this variant.
+    signingConfigs {
+        if (releaseKeystore != null) {
+            create("release") {
+                storeFile = file(releaseKeystore)
+                storePassword = System.getenv("TRIREME_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("TRIREME_KEY_ALIAS") ?: "trireme"
+                keyPassword = System.getenv("TRIREME_KEY_PASSWORD")
+                    ?: System.getenv("TRIREME_KEYSTORE_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         getByName("debug") {
             applicationIdSuffix = ".debug"
@@ -52,6 +72,24 @@ android {
         }
         getByName("release") {
             isMinifyEnabled = false
+            if (releaseKeystore != null) {
+                signingConfig = signingConfigs.getByName("release")
+            }
+        }
+    }
+
+    // Per-ABI release APKs (plus a universal fallback), opt-in via
+    // -PabiSplits so everyday assembleDebug still yields one APK. Only
+    // meaningful when the matching libcore_ffi.so files are in jniLibs —
+    // rig/build-android-release.sh cross-compiles all three ABIs first.
+    if (project.hasProperty("abiSplits")) {
+        splits {
+            abi {
+                isEnable = true
+                reset()
+                include("arm64-v8a", "armeabi-v7a", "x86_64")
+                isUniversalApk = true
+            }
         }
     }
 }

@@ -161,11 +161,18 @@ Or grab the `.deb` from the release page yourself and
 `pharos-streaming-bin` (prebuilt release binaries); both split into `pharos`
 and `trireme`.
 
+**Windows host**: `pharos-<ver>-x86_64.msi` installs the host stack
+(`pharos-host`, `pharos-tray`, `pharos-panel`) with Start Menu shortcuts and
+the firewall exception streaming needs. The same three exes are also on the
+release page bare, as the portable/no-admin option.
+
+**Android / Android TV client**: sideload `trireme-<ver>-<abi>.apk` from the
+release page — `arm64-v8a` for phones and recent TVs, `armeabi-v7a` for
+32-bit TVs (e.g. Sony X90J), or `universal` if unsure.
+
 **Anything else**: `pharos-<ver>-linux-x86_64.tar.gz` and
 `trireme-<ver>-linux-x86_64.tar.gz` on the release page carry the binaries,
-systemd units, and desktop files; copy them where your distro likes. Windows
-hosts get `pharos-host.exe`, `pharos-tray.exe`, and `pharos-panel.exe` as bare
-release assets.
+systemd units, and desktop files; copy them where your distro likes.
 
 **After installing the host:**
 
