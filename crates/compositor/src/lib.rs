@@ -546,6 +546,25 @@ impl State {
     }
 }
 
+/// A short human label for a toplevel — its xdg `app_id` + `title` — for
+/// diagnostics. Either may be empty before the client sets it on first commit.
+fn xdg_ident(surface: &ToplevelSurface) -> String {
+    with_states(surface.wl_surface(), |states| {
+        match states
+            .data_map
+            .get::<XdgToplevelSurfaceData>()
+            .and_then(|d| d.lock().ok())
+        {
+            Some(a) => format!(
+                "app_id={:?} title={:?}",
+                a.app_id.as_deref().unwrap_or(""),
+                a.title.as_deref().unwrap_or(""),
+            ),
+            None => "app_id=? title=?".to_string(),
+        }
+    })
+}
+
 impl XdgShellHandler for State {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell_state
@@ -594,11 +613,39 @@ impl XdgShellHandler for State {
         // activate=true: raise the freshly-launched app to the top of the stack and
         // mark it activated (launch-to-front). The render loop's focus-on-count-
         // change then routes keyboard input to it (it's now the topmost element).
+        // Diagnostic: name every toplevel pharos receives, so app-spawned auxiliary
+        // windows (Steam's "launching game" / shader-processing / Input onboarding)
+        // are visible in the log even when the render policy hides them — the first
+        // step to surfacing them in-stream. See `xdg_ident`.
+        tracing::info!(
+            "new toplevel #{}: {} (mapped fullscreen at {origin:?}, now {} window(s) in space)",
+            self.placed_toplevels,
+            xdg_ident(window.toplevel().unwrap()),
+            self.space.elements().count() + 1,
+        );
         self.space.map_element(window, origin, true);
         self.placed_toplevels = self.placed_toplevels.saturating_add(1);
     }
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+        tracing::info!(
+            "new popup (parent surface present={})",
+            get_parent(surface.wl_surface()).is_some(),
+        );
         let _ = self.popups.track_popup(PopupKind::Xdg(surface));
+    }
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        // Log + unmap so a departed auxiliary window (e.g. Steam's launch splash)
+        // doesn't linger in the space as a stale fullscreen element on top of the
+        // game. Find the matching Window and drop it.
+        tracing::info!("toplevel destroyed: {}", xdg_ident(&surface));
+        let victim = self
+            .space
+            .elements()
+            .find(|w| w.toplevel().map(|t| t.wl_surface()) == Some(surface.wl_surface()))
+            .cloned();
+        if let Some(w) = victim {
+            self.space.unmap_elem(&w);
+        }
     }
     fn fullscreen_request(
         &mut self,
