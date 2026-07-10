@@ -45,11 +45,20 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential pkg-config curl ca-certificates \
+            build-essential pkg-config curl ca-certificates gnupg \
             libwayland-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev \
             libdrm-dev libudev-dev libusb-1.0-0-dev libxkbcommon-dev \
             libinput-dev libxcb1-dev libopus-dev libpixman-1-dev \
-            clang libclang-dev libpipewire-0.3-dev
+            clang libclang-dev software-properties-common
+          # The desktop-mirror capture path (pipewire-rs/libspa 0.10) needs far
+          # newer PipeWire headers than jammy's 0.3.48; the pipewire-debian PPA
+          # tracks upstream on 22.04. Build-time only: the library soname is
+          # libpipewire-0.3.so.0 all the way through 1.x, so the deb's runtime
+          # dependency (unversioned libpipewire-0.3-0) is unaffected.
+          add-apt-repository -y ppa:pipewire-debian/pipewire-upstream
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            libpipewire-0.3-dev libspa-0.2-dev
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -147,8 +156,11 @@ jobs:
         shell: bash
         run: |
           VER="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-          dotnet tool install --global wix
-          wix extension add --global WixToolset.Firewall.wixext
+          # Pinned: WiX v7+ demands interactive acceptance of the Open Source
+          # Maintenance Fee EULA (WIX7015); v5 is the last freely usable line
+          # and consumes the same v4-namespace authoring.
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add --global WixToolset.Firewall.wixext/5.0.2
           wix build packaging/windows/pharos.wxs \
             -ext WixToolset.Firewall.wixext \
             -d Version="$VER" -d BinDir=target/release -d IconDir=packaging/icons \
