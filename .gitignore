@@ -1,6 +1,10 @@
 # Rust
 /target
 
+# Release build output (debs, tarballs, MSI, APKs) — release assets are never
+# committed; the release workflow and rig/build-android-release.sh stage here.
+/dist/
+
 # Capture/stream test artifacts
 *.hevc
 *.mp4
