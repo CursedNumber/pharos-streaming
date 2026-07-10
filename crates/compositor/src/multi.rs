@@ -736,14 +736,29 @@ fn primary_is_mirroring(_pipelines: &[Option<Pipeline>]) -> bool {
     false
 }
 
+/// The primary output's native mode, for sizing launches (a steam-session's
+/// gamescope output — issue #38). Native `width`/`height`, NOT the DRC-scaled
+/// coded size: the session renders at the streamed surface's full mode and the
+/// resolution ladder keeps downscaling the encode underneath it.
+fn primary_output_size(pipelines: &[Option<Pipeline>]) -> Option<(u32, u32)> {
+    pipelines
+        .first()
+        .and_then(|p| p.as_ref())
+        .map(|p| (p.width, p.height))
+}
+
 /// Reconcile the seamless Steam-redirect marker with the live session. The
 /// marker must be present on disk iff the redirect feature is enabled, a client
-/// is actively streaming, AND the primary output is NOT mirroring the real
-/// desktop. That last clause is the desktop-mirror fix (issue #6): while the
-/// user is looking at the mirrored real desktop, a game they start there must
-/// run on wayland-0 (so it appears in the mirror), which means the shim must see
-/// NO marker and pass through. Writing the marker in mirror mode would instead
-/// shove the game onto the unwatched virtual display.
+/// is actively streaming, the primary output is NOT mirroring the real
+/// desktop, AND no gamescope Steam session is live. The mirror clause is the
+/// desktop-mirror fix (issue #6): while the user is looking at the mirrored
+/// real desktop, a game they start there must run on wayland-0 (so it appears
+/// in the mirror), which means the shim must see NO marker and pass through.
+/// Writing the marker in mirror mode would instead shove the game onto the
+/// unwatched virtual display. The steam-session clause is the same idea for
+/// issue #38: the session Steam already launches games inside gamescope, and a
+/// marker would make the shim re-exec them onto the bare compositor socket,
+/// out of the session (and out of Steam Input's sight).
 ///
 /// Idempotent and edge-tracked via [`REDIRECT_MARKER_ON`] — safe to call on
 /// every status tick; it only touches the filesystem on an actual transition.
@@ -758,7 +773,8 @@ fn reconcile_redirect_marker(pipelines: &[Option<Pipeline>], socket_name: &std::
         .flatten()
         .any(|p| p.streamer.as_ref().is_some_and(|s| s.is_connected()));
     let mirroring = primary_is_mirroring(pipelines);
-    let want = any_connected && !mirroring;
+    let steam_session = app_launcher::launch::steam_session_active();
+    let want = any_connected && !mirroring && !steam_session;
     let was = REDIRECT_MARKER_ON.swap(want, std::sync::atomic::Ordering::Relaxed);
     if want == was {
         return;
@@ -784,6 +800,11 @@ fn reconcile_redirect_marker(pipelines: &[Option<Pipeline>], socket_name: &std::
             tracing::info!(
                 "launch-redirect: primary output mirroring the real desktop → games stay on the \
                  desktop (in the mirror)"
+            );
+        } else if steam_session {
+            tracing::info!(
+                "launch-redirect: gamescope Steam session live → the session launches games \
+                 itself; shim passes through"
             );
         } else {
             tracing::info!("launch-redirect: stream idle → games stay on the desktop");
@@ -3123,7 +3144,8 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                     // associate this slug → a Trireme client can Switch-To even a
                     // panel-launched app.
                     data.state.pending_app_launch = Some((slug.clone(), std::time::Instant::now()));
-                    match crate::control::launch_app(&slug, &socket_name, launch_fps) {
+                    let out_size = primary_output_size(&pipelines);
+                    match crate::control::launch_app(&slug, &socket_name, launch_fps, out_size) {
                         Ok(child) => {
                             info!("panel: launched app '{slug}'");
                             // Per-app gyro policy: read the saved entry's mode
@@ -3402,7 +3424,8 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                         // pid indirection; last-one-wins handled in new_toplevel).
                         data.state.pending_app_launch =
                             Some((id.clone(), std::time::Instant::now()));
-                        match crate::control::launch_app(&id, &socket_name, launch_fps) {
+                        let out_size = primary_output_size(&pipelines);
+                        match crate::control::launch_app(&id, &socket_name, launch_fps, out_size) {
                             Ok(child) => {
                                 info!("client: launched app '{id}'");
                                 let catalog = app_launcher::config::load_with_builtins();

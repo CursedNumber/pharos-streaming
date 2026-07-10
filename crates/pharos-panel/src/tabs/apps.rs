@@ -92,6 +92,16 @@ fn grid_ui(ui: &mut egui::Ui, state: &mut PanelState, connected: bool) {
             let desktop = AppEntry::desktop_builtin();
             card(ui, &desktop, connected, None, &mut action);
 
+            // Built-in Steam Big Picture tile (issue #38): the gamescope-hosted
+            // Steam session. Gated on THIS machine being able to run it (Linux
+            // + gamescope + Steam) — the usual panel-on-the-host case; a panel
+            // driving a remote host won't offer it, which errs on the quiet
+            // side. Launch-only like Desktop.
+            if app_launcher::launch::steam_session_supported() {
+                let steam = AppEntry::steam_session_builtin();
+                card(ui, &steam, connected, None, &mut action);
+            }
+
             // User apps, in saved order. `idx` indexes state.apps.apps.
             for (idx, app) in state.apps.apps.iter().enumerate() {
                 card(ui, app, connected, Some(idx), &mut action);

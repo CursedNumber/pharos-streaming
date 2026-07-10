@@ -116,6 +116,32 @@ impl SteamInstall {
             }
             LaunchKind::DesktopFile { exec } => (exec.clone(), false),
             LaunchKind::RawCommand { line } => (line.clone(), false),
+            // Representative only: the real spawn is built directly (with the
+            // live output size) by `launch::launch_steam_session`, never from
+            // this line. Returned so display/end-app callers that resolve every
+            // kind see something truthful rather than an empty string.
+            LaunchKind::SteamSession => {
+                let client = self.session_client_argv().join(" ");
+                (format!("gamescope -e -f -- {client} -gamepadui"), false)
+            }
+        }
+    }
+
+    /// The argv that starts THIS install's Steam client directly (no `setsid`,
+    /// no URI) — the child gamescope execs for a [`LaunchKind::SteamSession`].
+    /// Unlike [`launch_uri`](Self::launch_uri), the session wants Steam as a
+    /// *foreground child of gamescope*, so no detach wrapper.
+    pub fn session_client_argv(&self) -> Vec<String> {
+        match self {
+            SteamInstall::Flatpak { .. } => vec![
+                "flatpak".into(),
+                "run".into(),
+                "com.valvesoftware.Steam".into(),
+            ],
+            SteamInstall::Snap { .. } => vec!["snap".into(), "run".into(), "steam".into()],
+            // Native, Windows (unreachable for sessions — Linux-only), None
+            // (still emit the most likely form, same policy as launch_uri).
+            _ => vec!["steam".into()],
         }
     }
 }

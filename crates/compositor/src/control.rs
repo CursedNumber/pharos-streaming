@@ -1016,11 +1016,17 @@ pub fn launch_app(
     slug: &str,
     socket_name: &std::ffi::OsStr,
     output_fps: u32,
+    output_size: Option<(u32, u32)>,
 ) -> Result<Option<std::process::Child>, String> {
     // `output_fps` is the virtual output's refresh (the single global pacer), so
-    // an app's `FpsCap::Auto` resolves to "match the stream rate".
-    let ctx = app_launcher::LaunchContext::wayland(socket_name.to_os_string())
+    // an app's `FpsCap::Auto` resolves to "match the stream rate". `output_size`
+    // is the primary output's native mode — it sizes a steam-session's gamescope
+    // output to the streamed surface (issue #38).
+    let mut ctx = app_launcher::LaunchContext::wayland(socket_name.to_os_string())
         .with_output_fps(output_fps);
+    if let Some((w, h)) = output_size {
+        ctx = ctx.with_output_size(w, h);
+    }
     app_launcher::launch_slug(slug, &ctx).map_err(|e| e.to_string())
 }
 

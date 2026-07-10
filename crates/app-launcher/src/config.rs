@@ -209,6 +209,16 @@ pub enum LaunchKind {
     /// A free-form command line (the v1 behaviour). `line` is tokenized on
     /// whitespace (respecting double quotes) unless [`AppEntry::shell`] is set.
     RawCommand { line: String },
+    /// A gamescope-hosted Steam session (issue #38): the whole Steam client —
+    /// Big Picture UI, overlay, Steam Input, launch/shader dialogs — runs inside
+    /// one `gamescope … -- steam -gamepadui` nested session on the virtual
+    /// display, the way the Steam Deck hosts it. This is what makes Steam Input
+    /// API games (which read controllers only via Steam client IPC, routed by
+    /// the window focus *Steam* sees) playable through the stream, and puts
+    /// every Steam-owned window in-stream instead of lost on the host desktop.
+    /// Linux-only; sized from the live output mode at launch (see
+    /// [`launch`](crate::launch::launch)).
+    SteamSession,
 }
 
 /// One launchable application.
@@ -331,10 +341,33 @@ impl AppEntry {
         }
     }
 
+    /// The built-in "Steam Big Picture" entry — a gamescope-hosted Steam session
+    /// on the virtual display (issue #38). Only surfaced by [`Catalog::with_builtins`]
+    /// when the host can actually run it (Linux + gamescope + a Steam install —
+    /// see [`steam_session_supported`](crate::launch::steam_session_supported)),
+    /// so the tile never appears where it would only error.
+    pub fn steam_session_builtin() -> Self {
+        AppEntry {
+            slug: "steam-session".into(),
+            name: "Steam Big Picture".into(),
+            kind: AppKind::Game,
+            command: String::new(),
+            launch: Some(LaunchKind::SteamSession),
+            shell: false,
+            cwd: None,
+            env: Vec::new(),
+            box_art: None,
+            target: LaunchTarget::VirtualDisplay,
+            gyro_mode: GyroMode::default(),
+            perf_overlay: false,
+            fps_cap: FpsCap::default(),
+        }
+    }
+
     /// True for entries the user authored (i.e. not a synthetic built-in like
     /// `desktop`), so the editor only lets you delete/edit real ones.
     pub fn is_builtin(&self) -> bool {
-        self.slug == "desktop"
+        self.slug == "desktop" || self.slug == "steam-session"
     }
 
     /// The effective [`LaunchKind`] for this entry: the explicit structured
@@ -375,13 +408,18 @@ impl Catalog {
         self.apps.iter().find(|a| a.slug.eq_ignore_ascii_case(s))
     }
 
-    /// Return a copy with built-in entries (currently just `desktop`) prepended
-    /// if they aren't already present. Use this for anything user-facing — the
-    /// panel grid, the CLI, the client relay — so Desktop always shows.
+    /// Return a copy with built-in entries prepended if they aren't already
+    /// present: `desktop` always, `steam-session` (issue #38) only where the
+    /// host can run it. Use this for anything user-facing — the panel grid, the
+    /// CLI, the client relay — so Desktop always shows. A user entry with the
+    /// same slug wins over the built-in (same override rule as `desktop`).
     pub fn with_builtins(&self) -> Catalog {
         let mut out = Catalog::default();
         if self.find("desktop").is_none() {
             out.apps.push(AppEntry::desktop_builtin());
+        }
+        if self.find("steam-session").is_none() && crate::launch::steam_session_supported() {
+            out.apps.push(AppEntry::steam_session_builtin());
         }
         out.apps.extend(self.apps.iter().cloned());
         out
@@ -480,10 +518,36 @@ mod tests {
 
     #[test]
     fn builtins_prepend_desktop() {
+        // Desktop is always first. The steam-session built-in is machine-gated
+        // (Linux + gamescope + Steam), so only assert that ANY extra built-in is
+        // exactly that one — the test must pass both on CI (absent) and on a rig
+        // with gamescope installed (present).
         let cat = Catalog::default().with_builtins();
-        assert_eq!(cat.apps.len(), 1);
         assert_eq!(cat.apps[0].slug, "desktop");
         assert!(cat.apps[0].is_builtin());
+        for extra in &cat.apps[1..] {
+            assert_eq!(extra.slug, "steam-session");
+            assert!(extra.is_builtin());
+            assert_eq!(extra.resolved_kind(), LaunchKind::SteamSession);
+        }
+    }
+
+    #[test]
+    fn steam_session_kind_roundtrips_through_toml() {
+        // A hand-written `[app.launch] kind = "steam-session"` table must parse,
+        // and the built-in entry must survive a save/load cycle.
+        let cat = Catalog {
+            apps: vec![AppEntry {
+                slug: "bp".into(),
+                name: "Big Picture".into(),
+                launch: Some(LaunchKind::SteamSession),
+                ..AppEntry::new()
+            }],
+        };
+        let text = toml::to_string_pretty(&cat).unwrap();
+        assert!(text.contains("kind = \"steam-session\""), "{text}");
+        let back: Catalog = toml::from_str(&text).unwrap();
+        assert_eq!(back.apps[0].resolved_kind(), LaunchKind::SteamSession);
     }
 
     #[test]

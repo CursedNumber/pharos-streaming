@@ -50,6 +50,10 @@ pub struct LaunchContext {
     /// concrete MangoHud `fps_limit`. `None` (the CLI/tests, which have no
     /// compositor context) leaves an `Auto` cap *uncapped* rather than guessing.
     pub output_fps: Option<u32>,
+    /// The live virtual output's native mode in pixels, if the host knows it.
+    /// Sizes a [`LaunchKind::SteamSession`]'s gamescope output (`-W`/`-H`) to
+    /// the streamed surface; `None` (CLI/tests) falls back to 1920×1080.
+    pub output_size: Option<(u32, u32)>,
 }
 
 impl LaunchContext {
@@ -65,6 +69,7 @@ impl LaunchContext {
             x11_display: None,
             audio_sink: session_audio_sink(),
             output_fps: None,
+            output_size: None,
         }
     }
 
@@ -72,6 +77,13 @@ impl LaunchContext {
     /// [`FpsCap::Auto`](crate::config::FpsCap::Auto) at launch.
     pub fn with_output_fps(mut self, fps: u32) -> Self {
         self.output_fps = Some(fps);
+        self
+    }
+
+    /// Record the live virtual output's native mode, used to size a Steam
+    /// session's gamescope output.
+    pub fn with_output_size(mut self, w: u32, h: u32) -> Self {
+        self.output_size = Some((w, h));
         self
     }
 }
@@ -119,6 +131,14 @@ pub fn launch(entry: &AppEntry, ctx: &LaunchContext) -> anyhow::Result<Option<Ch
     // Steam install turns a SteamGame/RawCommand into the concrete command line,
     // so the launcher — not a hand-authored string — owns the distro wrapper.
     let kind = entry.resolved_kind();
+
+    // A Steam session (issue #38) is not a command line: gamescope is sized from
+    // the live output mode in `ctx`, so it gets its own build path before any
+    // line resolution. Its own guards mirror the generic ones below.
+    if matches!(kind, crate::config::LaunchKind::SteamSession) {
+        return launch_steam_session(entry, ctx);
+    }
+
     let install = detect_steam();
     let (line_owned, kind_shell) = install.launch_command(&kind);
     let line = line_owned.trim();
@@ -278,6 +298,211 @@ pub fn launch(entry: &AppEntry, ctx: &LaunchContext) -> anyhow::Result<Option<Ch
         .map_err(|e| anyhow::anyhow!("spawn `{}` for app `{}`: {e}", line, entry.slug))?;
     register_pid(&entry.slug, child.id());
     Ok(Some(child))
+}
+
+// ── Steam session (issue #38): gamescope-hosted Big Picture in the stream ───
+//
+// Two architectural walls, one root cause: the Steam client lives on the real
+// desktop while a Pharos-launched game lives on the compositor's nested Wayland
+// display. Steam Input routes controllers by the window focus *Steam* sees, so
+// a Steam-Input-API game in the stream never gets its action set activated
+// (lesson-steam-input-nested-wayland); and Steam's launch/shader/onboarding
+// windows map on the desktop, invisible in-stream. Hosting the WHOLE Steam
+// client Deck-style — `gamescope … -- steam -gamepadui` — inside the virtual
+// display solves both: Steam owns the session it is focused in, and every
+// Steam window renders in the stream.
+
+/// Is gamescope on `PATH`? Gates the built-in `steam-session` tile and the
+/// spawn. Cached — presence doesn't change within a run. Always false
+/// off-Linux (nested gamescope is a Linux Wayland client).
+pub fn gamescope_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        cfg!(target_os = "linux")
+            && std::env::var_os("PATH")
+                .map(|paths| {
+                    std::env::split_paths(&paths).any(|dir| dir.join("gamescope").is_file())
+                })
+                .unwrap_or(false)
+    })
+}
+
+/// Can THIS host run a gamescope-hosted Steam session? Linux with gamescope on
+/// `PATH` and a detected Steam install. Consulted by
+/// [`Catalog::with_builtins`](crate::config::Catalog::with_builtins) so the
+/// built-in tile only appears where launching it can work.
+pub fn steam_session_supported() -> bool {
+    gamescope_available() && detect_steam().root().is_some()
+}
+
+/// The live Steam session's identity: `(pid, start_ticks)`, recorded at spawn.
+/// Start ticks make the liveness probe immune to pid recycling (same guard as
+/// [`end_app`]'s SIGKILL pass). Linux-only, like the spawn path that fills it.
+#[cfg(target_os = "linux")]
+type SessionPid = Option<(u32, Option<u64>)>;
+
+#[cfg(target_os = "linux")]
+fn steam_session_pid_cell() -> &'static Mutex<SessionPid> {
+    static PID: OnceLock<Mutex<SessionPid>> = OnceLock::new();
+    PID.get_or_init(|| Mutex::new(None))
+}
+
+/// Is a Pharos-spawned gamescope Steam session currently alive? Cheap (one
+/// /proc probe) and self-clearing when the session exits. The compositor's
+/// redirect-marker reconciler keys off this: inside the session Steam already
+/// owns the right display, so the `pharos-redirect` shim must see NO marker
+/// and pass through — a marker would yank a session-launched game out of
+/// gamescope onto the bare compositor socket.
+pub fn steam_session_active() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let mut cell = steam_session_pid_cell()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match *cell {
+            Some((pid, start)) if pid_alive(pid) && proc_starttime(pid) == start => true,
+            Some(_) => {
+                *cell = None;
+                false
+            }
+            None => false,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// gamescope argv for a Steam session: `-e` (Steam integration), `-f`
+/// (fullscreen), output sized to the live virtual mode, nested refresh matched
+/// to the stream pace, then any `extra` flags (`PHAROS_GAMESCOPE_ARGS`), `--`,
+/// and the install-correct Steam client argv in Big Picture mode.
+#[cfg(target_os = "linux")]
+fn steam_session_args(
+    w: u32,
+    h: u32,
+    fps: Option<u32>,
+    extra: &[String],
+    client: &[String],
+) -> Vec<String> {
+    let mut a: Vec<String> = vec!["-e".into(), "-f".into()];
+    a.push("-W".into());
+    a.push(w.to_string());
+    a.push("-H".into());
+    a.push(h.to_string());
+    if let Some(f) = fps.filter(|f| *f > 0) {
+        a.push("-r".into());
+        a.push(f.to_string());
+    }
+    a.extend(extra.iter().cloned());
+    a.push("--".into());
+    a.extend(client.iter().cloned());
+    a.push("-gamepadui".into());
+    a
+}
+
+/// Spawn a [`LaunchKind::SteamSession`](crate::config::LaunchKind::SteamSession):
+/// gamescope hosting the full Steam client on the virtual display. Mirrors
+/// [`launch`]'s generic guards (physical-target refusal, slug idempotency) and
+/// adds the session-specific ones: gamescope + Steam present, and no desktop
+/// Steam already running — `-gamepadui` handed to a running Steam just flips
+/// *its* desktop window to Big Picture, so nothing would appear in the stream.
+///
+/// The per-app `fps_cap`/`perf_overlay` knobs deliberately do NOT apply here:
+/// `MANGOHUD=1` on gamescope would hook gamescope's own Vulkan compositor, and
+/// every game in the session inherits the env — cap per-title in Steam launch
+/// options instead. gamescope's `-r` already paces the session to the stream.
+fn launch_steam_session(entry: &AppEntry, ctx: &LaunchContext) -> anyhow::Result<Option<Child>> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = ctx;
+        anyhow::bail!(
+            "app `{}` is a steam-session (gamescope-hosted Steam), which is Linux-only",
+            entry.slug
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if entry.target.is_physical_target() {
+            anyhow::bail!(
+                "app `{}` is a steam-session targeting {:?} (the host's PHYSICAL desktop); \
+                 the session exists to own the virtual display — use a virtual-display target",
+                entry.slug,
+                entry.target
+            );
+        }
+        if let Some(pid) = live_registered_pid(&entry.slug) {
+            tracing::info!(
+                "app `{}`: Steam session already running (pid {pid}); focus/no-op",
+                entry.slug
+            );
+            return Ok(None);
+        }
+        if !gamescope_available() {
+            anyhow::bail!(
+                "steam-session needs gamescope on PATH — install your distro's `gamescope` package"
+            );
+        }
+        let install = detect_steam();
+        if install.root().is_none() {
+            anyhow::bail!("steam-session: no Steam install detected on this host");
+        }
+        if crate::steam::is_ready() {
+            anyhow::bail!(
+                "steam-session: Steam is already running on the desktop, and a second launch \
+                 would attach to it there instead of starting inside the stream. Fully quit \
+                 Steam (Steam → Exit, or `steam -shutdown`) and launch the session again"
+            );
+        }
+        let (w, h) = ctx.output_size.unwrap_or((1920, 1080));
+        let extra = std::env::var("PHAROS_GAMESCOPE_ARGS")
+            .map(|s| tokenize(&s))
+            .unwrap_or_default();
+        let args = steam_session_args(w, h, ctx.output_fps, &extra, &install.session_client_argv());
+        let mut cmd = Command::new("gamescope");
+        cmd.args(&args);
+        if let Some(sock) = &ctx.wayland_socket {
+            cmd.env("WAYLAND_DISPLAY", sock);
+        }
+        // gamescope brings its own XWayland for the games; scrub the host's
+        // DISPLAY so nothing inside can escape to the real X11 session.
+        match &ctx.x11_display {
+            Some(d) => {
+                cmd.env("DISPLAY", d);
+            }
+            None => {
+                cmd.env_remove("DISPLAY");
+            }
+        }
+        // Steam and every game it launches inherit the session sink, so the
+        // whole session's audio lands in the stream capture.
+        if let Some(sink) = &ctx.audio_sink {
+            cmd.env("PULSE_SINK", sink);
+        }
+        if let Some(dir) = &entry.cwd {
+            if !dir.trim().is_empty() {
+                cmd.current_dir(dir);
+            }
+        }
+        for (k, v) in &entry.env {
+            cmd.env(k, v);
+        }
+        tracing::info!(
+            "launching Steam session `{}`: gamescope {}",
+            entry.slug,
+            args.join(" ")
+        );
+        let child = cmd.spawn().map_err(|e| {
+            anyhow::anyhow!("spawn gamescope for steam-session `{}`: {e}", entry.slug)
+        })?;
+        let pid = child.id();
+        register_pid(&entry.slug, pid);
+        *steam_session_pid_cell()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((pid, proc_starttime(pid)));
+        Ok(Some(child))
+    }
 }
 
 /// Translate a resolved FPS limit into the MangoHud environment that turns it
@@ -457,12 +682,16 @@ fn spawn_steam_handoff_worker(
     kind_shell: bool,
 ) -> anyhow::Result<()> {
     // Arm the seamless display-redirect only for a virtual-display launch (a
-    // physical target must never be redirected) with the feature opted in.
-    let redirect_appid = if ctx.wayland_socket.is_some() && crate::redirect::enabled() {
-        parse_steam_appid(line)
-    } else {
-        None
-    };
+    // physical target must never be redirected) with the feature opted in — and
+    // never while a gamescope Steam session is live: the handoff then goes to
+    // the SESSION Steam, which already launches the game inside the stream, so
+    // arming (and its "goes to the DESKTOP" deferral warning) would be wrong.
+    let redirect_appid =
+        if ctx.wayland_socket.is_some() && crate::redirect::enabled() && !steam_session_active() {
+            parse_steam_appid(line)
+        } else {
+            None
+        };
     let spec = SteamHandoffSpec {
         slug: entry.slug.clone(),
         line: line.to_string(),
@@ -1318,6 +1547,61 @@ mod tests {
             live_registered_pid(&slug).is_none(),
             "a dead pid must be pruned and treated as absent"
         );
+    }
+
+    /// The gamescope argv is deterministic and ordered: integration+fullscreen,
+    /// output size, refresh (only when known), user extras, then `-- <client>
+    /// -gamepadui`. This is the whole session command — worth pinning exactly.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn steam_session_args_shape() {
+        let a = steam_session_args(
+            2560,
+            1440,
+            Some(60),
+            &["--hdr-enabled".into()],
+            &["steam".into()],
+        );
+        let want: Vec<String> = [
+            "-e",
+            "-f",
+            "-W",
+            "2560",
+            "-H",
+            "1440",
+            "-r",
+            "60",
+            "--hdr-enabled",
+            "--",
+            "steam",
+            "-gamepadui",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(a, want);
+        // Unknown refresh → no -r flag at all rather than a guess.
+        let a = steam_session_args(1920, 1080, None, &[], &["steam".into()]);
+        assert!(!a.contains(&"-r".to_string()), "{a:?}");
+    }
+
+    /// A steam-session pointed at the physical desktop makes no sense (the
+    /// session exists to own the virtual display) and must be refused with the
+    /// reason, same policy as the generic physical-target guard.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn steam_session_physical_target_is_refused() {
+        let e = AppEntry {
+            slug: "bp-phys".into(),
+            name: "BP".into(),
+            launch: Some(LaunchKind::SteamSession),
+            target: LaunchTarget::DuplicatePhysical,
+            ..AppEntry::new()
+        };
+        let err = launch(&e, &LaunchContext::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("PHYSICAL"), "reason must be explicit: {err}");
     }
 
     #[test]

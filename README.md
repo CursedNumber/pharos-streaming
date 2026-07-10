@@ -78,6 +78,10 @@ Proven on real hardware, and used day-to-day for game streaming:
   via xdg-desktop-portal + PipeWire off the render loop, with libei input
   injection and best-fit letterboxing. Distinct from the multi-client fan-out
   below (this mirrors the *real* screen; that fans *one virtual display* out).
+- **Steam Big Picture session** (Linux): a built-in tile runs the whole Steam
+  client Deck-style — gamescope-hosted, inside the stream — so Steam Input API
+  games get controllers and every Steam dialog is drivable from the couch;
+  *shipped, not yet live-validated* (issue #38).
 - **Native VNC and SPICE console sources** in the client, so a Proxmox/QEMU VM
   console can share a split-screen cell alongside a Pharos stream, fully
   interactive.

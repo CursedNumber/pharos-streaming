@@ -12,6 +12,7 @@ configuration files. For an overview and the feature list, see
 - [Environment variables](#environment-variables)
 - [Configuration files](#configuration-files)
 - [Desktop mirroring](#desktop-mirroring)
+- [Steam Big Picture session](#steam-big-picture-session)
 - [Pairing & trust model](#pairing--trust-model)
 - [Input capture & pacing](#input-capture--pacing)
 
@@ -343,6 +344,7 @@ tracing `EnvFilter`) is honored by every binary.
 | `PHAROS_MARK_PID` / `_START` / `_SOCKET` | liveness/PID-reuse guards read by the shim |
 | `PHAROS_WAYLAND_DISPLAY` | Wayland socket the shim exports so the game renders into the stream |
 | `PHAROS_PULSE_SINK` / `PHAROS_PROTON_ENABLE_WAYLAND` | per-stream audio sink / Proton Wayland toggle |
+| `PHAROS_GAMESCOPE_ARGS` | extra gamescope flags for the Steam Big Picture session (issue #38) |
 
 **Diagnostics & Windows host**
 | var | effect |
@@ -451,7 +453,9 @@ addr = "quic://0.0.0.0:15777"
 ### apps.toml: the launchable app/game catalog
 
 An array of `[[app]]` tables shown in the panel and the Trireme grid. A synthetic
-`desktop` entry is always present. Only `slug`/`name`/`command` are required.
+`desktop` entry is always present; a `steam-session` entry (**Steam Big Picture**,
+issue #38) appears automatically on a Linux host with gamescope and Steam
+installed. Only `slug`/`name`/`command` are required.
 
 | key | type | default | meaning |
 |---|---|---|---|
@@ -459,7 +463,7 @@ An array of `[[app]]` tables shown in the panel and the Trireme grid. A syntheti
 | `name` | string (req) |  | display name |
 | `kind` | `app`\|`game`\|`desktop`\|`media` | `app` | drives the default icon |
 | `command` | string | "" | launch line (whitespace-tokenized unless `shell`) |
-| `[app.launch]` | tagged table | none | structured launch: `steam-game`(`appid`) / `desktop-file`(`exec`) / `raw-command`(`line`) |
+| `[app.launch]` | tagged table | none | structured launch: `steam-game`(`appid`) / `desktop-file`(`exec`) / `raw-command`(`line`) / `steam-session` (no fields) |
 | `shell` | bool | false | run through `/bin/sh -c` (pipes, `steam://` handlers) |
 | `cwd` | string | none | working directory |
 | `env` | `[["K","V"]]` | [] | extra child env |
@@ -622,6 +626,39 @@ an interactive mirror without the HEVC pipeline; add a `protocol = "vnc"` source
 pointing at it (see the sources config above). Expect VNC-tier latency and quality.
 On Plasma 6 Wayland, KDE's built-in remote desktop speaks RDP, so you need an actual
 VNC server (e.g. `krfb`) for this route.
+
+## Steam Big Picture session
+
+The **`steam-session`** built-in tile (issue #38) runs the whole Steam client
+Deck-style inside the stream: `gamescope -e -f -W <w> -H <h> -r <hz> -- steam
+-gamepadui`, launched onto the virtual display and sized from its live mode. It
+appears automatically (panel grid + Trireme Apps) on a Linux host with
+`gamescope` and Steam installed.
+
+Why it exists: the Steam client normally lives on your real desktop while a
+Pharos-launched game lives on the compositor's nested display. Steam Input
+routes controllers by the window focus *Steam* sees, so a Steam Input API game
+(No Man's Sky and a growing list) never gets its controller configuration
+activated in-stream; and Steam's "Launching…"/shader/onboarding dialogs map on
+the desktop, invisible from the couch. Hosting all of Steam inside one
+gamescope session on the virtual display fixes both: Steam Input works, and
+every Steam window renders in the stream, drivable with the pad.
+
+Notes:
+- **Desktop Steam must be closed first.** A second `steam -gamepadui` would
+  attach to the running desktop client (flipping *its* window to Big Picture)
+  instead of starting inside the stream, so the launch refuses with that
+  message. Quit Steam (Steam → Exit, or `steam -shutdown`) and relaunch.
+- While a session is live the `PHAROS_STEAM_REDIRECT` marker is suppressed
+  (same reconciliation as mirror mode): the session Steam launches games itself,
+  and per-title app tiles hand their `steam://rungameid/…` URI to it, so tile
+  launches land inside the session too.
+- Games run against gamescope's own XWayland, which also sidesteps the
+  winewayland-only constraint for titles that misbehave under it.
+- Extra gamescope flags (e.g. `--hdr-enabled`, a different `--backend`) can be
+  injected via `PHAROS_GAMESCOPE_ARGS`.
+- Per-app `fps_cap`/`perf_overlay` don't apply to the session (they would hook
+  gamescope itself); use per-title Steam launch options (`mangohud %command%`).
 
 ## Pairing & trust model
 
