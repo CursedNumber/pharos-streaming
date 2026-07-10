@@ -97,9 +97,9 @@ fn codec_card(
 ) {
     let active = state == CardState::Active;
     let stroke = if active {
-        Stroke::new(2.5, theme::streaming())
+        Stroke::new(2.5_f32, theme::streaming())
     } else {
-        Stroke::new(1.0, theme::available().gamma_multiply(0.8))
+        Stroke::new(1.0_f32, theme::available().gamma_multiply(0.8))
     };
     let fill = if active {
         theme::streaming().gamma_multiply(0.10)

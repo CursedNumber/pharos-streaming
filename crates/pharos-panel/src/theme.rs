@@ -283,7 +283,7 @@ pub fn visuals(theme: Theme) -> egui::Visuals {
             v.widgets.active.fg_stroke.color = rgb(0x00, 0x00, 0x00);
             v.widgets.active.bg_fill = rgb(0xd2, 0xd6, 0xdd);
             v.selection.bg_fill = rgb(0xb6, 0xd4, 0xff);
-            v.selection.stroke = Stroke::new(1.0, rgb(0x10, 0x10, 0x10));
+            v.selection.stroke = Stroke::new(1.0_f32, rgb(0x10, 0x10, 0x10));
         }
         Theme::HighContrast => {
             v.dark_mode = true;
@@ -294,24 +294,24 @@ pub fn visuals(theme: Theme) -> egui::Visuals {
             v.code_bg_color = rgb(0x10, 0x10, 0x10);
             v.faint_bg_color = rgb(0x1c, 0x1c, 0x1c);
             // Strong borders carry structure when colour is minimised.
-            v.window_stroke = Stroke::new(1.0, rgb(0x9a, 0x9a, 0x9a));
+            v.window_stroke = Stroke::new(1.0_f32, rgb(0x9a, 0x9a, 0x9a));
             v.widgets.noninteractive.fg_stroke.color = white;
             v.widgets.noninteractive.weak_bg_fill = rgb(0xc4, 0xc4, 0xc4);
-            v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, rgb(0x80, 0x80, 0x80));
+            v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, rgb(0x80, 0x80, 0x80));
             v.widgets.inactive.fg_stroke.color = white;
             v.widgets.inactive.bg_fill = rgb(0x12, 0x12, 0x12);
             // Darker than `bg_fill` so the slider rail (which egui paints with
             // `bg_fill`) stays visible on a card (cards fill with `weak_bg_fill`).
             v.widgets.inactive.weak_bg_fill = rgb(0x08, 0x08, 0x08);
-            v.widgets.inactive.bg_stroke = Stroke::new(1.0, rgb(0xa0, 0xa0, 0xa0));
+            v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, rgb(0xa0, 0xa0, 0xa0));
             v.widgets.hovered.fg_stroke.color = white;
             v.widgets.hovered.bg_fill = rgb(0x2a, 0x2a, 0x2a);
-            v.widgets.hovered.bg_stroke = Stroke::new(2.0, white);
+            v.widgets.hovered.bg_stroke = Stroke::new(2.0_f32, white);
             v.widgets.active.fg_stroke.color = white;
             v.widgets.active.bg_fill = rgb(0x3a, 0x3a, 0x3a);
-            v.widgets.active.bg_stroke = Stroke::new(2.0, white);
+            v.widgets.active.bg_stroke = Stroke::new(2.0_f32, white);
             v.selection.bg_fill = rgb(0x00, 0x5a, 0xb0);
-            v.selection.stroke = Stroke::new(1.0, white);
+            v.selection.stroke = Stroke::new(1.0_f32, white);
         }
     }
 

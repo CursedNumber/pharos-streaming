@@ -675,7 +675,7 @@ fn latency_table(ui: &mut egui::Ui, state: &mut PanelState, report: &LatencyRepo
     crate::widgets::card(ui, "video_bench_table", |ui| {
         // Header underline + Total overline, so the header band and the Total
         // read as distinct from the striped per-step rows (not just bold).
-        let rule = Stroke::new(1.5, ui.visuals().widgets.noninteractive.fg_stroke.color);
+        let rule = Stroke::new(1.5_f32, ui.visuals().widgets.noninteractive.fg_stroke.color);
         let head_color = ui.visuals().strong_text_color();
         TableBuilder::new(ui)
             .striped(true)
@@ -1360,7 +1360,7 @@ fn metrics_line(ui: &mut egui::Ui, metric: Option<CardMetric>) {
 /// Connect the active encoder → codec → decoder cards with arrows, drawn over
 /// the rendered columns in screen space.
 fn draw_arrows(ui: &egui::Ui, rects: &[Option<egui::Rect>; 3]) {
-    let stroke = Stroke::new(2.5, crate::theme::streaming());
+    let stroke = Stroke::new(2.5_f32, crate::theme::streaming());
     let painter = ui.painter();
     let connect = |from: egui::Rect, to: egui::Rect| {
         let a = from.right_center();
@@ -1396,15 +1396,15 @@ fn option_box(
     // click) → an info-colour ring "glow"; else validated → green, available →
     // faint teal, unavailable → dim.
     let stroke = if is_active {
-        Stroke::new(2.5, crate::theme::streaming())
+        Stroke::new(2.5_f32, crate::theme::streaming())
     } else if is_selected {
-        Stroke::new(2.0, crate::theme::info())
+        Stroke::new(2.0_f32, crate::theme::info())
     } else if cap.validated {
-        Stroke::new(2.0, crate::theme::validated())
+        Stroke::new(2.0_f32, crate::theme::validated())
     } else if cap.available {
-        Stroke::new(1.0, crate::theme::available().gamma_multiply(0.8))
+        Stroke::new(1.0_f32, crate::theme::available().gamma_multiply(0.8))
     } else {
-        Stroke::new(1.0, crate::theme::unavailable().gamma_multiply(0.5))
+        Stroke::new(1.0_f32, crate::theme::unavailable().gamma_multiply(0.5))
     };
     // A subtle fill tint reinforces active/selected without a literal glow.
     let fill = if is_active {
@@ -1603,13 +1603,13 @@ fn codec_cards(
         let is_active = active_key == Some(key);
         let is_selected = pending_key == Some(key) && !is_active;
         let stroke = if is_active {
-            Stroke::new(2.5, crate::theme::streaming())
+            Stroke::new(2.5_f32, crate::theme::streaming())
         } else if is_selected {
-            Stroke::new(2.0, crate::theme::info())
+            Stroke::new(2.0_f32, crate::theme::info())
         } else if switchable {
-            Stroke::new(1.0, crate::theme::available().gamma_multiply(0.8))
+            Stroke::new(1.0_f32, crate::theme::available().gamma_multiply(0.8))
         } else {
-            Stroke::new(1.0, crate::theme::unavailable().gamma_multiply(0.5))
+            Stroke::new(1.0_f32, crate::theme::unavailable().gamma_multiply(0.5))
         };
         let fill = if is_active {
             crate::theme::streaming().gamma_multiply(0.10)

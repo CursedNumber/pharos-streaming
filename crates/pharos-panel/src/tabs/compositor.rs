@@ -1208,9 +1208,9 @@ fn draw_canvas(
             visuals.widgets.inactive.fg_stroke.color
         };
         let stroke_w = if overlaps || is_primary || in_set {
-            2.5
+            2.5_f32
         } else {
-            1.5
+            1.5_f32
         };
 
         painter.rect(
@@ -1621,7 +1621,7 @@ fn draw_client_card(
             cell.shrink(1.0),
             Rounding::same(3.0),
             Color32::from_black_alpha(70),
-            Stroke::new(1.0, visuals.weak_text_color()),
+            Stroke::new(1.0_f32, visuals.weak_text_color()),
         );
     }
     let pad = Vec2::new(5.0, 4.0);
@@ -1698,7 +1698,7 @@ fn snap_position(
 fn draw_grid(painter: &egui::Painter, rect: Rect, view: &View, visuals: &egui::Visuals) {
     const STEP: i32 = 480;
     let line = Stroke::new(
-        1.0,
+        1.0_f32,
         visuals
             .widgets
             .noninteractive
@@ -3064,7 +3064,7 @@ fn draw_sparkline(ui: &mut egui::Ui, samples: &[u32], y_max: u32) {
             Pos2::new(rect.left(), baseline_y),
             Pos2::new(rect.right(), baseline_y),
         ],
-        Stroke::new(0.5, ui.visuals().weak_text_color()),
+        Stroke::new(0.5_f32, ui.visuals().weak_text_color()),
     );
     if samples.len() < 2 {
         return;
@@ -3082,7 +3082,7 @@ fn draw_sparkline(ui: &mut egui::Ui, samples: &[u32], y_max: u32) {
         if let Some(q) = prev {
             painter.line_segment(
                 [q, p],
-                Stroke::new(1.2, ui.visuals().widgets.active.fg_stroke.color),
+                Stroke::new(1.2_f32, ui.visuals().widgets.active.fg_stroke.color),
             );
         }
         prev = Some(p);

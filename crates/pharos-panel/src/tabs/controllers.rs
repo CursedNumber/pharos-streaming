@@ -550,7 +550,7 @@ fn draw_gyro_curve(ui: &mut egui::Ui, g: &GyroTuning) {
         rect,
         egui::Rounding::same(4.0),
         vis.extreme_bg_color,
-        egui::Stroke::new(1.0, vis.weak_text_color()),
+        egui::Stroke::new(1.0_f32, vis.weak_text_color()),
     );
 
     let map = |sp: f32, gain: f32| {
@@ -562,7 +562,7 @@ fn draw_gyro_curve(ui: &mut egui::Ui, g: &GyroTuning) {
         )
     };
 
-    let faint = egui::Stroke::new(1.0, vis.weak_text_color());
+    let faint = egui::Stroke::new(1.0_f32, vis.weak_text_color());
     // Knee (accel_ref) and clamp ceiling (1 + accel_max).
     if g.accel_ref > 0.0 && g.accel_ref <= X_MAX {
         let x = map(g.accel_ref, 1.0).x;
@@ -586,7 +586,7 @@ fn draw_gyro_curve(ui: &mut egui::Ui, g: &GyroTuning) {
     } else {
         vis.weak_text_color()
     };
-    let stroke = egui::Stroke::new(1.6, col);
+    let stroke = egui::Stroke::new(1.6_f32, col);
     let n = 48;
     let mut prev = map(0.0, accel_multiplier(g, 0.0));
     for i in 1..=n {
