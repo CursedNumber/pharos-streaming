@@ -39,6 +39,10 @@ Proven on real hardware, and used day-to-day for game streaming:
 - **Reversed USB/IP**: export a controller, stick, or drive **from the client**
   and it appears as a *real* device on the host (HID + mass-storage, verified over
   the LAN).
+- **Mirror your real desktop**: stream the physical KDE/GNOME session you are
+  sitting at (not just the headless virtual display) through the same zero-copy
+  NVENC pipeline, with libei keyboard/mouse injection back and best-fit letterbox
+  scaling for odd aspect ratios; live-validated at ~60 fps HEVC on an RTX 4070.
 - **Windows host**: WGC/ddagrab + an IddCx headless virtual display →
   Quick Sync / NVENC / AMF HEVC with SendInput; NVENC HEVC hosting validated on a
   real GPU rig.
@@ -69,6 +73,11 @@ Proven on real hardware, and used day-to-day for game streaming:
   mouse motion. Client gamepads land on per-slot virtual Xbox 360 pads.
 
 **Beyond one screen**
+- **Real-desktop mirror** (Linux): launch the built-in `desktop` app and Pharos
+  streams your physical KDE/GNOME session through the full HEVC pipeline, captured
+  via xdg-desktop-portal + PipeWire off the render loop, with libei input
+  injection and best-fit letterboxing. Distinct from the multi-client fan-out
+  below (this mirrors the *real* screen; that fans *one virtual display* out).
 - **Native VNC and SPICE console sources** in the client, so a Proxmox/QEMU VM
   console can share a split-screen cell alongside a Pharos stream, fully
   interactive.
@@ -142,8 +151,9 @@ For the full crate map, see [`DOCUMENTATION.md`](DOCUMENTATION.md).
 
 Prebuilt packages come from [GitHub Releases](https://github.com/CursedNumber/pharos-streaming/releases)
 (built by CI from the tagged source; x86_64 Linux and Windows). Two packages:
-**pharos** is the host (the gaming PC that streams out; needs an NVIDIA GPU),
-**trireme** is the client (the machine you play on).
+**pharos** is the host (the gaming PC that streams out; the Linux host needs an
+**NVIDIA GPU** for now, AMD/VAAPI encode is stubbed and unvalidated), **trireme**
+is the client (the machine you play on).
 
 **Ubuntu / Debian** (22.04+/12+): the install script fetches the latest
 release's `.deb` and installs it with apt:
@@ -206,7 +216,9 @@ also needs `xdg-desktop-portal` plus a backend for your desktop (e.g.
 without one, the host just falls back to virtual displays.
 
 **Build.** The `compositor` crate needs an NVIDIA driver + CUDA (it links
-`libnvidia-encode` / `libnvcuvid`). Without them, build everything else:
+`libnvidia-encode` / `libnvcuvid`); NVENC is the only wired Linux encoder today,
+with an AMD/VAAPI path stubbed but not yet validated. Without NVIDIA/CUDA, build
+everything else:
 
 ```sh
 cargo build --workspace --exclude compositor   # no NVIDIA/CUDA
@@ -230,18 +242,15 @@ config keys: [`DOCUMENTATION.md`](DOCUMENTATION.md).
 Pre-1.0 research-quality software; interfaces, config keys, and env vars may change
 between commits. Known honest caveats:
 
-- The desktop client currently sends **absolute** pointer position; cursor-grab
-  **relative** capture (for FPS-style aim from a PC client) is the remaining
-  client-side piece; the host path for it is ready.
-- **Mirroring your real desktop session** (rather than the headless Pharos
-  session) is scaffolded behind the experimental `portal-mirror` feature
-  (portal + PipeWire negotiation work; the encoder wiring does not exist yet).
-  The client's native VNC source can bridge the gap today; see
-  [`DOCUMENTATION.md`](DOCUMENTATION.md#desktop-mirroring-experimental).
+- **AMD (VAAPI) GPU encode on the Linux host is a stub, pending validation.** The
+  Linux compositor encodes through **NVENC (NVIDIA only)** today; the VAAPI backend
+  is scaffolded behind the shared encoder trait but not yet wired or hardware-
+  validated. On an AMD box, run the Windows host (AMF) for now.
 - **Linux Proton *game*-HDR** is blocked upstream in Wine's Vulkan/Wayland WSI and
   is deferred to the Windows-native host path. Host HDR10 encode itself works.
-- **Multi-client mirror** is shipped but **off by default and not two-device
-  validated**.
+- **Multi-client mirror/extend** (fan one virtual display out to several clients)
+  is shipped but **off by default and not two-device validated**. This is a
+  separate feature from real-desktop mirroring, which is validated.
 - USB/IP **isochronous** (USB-audio / webcams) has wire format + framing but iso
   servicing is deferred.
 

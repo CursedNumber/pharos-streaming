@@ -11,7 +11,7 @@ configuration files. For an overview and the feature list, see
   - [pharos-compositor](#pharos-compositor-linux-host) · [pharos-host](#pharos-host-windows-host) · [hostd](#hostd) · [trireme](#trireme-desktop-client) · [trireme-usbexport](#trireme-usbexport) · [pharos-usbimport](#pharos-usbimport)
 - [Environment variables](#environment-variables)
 - [Configuration files](#configuration-files)
-- [Desktop mirroring (experimental)](#desktop-mirroring-experimental)
+- [Desktop mirroring](#desktop-mirroring)
 - [Pairing & trust model](#pairing--trust-model)
 - [Input capture & pacing](#input-capture--pacing)
 
@@ -39,8 +39,13 @@ configuration files. For an overview and the feature list, see
 | `compositor` | `pharos-compositor` | headless Smithay compositor → zero-copy NVENC HEVC/AV1 |
 | `trireme-kms` | `trireme-kms` | direct DRM/KMS scanout client (drive a real TV headless) |
 | `usbip-host` | `pharos-usbimport` | USB/IP import bridge (vhci-hcd virtual hub) |
-| `app-launcher` |  | launch apps/games into the virtual display; Steam redirect |
+| `app-launcher` |  | launch apps/games into the virtual display (or mirror the real desktop); Steam redirect |
 | `hostd` | `hostd` | proto self-test daemon (M0 skeleton) |
+
+> **Encoder support (Linux host):** the compositor encodes exclusively through
+> **NVENC** (NVIDIA) today, HEVC and AV1. An **AMD/VAAPI** encode path is stubbed
+> behind the shared encoder trait but not yet wired or hardware-validated; an AMD
+> Linux host cannot stream yet. AMD hosts use the Windows host (AMF) meanwhile.
 
 **Windows host**
 | crate | binary | role |
@@ -53,7 +58,7 @@ configuration files. For an overview and the feature list, see
 | `media-audio` | Opus capture/encode |
 | `media-decode` | client decode helpers (HW decoder probing) |
 | `media-spice` | native SPICE source via libspice FFI (feature-gated) |
-| `media-capture` / `media-encode` / `input-inject` | trait crates (thin) |
+| `media-capture` / `media-encode` / `input-inject` | trait crates (thin). `media-encode` enumerates NVENC HEVC/AV1 plus a **VAAPI** backend that is a stub today (see the note below the Linux-host table) |
 | `pharos-panel` | cross-platform egui control panel |
 | `pharos-tray` | KDE StatusNotifier tray (state follows host GPU health) |
 | `pharos-assets` | shared embedded art |
@@ -123,9 +128,13 @@ DIAGNOSTIC / TEST
   nvenc-test [out] [frames]        Direct NVENC-from-CUDA SDR test pattern.
   nvenc-test-hdr [out] [frames]    10-bit HEVC Main10 (BT.2020/PQ + HDR10 SEI) pattern.
   input-demo [out] [frames]        Launch `alacritty -e cat`, inject "pharos", capture.
-  mirror                           EXPERIMENTAL session-mirror smoke test; needs a
-                                   build with --features portal-mirror (see the
-                                   Desktop mirroring section below).
+  mirror                           Portal/PipeWire smoke test for desktop mirroring:
+                                   negotiates + streams ~10s and reports what arrives,
+                                   without touching the encoder. The real streaming
+                                   mirror is the built-in `desktop` app on a running
+                                   host, not this command (see Desktop mirroring below).
+                                   Needs a build with --features portal-mirror (on by
+                                   default).
 
 CONTROL / MANAGEMENT
   launch-app <slug>                Ask the RUNNING host to launch a saved app
@@ -455,7 +464,7 @@ An array of `[[app]]` tables shown in the panel and the Trireme grid. A syntheti
 | `cwd` | string | none | working directory |
 | `env` | `[["K","V"]]` | [] | extra child env |
 | `box_art` | string | none | icon/box-art image path |
-| `target` | enum | `virtual-display` | `virtual-display` / `{virtual-output="name"}` (physical targets refuse to launch in v1) |
+| `target` | enum | `virtual-display` | `virtual-display` / `{virtual-output="name"}` / `duplicate-physical` (mirror the real desktop, issue #6; the default for the built-in `desktop` entry). `extend-physical` is reserved. |
 | `gyro_mode` | `enabled`\|`mouse`\|`disabled` | `enabled` | how gamepad gyro is treated while foreground |
 | `perf_overlay` | bool | false | burn MangoHud overlay into the stream |
 | `fps_cap` | `off`\|`auto`\|`{fixed=N}` | `off` | MangoHud fps cap (direct-spawn only) |
@@ -564,45 +573,55 @@ forward_scroll = true
 
 [input.hotkeys]
 toggle_capture = "Ctrl+Alt+End"
+toggle_grab = "Ctrl+Alt+Home"        # cursor-grab relative mouselook (issue #5)
 toggle_fullscreen = "F10"
 disconnect = "Ctrl+Alt+Backspace"
 ```
 
 ---
 
-## Desktop mirroring (experimental)
+## Desktop mirroring
 
 Pharos's primary model is the **headless session**: the compositor owns a virtual
 display, and apps launch into it. Mirroring your **real** desktop session (the
-KDE/GNOME desktop you are physically using) is a separate capture source, in two
-stages of doneness:
+KDE/GNOME desktop you are physically using) is a separate capture source, shipped
+via the full HEVC pipeline (issue #6) and live-validated at ~60 fps on an RTX 4070.
 
-**Today, via VNC:** the Trireme player's native VNC source works against any VNC
-server, so running one on your desktop session gives an interactive (keyboard +
-pointer) mirror right now; add a `protocol = "vnc"` source pointing at it (see
-the sources config above). Expect VNC-tier latency and quality, not the HEVC
-pipeline; on Plasma 6 Wayland note that KDE's built-in remote desktop speaks RDP,
-so you need an actual VNC server (e.g. `krfb`) for this route.
+**The HEVC mirror (Linux, NVIDIA host).** Launch the built-in **`desktop`** app on
+a running host (from `pharos-panel`, or the client's Apps tile) and the primary
+output flips from its virtual display to mirroring your physical screen. Under the
+hood, the `portal-mirror` compositor feature (`compositor::portal_mirror`, **on by
+default on Linux**) opens one combined xdg-desktop-portal **RemoteDesktop +
+ScreenCast** session (a single permission dialog, restore-token aware) and a
+dedicated PipeWire thread that hands frames into the same GLES → CUDA → NVENC path
+the virtual displays use. Key properties:
 
-**Scaffolded, the real path:** the `portal-mirror` compositor feature
-(`compositor::portal_mirror`) implements the portal side of low-latency session
-mirroring: one combined xdg-desktop-portal **RemoteDesktop + ScreenCast** session
-(a single permission dialog, restore-token aware), and a dedicated PipeWire
-thread delivering frames as either DMA-BUF planes or SHM bytes over a bounded
-channel. Not yet wired: the EGLImage import into the existing GLES -> CUDA ->
-NVENC path, DMA-BUF modifier negotiation, and the libei input bridge (the
-session already hands over the EIS fd). Build and smoke-test it with:
+- **The portal handshake runs off the render loop.** It blocks on the "Share"
+  dialog, so it lives on a keeper thread; the pipeline keeps rendering the virtual
+  display (idle screen / app windows) until the mirror is live, and the stream
+  never freezes waiting on the dialog. An unanswered dialog times out and reverts
+  to the virtual display rather than wedging the host.
+- **Input goes back via libei.** The portal hands over an EIS fd, and keyboard +
+  mouse from the client inject into the real session (not just the virtual seat).
+- **Best-fit letterboxing.** A mismatched client aspect ratio (e.g. a 16:9 client
+  viewing a 32:9 desktop) is scaled to fit with letterbox bars, not cropped.
 
-```sh
-# needs libpipewire-0.3 headers + clang at build time
-cargo build -p compositor --features portal-mirror
-pharos-compositor mirror     # negotiate, stream ~10 s, report what arrives
-```
+Requires `xdg-desktop-portal` plus a backend for your desktop
+(`xdg-desktop-portal-kde` / `-gnome` / `-wlr`); without one the host simply stays
+on virtual displays. AMD Linux hosts cannot use this yet (the encoder is
+NVENC-only; see the crate map's encoder note).
 
-The smoke test opens the permission dialog on the local desktop, connects to the
-first granted monitor, and prints the negotiated format plus per-frame kind
-(dmabuf or shm) and size; it proves the portal and PipeWire legs on a given rig
-without touching the encoder.
+**Smoke-testing the capture legs.** `pharos-compositor mirror` negotiates the
+portal, streams ~10 s, and prints the negotiated format plus per-frame kind
+(dmabuf or shm) and size, proving the portal + PipeWire legs on a given rig
+without touching the encoder. It is a diagnostic, not the streaming path.
+
+**Alternative, via VNC (any host OS, no NVIDIA):** the Trireme player's native VNC
+source works against any VNC server, so running one on your desktop session gives
+an interactive mirror without the HEVC pipeline; add a `protocol = "vnc"` source
+pointing at it (see the sources config above). Expect VNC-tier latency and quality.
+On Plasma 6 Wayland, KDE's built-in remote desktop speaks RDP, so you need an actual
+VNC server (e.g. `krfb`) for this route.
 
 ## Pairing & trust model
 
@@ -639,10 +658,20 @@ stay local so you can reach your own desktop. Per-class gates
 | `smooth` | 6 | Fifo | presents oldest-first |
 | `vrr` | 1 | Fifo | for variable-refresh displays |
 
-**What input reaches the host today:** the desktop client sends keyboard, absolute
-pointer (move/buttons/scroll); the Linux and Windows hosts also inject **relative**
-pointer motion (`PointerRel`) for pointer-locked/FPS games. Android/TV clients are
-gamepad-first (buttons, axes, gyro→mouse) and forward hardware-keyboard scancodes,
-but do not send mouse pointer events. All client input is gated **host-side per
-device**: it is silently discarded until that peer is input-enabled (via the
-panel or `multi.toml`).
+**What input reaches the host today:**
+- **Desktop client**: keyboard, absolute pointer (move/buttons/scroll), and
+  **relative** pointer motion for pointer-locked/FPS mouselook. Relative mode is a
+  cursor grab (issue #5): the `toggle_grab` hotkey (default `Ctrl+Alt+Home`) hides
+  and locks the OS cursor and routes raw motion as `PointerRel`; ungrabbed, motion
+  is the absolute `PointerAbs` path. The grab reconciles on focus (alt-tab resumes
+  mouselook) and releases on stream drop, so the cursor is never trapped. The host
+  injects both on Linux and Windows.
+- **Android / TV client**: gamepad-first (buttons, axes, gyro→mouse) and forwards
+  hardware-keyboard scancodes, and now also drives the **host pointer from touch**
+  (Settings → "Touch pointer"): *Absolute* (finger is the cursor, letterbox-correct
+  over the content rect) or *Trackpad* (one-finger drag = relative motion, tap =
+  left click, two fingers = scroll). Touch is active only while the navbar is
+  hidden, so it never fights the navbar gestures.
+
+All client input is gated **host-side per device**: it is silently discarded until
+that peer is input-enabled (via the panel or `multi.toml`).
