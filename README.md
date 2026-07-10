@@ -80,8 +80,9 @@ Proven on real hardware, and used day-to-day for game streaming:
   below (this mirrors the *real* screen; that fans *one virtual display* out).
 - **Steam Big Picture session** (Linux): a built-in tile runs the whole Steam
   client Deck-style — gamescope-hosted, inside the stream — so Steam Input API
-  games get controllers and every Steam dialog is drivable from the couch;
-  *shipped, not yet live-validated* (issue #38).
+  games get controllers and every Steam dialog is drivable from the couch.
+  Live-validated (issue #38): No Man's Sky, a Steam-Input-API-only title, at
+  native phone resolution / steady 60 fps with the pad fully working in-game.
 - **Native VNC and SPICE console sources** in the client, so a Proxmox/QEMU VM
   console can share a split-screen cell alongside a Pharos stream, fully
   interactive.

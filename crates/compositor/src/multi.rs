@@ -67,6 +67,7 @@ use smithay::desktop::space::space_render_elements;
 use smithay::input::keyboard::{FilterResult, Keycode};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::EventLoop;
+use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::reexports::wayland_server::Display;
 use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Size};
 use smithay::utils::{Transform, SERIAL_COUNTER};
@@ -2107,6 +2108,24 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
     // The single-output path creates this too; the multi path had been missing
     // it. Held for the run's lifetime — dropping it withdraws the global.
     let _viewporter = smithay::wayland::viewporter::ViewporterState::new::<State>(&dh);
+
+    // Advertise wp_presentation + zwp_relative_pointer_manager_v1 +
+    // zwp_pointer_constraints_v1 — the remaining three globals gamescope's
+    // Wayland backend hard-requires (issue #38: its init aborts with
+    // "Couldn't create Wayland objects." if ANY of its nine required globals
+    // is missing; pharos already had the other six). Presentation feedback is
+    // answered in the render loop at the frame-callback cadence with
+    // `presentation_clock`; relative motion was already dispatched by the
+    // input path; constraints activate via the handler in lib.rs.
+    let presentation_clock = smithay::utils::Clock::<smithay::utils::Monotonic>::new();
+    let _presentation = smithay::wayland::presentation::PresentationState::new::<State>(
+        &dh,
+        presentation_clock.id() as u32,
+    );
+    let _relative_pointer =
+        smithay::wayland::relative_pointer::RelativePointerManagerState::new::<State>(&dh);
+    let _pointer_constraints =
+        smithay::wayland::pointer_constraints::PointerConstraintsState::new::<State>(&dh);
 
     // Advertise wp_color_manager_v1 so an HDR client (winewayland/DXVK, mpv) can
     // declare a PQ/scRGB surface instead of pre-flattening to 8-bit sRGB. The
@@ -5036,6 +5055,31 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                     Some(p.output.clone())
                 });
             }
+        }
+        // wp_presentation feedback, answered at the same cadence: the headless
+        // encode has no vblank, so the pace tick IS the presentation time and
+        // the live pace interval is the (fixed) refresh we report. gamescope's
+        // Wayland backend times its present-wait off these events (issue #38);
+        // a client that never gets an answer would stall its frame pacing.
+        // Feedbacks are MOVED out of surface state, so a surface spanning two
+        // outputs is answered once (by the first pipeline that takes it).
+        let pres_time = presentation_clock.now();
+        for slot in pipelines.iter() {
+            let Some(p) = slot.as_ref() else { continue };
+            let mut ofb = smithay::desktop::utils::OutputPresentationFeedback::new(&p.output);
+            for w in data.state.space.elements() {
+                w.take_presentation_feedback(
+                    &mut ofb,
+                    |_, _| Some(p.output.clone()),
+                    |_, _| wp_presentation_feedback::Kind::empty(),
+                );
+            }
+            ofb.presented(
+                pres_time,
+                smithay::wayland::presentation::Refresh::fixed(current_pace),
+                u64::from(i) + 1,
+                wp_presentation_feedback::Kind::Vsync,
+            );
         }
         let _ = data.display_handle.flush_clients();
         framing.post += stage.mark();

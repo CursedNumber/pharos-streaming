@@ -106,6 +106,13 @@ use smithay::desktop::space::space_render_elements;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::viewporter::ViewporterState;
 
+// wp_presentation + relative-pointer + pointer-constraints: the three globals
+// gamescope's Wayland backend hard-requires (issue #38 — its init aborts with
+// "Couldn't create Wayland objects." when any is missing).
+use smithay::input::pointer::PointerHandle;
+use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraintsHandler};
+use smithay::{delegate_pointer_constraints, delegate_presentation, delegate_relative_pointer};
+
 /// Event-loop shared data: the compositor state plus a display handle.
 pub struct CalloopData {
     pub state: State,
@@ -422,6 +429,63 @@ impl SeatHandler for State {
     }
 }
 delegate_seat!(State);
+
+// --- Pointer constraints / relative pointer / presentation ---
+//
+// Advertised for nested-compositor clients (gamescope hosting the Steam
+// session, issue #38) and pointer-locked games. Relative motion was already
+// dispatched by the input path (`dispatch_input_event` / `dispatch_gyro_mouse`);
+// the `zwp_relative_pointer_manager_v1` global is what lets clients bind to
+// receive it. `wp_presentation` feedback is answered by the multi render loop
+// at the frame-callback cadence (the encode tick is the "vblank" here).
+
+impl PointerConstraintsHandler for State {
+    fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
+        // Activate immediately when the surface already holds pointer focus —
+        // the streamed seat has no local cursor UX to arbitrate, so a focused
+        // client asking to lock/confine gets it. A constraint created BEFORE
+        // focus lands is picked up by `activate_pointer_constraint_on` on the
+        // next injected motion.
+        if pointer.current_focus().as_ref() == Some(surface) {
+            with_pointer_constraint(surface, pointer, |constraint| {
+                if let Some(c) = constraint {
+                    c.activate();
+                }
+            });
+        }
+    }
+
+    fn cursor_position_hint(
+        &mut self,
+        _surface: &WlSurface,
+        _pointer: &PointerHandle<Self>,
+        _location: Point<f64, Logical>,
+    ) {
+        // Headless output: there is no host cursor to warp; the hint is
+        // advisory and safely ignored.
+    }
+}
+delegate_pointer_constraints!(State);
+delegate_relative_pointer!(State);
+delegate_presentation!(State);
+
+/// Activate any not-yet-active pointer constraint on the focused `surface`.
+/// Called from the input dispatch after each injected motion: a game usually
+/// requests its lock BEFORE the seat ever focuses it (at startup), so the
+/// `new_constraint` fast-path misses and this sweep catches it on the first
+/// real pointer event. Cheap — one surface-data lookup per event.
+fn activate_pointer_constraint_on(state: &mut State, surface: &WlSurface) {
+    let Some(pointer) = state.seat.get_pointer() else {
+        return;
+    };
+    with_pointer_constraint(surface, &pointer, |constraint| {
+        if let Some(c) = constraint {
+            if !c.is_active() {
+                c.activate();
+            }
+        }
+    });
+}
 
 impl SelectionHandler for State {
     /// A compositor-owned clipboard carries its bytes here so [`Self::send_selection`]
@@ -1116,6 +1180,9 @@ fn dispatch_input(
                 },
             );
             pointer.frame(&mut data.state);
+            if let Some(s) = focus_surface {
+                activate_pointer_constraint_on(&mut data.state, s);
+            }
         }
         core_proto::InputEvent::PointerRel { dx, dy } => {
             let Some(pointer) = data.state.seat.get_pointer() else {
@@ -1150,6 +1217,9 @@ fn dispatch_input(
                 },
             );
             pointer.frame(&mut data.state);
+            if let Some(s) = focus_surface {
+                activate_pointer_constraint_on(&mut data.state, s);
+            }
         }
         core_proto::InputEvent::PointerButton { button, pressed } => {
             let Some(pointer) = data.state.seat.get_pointer() else {
@@ -1251,4 +1321,7 @@ fn dispatch_gyro_mouse(
         },
     );
     pointer.frame(&mut data.state);
+    if let Some(s) = focus_surface {
+        activate_pointer_constraint_on(&mut data.state, s);
+    }
 }
