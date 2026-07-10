@@ -20,8 +20,8 @@ source=(
   "$url/releases/download/v$pkgver/pharos-$pkgver-linux-x86_64.tar.gz"
   "$url/releases/download/v$pkgver/trireme-$pkgver-linux-x86_64.tar.gz"
 )
-sha256sums=('SKIP'
-            'SKIP')
+sha256sums=('80faa5d2c0cdd93838d5e7b4092b5c431e8e006947bbb9e24d32c2c71cc32119'
+            '06e21c599f0fa41b8ffcdeaa2f36d3c47007f628ab6c49fd75b87850f23957c0')
 
 package_pharos-bin() {
   pkgdesc="Pharos game-streaming host (headless Wayland compositor + NVENC, prebuilt)"

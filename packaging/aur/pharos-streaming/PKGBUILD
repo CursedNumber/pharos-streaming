@@ -24,7 +24,7 @@ license=(GPL-3.0-or-later)
 # build time.
 makedepends=(rust nvidia-utils mesa libdrm libxkbcommon pixman expat opus libusb systemd-libs clang pipewire)
 source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('1db7ef62aa6126e075f088040e7e08ab907dacc6026e3729d3bc033b8012dd7a')
 
 prepare() {
   cd "$pkgbase-$pkgver"

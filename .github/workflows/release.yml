@@ -164,7 +164,7 @@ jobs:
           wix build packaging/windows/pharos.wxs \
             -ext WixToolset.Firewall.wixext \
             -d Version="$VER" -d BinDir=target/release -d IconDir=packaging/icons \
-            -arch x64 \
+            -arch x64 -pdbtype none \
             -o "dist/pharos-$VER-x86_64.msi"
       - uses: actions/upload-artifact@v4
         with:
