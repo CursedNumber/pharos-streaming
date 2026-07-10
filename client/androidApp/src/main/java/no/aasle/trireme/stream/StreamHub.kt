@@ -1221,9 +1221,12 @@ object StreamHub {
     fun isGyroEnabled(): Boolean = gyroEnabled
 
     /**
-     * Persist the new gyro opt-in and update the in-memory flag. Takes effect
-     * on the next dial (re-dialing now would tear down the active stream — we
-     * prefer the user reconnect deliberately). Cheap; safe on any thread.
+     * Persist the new gyro opt-in and update the in-memory flag, AND apply it LIVE
+     * to the active session's controllers so it takes effect immediately — turning
+     * it off unregisters the IMU listeners right now (a true off, so the continuous
+     * gyro→mouse stream stops without a reconnect), turning it on starts them for
+     * any already-attached pad. The next dial still re-reads the flag for the
+     * handshake `wants_gyro`. Cheap; safe on any thread.
      */
     fun setGyroEnabled(on: Boolean) {
         gyroEnabled = on
@@ -1231,7 +1234,8 @@ object StreamHub {
             .edit()
             .putBoolean("gyro_enabled", on)
             .apply()
-        Log.i(TAG, "gyro opt-in set to $on (applies on next dial)")
+        controllers?.setGyroForwarding(on)
+        Log.i(TAG, "gyro opt-in set to $on (applied live to attached pads)")
     }
 
     /** Read the persisted gyro opt-in (default false — never accidentally on). */

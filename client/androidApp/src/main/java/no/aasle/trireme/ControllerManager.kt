@@ -336,6 +336,30 @@ class ControllerManager(
         Log.i(TAG, "gyro streaming for slot$slot (${d.name})")
     }
 
+    /**
+     * Start or stop controller-gyro forwarding LIVE for every attached pad, without
+     * waiting for a reconnect. The attach-time gate ([attach]) only decides gyro for
+     * pads that connect *after* the Settings flip; this re-applies the choice to pads
+     * already connected. Disabling unregisters every IMU listener, so the client truly
+     * stops reading the sensor (a real off, not just "don't send") — the clean A/B
+     * lever for "is the continuous gyro→mouse stream what's stealing the game's active
+     * device from the pad?". No-op in raw mode (gyro is never forwarded there).
+     */
+    fun setGyroForwarding(enabled: Boolean) {
+        if (!managed) return
+        if (enabled) {
+            for ((deviceId, slot) in slotOf.entries.toList()) {
+                if (gyro.containsKey(deviceId)) continue
+                InputDevice.getDevice(deviceId)?.let { registerGyro(it, slot) }
+            }
+        } else {
+            for ((_, reg) in gyro) reg.sm.unregisterListener(reg.listener)
+            val n = gyro.size
+            gyro.clear()
+            Log.i(TAG, "gyro forwarding OFF live — unregistered $n IMU listener(s)")
+        }
+    }
+
     private fun allocSlot(): Int? {
         for (i in used.indices) if (!used[i]) {
             used[i] = true
