@@ -6,8 +6,6 @@ package no.aasle.trireme.stream
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -34,11 +32,6 @@ import uniffi.core_ffi.StreamMode
 import uniffi.core_ffi.startVideoStream
 
 private const val TAG = "TriremeHub"
-
-// Bitrate cap auto-applied when the slider is untouched and the active network is
-// wired Ethernet (see [StreamHub.wiredAutoMaxKbps]). Matches a slider stop so the
-// Settings caption can name it.
-private const val WIRED_AUTO_MAX_KBPS = 150_000
 
 // Last-deliberately-used input source, for pad-vs-pointer arbitration (mirrors the
 // desktop client's gamepad.rs/play.rs SRC_KBDMOUSE/SRC_GAMEPAD). The host turns
@@ -896,15 +889,9 @@ object StreamHub {
         if (resTargetH != 0 || resFloorH != 0) {
             runCatching { gp.setResolutionPref(resTargetH.toUInt(), resFloorH.toUInt()) }
         }
-        // Re-assert the bitrate range too (Phase 3). An untouched slider on wired
-        // Ethernet auto-caps at WIRED_AUTO_MAX_KBPS (instead of the host's 80 Mbps
-        // Auto default); otherwise no-op at the default (0, 0).
-        val (bMin, bMax) = effectiveBitratePref()
-        if (bMin != 0 || bMax != 0) {
-            if (bitrateMinKbps == 0 && bitrateMaxKbps == 0) {
-                Log.i(TAG, "bitrate pref: wired auto-cap ${bMax / 1000} Mbps (slider untouched)")
-            }
-            runCatching { gp.setBitratePref(bMin.toUInt(), bMax.toUInt()) }
+        // Re-assert the bitrate range too (Phase 3). No-op at the default (0, 0).
+        if (bitrateMinKbps != 0 || bitrateMaxKbps != 0) {
+            runCatching { gp.setBitratePref(bitrateMinKbps.toUInt(), bitrateMaxKbps.toUInt()) }
         }
         // And the framerate range (Phase 3). No-op at the default (0, 0).
         if (fpsMin != 0 || fpsMax != 0) {
@@ -1373,42 +1360,13 @@ object StreamHub {
     }
 
     /** Current bitrate range (minKbps, maxKbps); `min=0` = host floor, `max=0` =
-     *  Auto (host-owned). Exposed so Settings renders the slider's initial state. */
+     *  Auto (host-owned). Exposed so Settings renders the slider's initial state.
+     *  NOTE: no transport-based auto-cap here on purpose — Android can't report
+     *  the real Ethernet link speed (AOSP hardcodes 100 Mbps), and a guessed cap
+     *  overshoots the common 100 Mbit TV port at every connect. High-bandwidth
+     *  users pick an explicit stop; a MEASURED Auto is issue #40 (connect-time
+     *  bandwidth probe). */
     fun bitratePref(): Pair<Int, Int> = Pair(bitrateMinKbps, bitrateMaxKbps)
-
-    /**
-     * The auto-cap for an UNTOUCHED bitrate slider on a wired link: 150 Mbps when
-     * the active network is Ethernet (TV port or USB-C adapter), else 0 (no cap —
-     * the host's Auto default applies). Transport-informed, not measured: Android
-     * can't report the negotiated PHY rate to a normal app (AOSP hardcodes the
-     * Ethernet link bandwidth to 100 Mbps, and /sys/class/net is SELinux-walled),
-     * so this may overshoot a Fast-Ethernet port — the host's net-bitrate
-     * controller backs off within ~2 QoS ticks and adapts from there.
-     */
-    fun wiredAutoMaxKbps(): Int = runCatching {
-        val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-        val caps = cm?.getNetworkCapabilities(cm.activeNetwork)
-        if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true) {
-            WIRED_AUTO_MAX_KBPS
-        } else {
-            0
-        }
-    }.getOrDefault(0)
-
-    /**
-     * The bitrate range actually pushed to the host: the user's stored range when
-     * they've set one; otherwise `(0, wiredAutoMaxKbps())` — the wired auto-cap on
-     * Ethernet, or the inert `(0, 0)` (host-owned Auto) on everything else. The
-     * slider can't produce a stored `(0, 0)` (its min stop is 5 Mbps), so `(0, 0)`
-     * reliably means "never touched". Evaluated per call, so it tracks the
-     * transport at each (re)connect.
-     */
-    fun effectiveBitratePref(): Pair<Int, Int> =
-        if (bitrateMinKbps != 0 || bitrateMaxKbps != 0) {
-            Pair(bitrateMinKbps, bitrateMaxKbps)
-        } else {
-            Pair(0, wiredAutoMaxKbps())
-        }
 
     /**
      * Set the bitrate range (Phase 3) — the primary auto-recover lever. `minKbps`
