@@ -2,6 +2,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Read the active network's transport type (wired-Ethernet detection for
+         the bitrate auto-cap). Normal permission; no runtime prompt. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- Hold a low-latency WiFi lock during USB export so power-save doesn't
          park the radio and spike the input round-trip. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />

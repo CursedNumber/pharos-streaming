@@ -226,12 +226,15 @@ fun SettingsPane(onOpenControllers: () -> Unit = {}) {
 
         // --- Bitrate range (Phase 3): Min..Max on ONE dual-thumb slider --------
         // The PRIMARY auto-recover lever. The client sends [min, max] kbps live; the
-        // host adapts bitrate within it (max=0 = Uncapped). Same dual-thumb widget,
-        // same three input modalities. StreamHub owns the persisted source of truth.
+        // host adapts bitrate within it (max=0 = Auto: host-owned, except on wired
+        // Ethernet where StreamHub auto-caps it — the Auto stop's label says so).
+        // Same dual-thumb widget, same three input modalities. StreamHub owns the
+        // persisted source of truth.
         val (bMin0, bMax0) = remember { StreamHub.bitratePref() }
+        val wiredAutoKbps = remember { StreamHub.wiredAutoMaxKbps() }
         var bMaxIdx by remember { mutableStateOf(maxToStop(bMax0)) }
         var bMinIdx by remember { mutableStateOf(minToStop(bMin0)) }
-        BitrateRangeRow(minIdx = bMinIdx, maxIdx = bMaxIdx) { mn, mx ->
+        BitrateRangeRow(minIdx = bMinIdx, maxIdx = bMaxIdx, wiredAutoKbps = wiredAutoKbps) { mn, mx ->
             bMinIdx = mn
             bMaxIdx = mx
             StreamHub.setBitratePref(stopToMin(mn), stopToMax(mx))
@@ -403,23 +406,31 @@ private fun floorToStop(floorH: Int): Int =
     (if (floorH == 0) 0 else RES_STOPS.indexOf(floorH).let { if (it < 0) 0 else it })
         .coerceIn(0, RES_STOPS.size - 2)
 
-// Bitrate stops in kbps (ascending). The last (0) is "Uncapped", reachable only by
-// the MAX thumb; the MIN thumb tops out one stop below it (50 Mbps). The MIN thumb's
-// lowest stop (5 Mbps) maps to the on-wire "min" the host won't auto-drop below.
-private val BITRATE_STOPS_KBPS = listOf(5_000, 10_000, 20_000, 35_000, 50_000, 0)
+// Bitrate stops in kbps (ascending). The last (0) is "Auto" (host-owned; on wired
+// Ethernet the client auto-caps it, see StreamHub.wiredAutoMaxKbps), reachable only
+// by the MAX thumb; the MIN thumb tops out one stop below it (300 Mbps). The MIN
+// thumb's lowest stop (5 Mbps) maps to the on-wire "min" the host won't auto-drop
+// below. The 80+ stops assume a wired/strong-WiFi path; the host clamps a cap it
+// can't honor (client_max_bitrate_kbps) and its net controller adapts below it.
+private val BITRATE_STOPS_KBPS =
+    listOf(5_000, 10_000, 20_000, 35_000, 50_000, 80_000, 150_000, 300_000, 0)
 
-private fun bitrateStopLabel(idx: Int): String =
-    if (BITRATE_STOPS_KBPS[idx] == 0) "Uncapped" else "${BITRATE_STOPS_KBPS[idx] / 1000} Mbps"
+/** Stop label; the Auto stop names the wired auto-cap when one is active. */
+private fun bitrateStopLabel(idx: Int, wiredAutoKbps: Int): String = when {
+    BITRATE_STOPS_KBPS[idx] != 0 -> "${BITRATE_STOPS_KBPS[idx] / 1000} Mbps"
+    wiredAutoKbps > 0 -> "Auto (wired: ${wiredAutoKbps / 1000} Mbps)"
+    else -> "Auto"
+}
 
-/** MAX thumb stop index → `max_kbps` (0 = Uncapped). */
+/** MAX thumb stop index → `max_kbps` (0 = Auto). */
 private fun stopToMax(idx: Int): Int =
     BITRATE_STOPS_KBPS[idx.coerceIn(0, BITRATE_STOPS_KBPS.lastIndex)]
 
-/** MIN thumb stop index → `min_kbps` (never the Uncapped stop). */
+/** MIN thumb stop index → `min_kbps` (never the Auto stop). */
 private fun stopToMin(idx: Int): Int =
     BITRATE_STOPS_KBPS[idx.coerceIn(0, BITRATE_STOPS_KBPS.size - 2)]
 
-/** `max_kbps` (0 = Uncapped) → MAX thumb stop index. */
+/** `max_kbps` (0 = Auto) → MAX thumb stop index. */
 private fun maxToStop(maxKbps: Int): Int =
     if (maxKbps == 0) BITRATE_STOPS_KBPS.lastIndex
     else BITRATE_STOPS_KBPS.indexOf(maxKbps).let {
@@ -449,10 +460,11 @@ private fun fpsToIdx(stops: List<Int>, fps: Int, default: Int): Int =
 private fun BitrateRangeRow(
     minIdx: Int,
     maxIdx: Int,
+    wiredAutoKbps: Int,
     onChange: (minIdx: Int, maxIdx: Int) -> Unit,
 ) = RangeSliderRow(
     title = "Bitrate",
-    stopLabel = ::bitrateStopLabel,
+    stopLabel = { bitrateStopLabel(it, wiredAutoKbps) },
     n = BITRATE_STOPS_KBPS.size,
     minIdx = minIdx,
     maxIdx = maxIdx,
