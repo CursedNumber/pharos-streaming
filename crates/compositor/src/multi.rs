@@ -5057,10 +5057,17 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
             }
         }
         // wp_presentation feedback, answered at the same cadence: the headless
-        // encode has no vblank, so the pace tick IS the presentation time and
-        // the live pace interval is the (fixed) refresh we report. gamescope's
-        // Wayland backend times its present-wait off these events (issue #38);
-        // a client that never gets an answer would stall its frame pacing.
+        // encode has no vblank, so the pace tick IS the presentation time.
+        // gamescope's Wayland backend times its present-wait off these events
+        // (issue #38); a client that never gets an answer would stall its pacing.
+        // The refresh we report is the output's NOMINAL mode refresh — NOT the
+        // live auto-pace interval. gamescope treats every advertised-refresh
+        // change as a mode switch and re-creates its full set of output images;
+        // under VRAM pressure that reallocation fails and its
+        // vulkan_remake_output_images() assert SIGABRTs the whole nested session
+        // (gamescope rendervulkan.cpp:3376, seen twice with NMS@4K under
+        // fps_auto pacer wobble, 2026-07-10/11). Timestamps stay real; only the
+        // advertised refresh is pinned to the mode.
         // Feedbacks are MOVED out of surface state, so a surface spanning two
         // outputs is answered once (by the first pipeline that takes it).
         let pres_time = presentation_clock.now();
@@ -5074,9 +5081,17 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                     |_, _| wp_presentation_feedback::Kind::empty(),
                 );
             }
+            // Mode refresh is in mHz; interval = 1000/mHz seconds. Falls back to
+            // the pace interval only if the output somehow has no current mode.
+            let nominal = p
+                .output
+                .current_mode()
+                .filter(|m| m.refresh > 0)
+                .map(|m| Duration::from_secs_f64(1000.0 / m.refresh as f64))
+                .unwrap_or(current_pace);
             ofb.presented(
                 pres_time,
-                smithay::wayland::presentation::Refresh::fixed(current_pace),
+                smithay::wayland::presentation::Refresh::fixed(nominal),
                 u64::from(i) + 1,
                 wp_presentation_feedback::Kind::Vsync,
             );
