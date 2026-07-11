@@ -221,6 +221,39 @@ pub enum LaunchKind {
     SteamSession,
 }
 
+/// Which display server hosts this app's windows on the virtual output.
+///
+/// The built-in Smithay compositor speaks Wayland only — an X11-only app
+/// launched onto it simply never maps a window, and a Steam-Input-API game
+/// needs the whole Steam client focused in ITS display to get controller
+/// configs (issue #38). This knob lets an entry opt into a nested host that
+/// fits the app, per app, from the editor:
+///
+/// - `builtin` (default): spawn straight onto the compositor's Wayland socket —
+///   native Wayland clients, the existing behaviour.
+/// - `xwayland`: spawn a rootful fullscreen Xwayland onto the virtual display
+///   and point the app at it (`DISPLAY=:N`, Wayland scrubbed) — X11-only apps.
+///   No window manager runs inside, so it fits fullscreen games/emulators, not
+///   multi-window desktop apps.
+/// - `gamescope`: wrap the app in a nested gamescope sized to the stream. For a
+///   Steam launch this boots the whole client Deck-style *directly into the
+///   game* (`gamescope -e … -- steam -gamepadui steam://rungameid/<appid>`) —
+///   Steam Input works and no Big Picture navigation is needed (issue #38's
+///   session, per game).
+///
+/// Linux-only semantics; non-`builtin` values fail the launch on other hosts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AppCompositor {
+    /// The built-in compositor's Wayland socket (default).
+    #[default]
+    Builtin,
+    /// A per-app rootful Xwayland on the virtual display (X11-only apps).
+    Xwayland,
+    /// A nested gamescope session; Steam launches boot straight into the game.
+    Gamescope,
+}
+
 /// One launchable application.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppEntry {
@@ -268,6 +301,12 @@ pub struct AppEntry {
     /// `#[serde(default)]` so an old `apps.toml` without this field still loads.
     #[serde(default)]
     pub gyro_mode: GyroMode,
+    /// Which display server hosts this app on the virtual output — the built-in
+    /// Wayland compositor (default), a per-app rootful Xwayland, or a nested
+    /// gamescope session (see [`AppCompositor`]). `#[serde(default)]` so an old
+    /// `apps.toml` without this field still loads.
+    #[serde(default)]
+    pub compositor: AppCompositor,
     /// Show MangoHud's perf overlay (fps/frametime/GPU/CPU) burned into this app's
     /// stream. Off by default — the [`fps_cap`](AppEntry::fps_cap) limiter normally
     /// runs MangoHud *invisibly* (`no_display=1`); turning this on flips it to
@@ -309,6 +348,7 @@ impl AppEntry {
             box_art: None,
             target: LaunchTarget::default(),
             gyro_mode: GyroMode::default(),
+            compositor: AppCompositor::default(),
             perf_overlay: false,
             fps_cap: FpsCap::default(),
         }
@@ -336,6 +376,7 @@ impl AppEntry {
             // display); the panel's target picker lets either be overridden.
             target: LaunchTarget::DuplicatePhysical,
             gyro_mode: GyroMode::default(),
+            compositor: AppCompositor::default(),
             perf_overlay: false,
             fps_cap: FpsCap::default(),
         }
@@ -359,6 +400,7 @@ impl AppEntry {
             box_art: None,
             target: LaunchTarget::VirtualDisplay,
             gyro_mode: GyroMode::default(),
+            compositor: AppCompositor::default(),
             perf_overlay: false,
             fps_cap: FpsCap::default(),
         }

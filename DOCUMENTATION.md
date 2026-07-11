@@ -470,6 +470,7 @@ installed. Only `slug`/`name`/`command` are required.
 | `box_art` | string | none | icon/box-art image path |
 | `target` | enum | `virtual-display` | `virtual-display` / `{virtual-output="name"}` / `duplicate-physical` (mirror the real desktop, issue #6; the default for the built-in `desktop` entry). `extend-physical` is reserved. |
 | `gyro_mode` | `enabled`\|`mouse`\|`disabled` | `enabled` | how gamepad gyro is treated while foreground |
+| `compositor` | `builtin`\|`xwayland`\|`gamescope` | `builtin` | display server hosting the app (Linux). `xwayland` = per-app rootful X server (X11-only apps, no WM — fullscreen games/emulators). `gamescope` = nested gamescope session; a Steam launch boots the client inside it **straight into the game** (Steam Input works, no Big Picture navigation); a live session is reused via URI handoff |
 | `perf_overlay` | bool | false | burn MangoHud overlay into the stream |
 | `fps_cap` | `off`\|`auto`\|`{fixed=N}` | `off` | MangoHud fps cap (direct-spawn only) |
 
@@ -480,6 +481,7 @@ name = "Elden Ring"
 kind = "game"
 command = "setsid -f steam steam://rungameid/1245620"
 gyro_mode = "enabled"
+compositor = "gamescope" # boots Steam inside a per-game gamescope, straight into the game
 
 [app.launch]
 kind = "steam-game"

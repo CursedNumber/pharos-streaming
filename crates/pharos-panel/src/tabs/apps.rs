@@ -18,7 +18,7 @@ use std::path::Path;
 
 use egui_phosphor::regular as ph;
 
-use app_launcher::config::{AppEntry, AppKind, FpsCap, GyroMode, LaunchTarget};
+use app_launcher::config::{AppCompositor, AppEntry, AppKind, FpsCap, GyroMode, LaunchTarget};
 
 use crate::a11y::Describe;
 use crate::i18n::tr;
@@ -493,6 +493,28 @@ fn form_fields(ui: &mut egui::Ui, draft: &mut AppEntry) {
                 .describe(tr("apps.field.gyro_desc"));
             ui.end_row();
 
+            // Which display server hosts the app on the virtual output —
+            // built-in Wayland, a per-app rootful Xwayland, or a nested
+            // gamescope session (Steam games boot straight into the game).
+            // Linux-only semantics, so the row is hidden on Windows.
+            if !cfg!(windows) {
+                ui.label(tr("apps.field.compositor"));
+                let _ = egui::ComboBox::from_id_salt("apps_compositor")
+                    .selected_text(compositor_label(draft.compositor))
+                    .show_ui(ui, |ui| {
+                        for c in [
+                            AppCompositor::Builtin,
+                            AppCompositor::Xwayland,
+                            AppCompositor::Gamescope,
+                        ] {
+                            ui.selectable_value(&mut draft.compositor, c, compositor_label(c));
+                        }
+                    })
+                    .response
+                    .describe(tr("apps.field.compositor_desc"));
+                ui.end_row();
+            }
+
             // Perf-overlay backend on this box: MangoHud (Linux) or RTSS
             // (Windows). Gate the control on presence — we don't offer a dead
             // knob — and pick the wording per OS. (Checked on the panel's box;
@@ -863,6 +885,16 @@ fn gyro_label(m: GyroMode) -> String {
         GyroMode::Enabled => tr("apps.gyro.enabled"),
         GyroMode::Mouse => tr("apps.gyro.mouse"),
         GyroMode::Disabled => tr("apps.gyro.disabled"),
+    }
+}
+
+/// User-facing label for an [`AppCompositor`] dropdown row — the host name plus
+/// what class of app it is for, so the pick is self-explanatory.
+fn compositor_label(c: AppCompositor) -> String {
+    match c {
+        AppCompositor::Builtin => tr("apps.compositor.builtin"),
+        AppCompositor::Xwayland => tr("apps.compositor.xwayland"),
+        AppCompositor::Gamescope => tr("apps.compositor.gamescope"),
     }
 }
 

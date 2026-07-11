@@ -16,7 +16,7 @@ use std::process::{Child, Command};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::config::{AppEntry, LaunchTarget};
+use crate::config::{AppCompositor, AppEntry, LaunchTarget};
 use crate::env::detect_steam;
 
 /// Steam's URI handler can race with pipe creation: a `steam://` handoff fired
@@ -136,7 +136,7 @@ pub fn launch(entry: &AppEntry, ctx: &LaunchContext) -> anyhow::Result<Option<Ch
     // the live output mode in `ctx`, so it gets its own build path before any
     // line resolution. Its own guards mirror the generic ones below.
     if matches!(kind, crate::config::LaunchKind::SteamSession) {
-        return launch_steam_session(entry, ctx);
+        return launch_steam_session(entry, ctx, None);
     }
 
     let install = detect_steam();
@@ -201,6 +201,18 @@ pub fn launch(entry: &AppEntry, ctx: &LaunchContext) -> anyhow::Result<Option<Ch
             entry.slug
         );
         return Ok(None);
+    }
+
+    // Per-app compositor routing (see [`AppCompositor`]): a non-builtin host
+    // wraps or re-targets the spawn. Gamescope owns the whole build path — for
+    // a Steam launch it boots the client INSIDE the session straight into the
+    // game (the issue-#38 session, per game); Xwayland brings up a rootful X
+    // server on the virtual display first. Both are Linux-only and bail
+    // actionably elsewhere.
+    match entry.compositor {
+        AppCompositor::Builtin => {}
+        AppCompositor::Gamescope => return launch_in_gamescope(entry, ctx, line, kind_shell),
+        AppCompositor::Xwayland => return launch_in_xwayland(entry, ctx, line, kind_shell),
     }
 
     // Perf overlay on Windows = RTSS. It hooks new processes system-wide once
@@ -377,7 +389,10 @@ pub fn steam_session_active() -> bool {
 /// gamescope argv for a Steam session: `-e` (Steam integration), `-f`
 /// (fullscreen), output sized to the live virtual mode, nested refresh matched
 /// to the stream pace, then any `extra` flags (`PHAROS_GAMESCOPE_ARGS`), `--`,
-/// and the install-correct Steam client argv in Big Picture mode.
+/// and the install-correct Steam client argv in Big Picture mode. An
+/// `autolaunch` URI (`steam://rungameid/<appid>`) appended after `-gamepadui`
+/// makes the client boot straight into that game — the SteamOS boot-to-game
+/// shape — so a per-game session never shows Big Picture navigation.
 #[cfg(target_os = "linux")]
 fn steam_session_args(
     w: u32,
@@ -385,6 +400,7 @@ fn steam_session_args(
     fps: Option<u32>,
     extra: &[String],
     client: &[String],
+    autolaunch: Option<&str>,
 ) -> Vec<String> {
     let mut a: Vec<String> = vec!["-e".into(), "-f".into()];
     a.push("-W".into());
@@ -399,24 +415,36 @@ fn steam_session_args(
     a.push("--".into());
     a.extend(client.iter().cloned());
     a.push("-gamepadui".into());
+    if let Some(uri) = autolaunch {
+        a.push(uri.into());
+    }
     a
 }
 
-/// Spawn a [`LaunchKind::SteamSession`](crate::config::LaunchKind::SteamSession):
-/// gamescope hosting the full Steam client on the virtual display. Mirrors
-/// [`launch`]'s generic guards (physical-target refusal, slug idempotency) and
-/// adds the session-specific ones: gamescope + Steam present, and no desktop
-/// Steam already running — `-gamepadui` handed to a running Steam just flips
-/// *its* desktop window to Big Picture, so nothing would appear in the stream.
+/// Spawn a gamescope-hosted Steam session: gamescope hosting the full Steam
+/// client on the virtual display. Two callers: a
+/// [`LaunchKind::SteamSession`](crate::config::LaunchKind::SteamSession) entry
+/// (`autolaunch = None`, plain Big Picture — issue #38) and a Steam-launching
+/// entry whose [`AppCompositor`] is `Gamescope` (`autolaunch =
+/// Some("steam://rungameid/<appid>")`, the client boots straight into that
+/// game). Mirrors [`launch`]'s generic guards (physical-target refusal, slug
+/// idempotency) and adds the session-specific ones: gamescope + Steam present,
+/// and no desktop Steam already running — `-gamepadui` handed to a running
+/// Steam just flips *its* desktop window to Big Picture, so nothing would
+/// appear in the stream.
 ///
 /// The per-app `fps_cap`/`perf_overlay` knobs deliberately do NOT apply here:
 /// `MANGOHUD=1` on gamescope would hook gamescope's own Vulkan compositor, and
 /// every game in the session inherits the env — cap per-title in Steam launch
 /// options instead. gamescope's `-r` already paces the session to the stream.
-fn launch_steam_session(entry: &AppEntry, ctx: &LaunchContext) -> anyhow::Result<Option<Child>> {
+fn launch_steam_session(
+    entry: &AppEntry,
+    ctx: &LaunchContext,
+    autolaunch: Option<&str>,
+) -> anyhow::Result<Option<Child>> {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = ctx;
+        let _ = (ctx, autolaunch);
         anyhow::bail!(
             "app `{}` is a steam-session (gamescope-hosted Steam), which is Linux-only",
             entry.slug
@@ -459,7 +487,14 @@ fn launch_steam_session(entry: &AppEntry, ctx: &LaunchContext) -> anyhow::Result
         let extra = std::env::var("PHAROS_GAMESCOPE_ARGS")
             .map(|s| tokenize(&s))
             .unwrap_or_default();
-        let args = steam_session_args(w, h, ctx.output_fps, &extra, &install.session_client_argv());
+        let args = steam_session_args(
+            w,
+            h,
+            ctx.output_fps,
+            &extra,
+            &install.session_client_argv(),
+            autolaunch,
+        );
         let mut cmd = Command::new("gamescope");
         cmd.args(&args);
         if let Some(sock) = &ctx.wayland_socket {
@@ -503,6 +538,281 @@ fn launch_steam_session(entry: &AppEntry, ctx: &LaunchContext) -> anyhow::Result
             .unwrap_or_else(|e| e.into_inner()) = Some((pid, proc_starttime(pid)));
         Ok(Some(child))
     }
+}
+
+/// Launch an entry whose [`AppCompositor`] is `Gamescope`: wrap the resolved
+/// command in a nested gamescope sized to the live virtual mode.
+///
+/// A Steam launch line gets the full session treatment instead of a plain wrap
+/// — the Steam client itself must live inside the gamescope for Steam Input to
+/// route controllers (issue #38), so the whole client boots there Deck-style
+/// with the game auto-launched (no Big Picture navigation). If a gamescope
+/// Steam session is ALREADY live (the built-in tile, or another per-game
+/// session), Steam is single-instance, so the plain URI handoff opens the game
+/// inside it — reuse, not a second session.
+fn launch_in_gamescope(
+    entry: &AppEntry,
+    ctx: &LaunchContext,
+    line: &str,
+    kind_shell: bool,
+) -> anyhow::Result<Option<Child>> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (ctx, line, kind_shell);
+        anyhow::bail!(
+            "app `{}` selects the gamescope compositor, which is Linux-only",
+            entry.slug
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if entry.target.is_physical_target() {
+            anyhow::bail!(
+                "app `{}` selects gamescope but targets {:?} (the host's PHYSICAL desktop); \
+                 gamescope wraps apps on the virtual display — use a virtual-display target",
+                entry.slug,
+                entry.target
+            );
+        }
+        if !gamescope_available() {
+            anyhow::bail!(
+                "app `{}` selects gamescope, but gamescope isn't on PATH — install your \
+                 distro's `gamescope` package",
+                entry.slug
+            );
+        }
+
+        if launches_via_steam(line) {
+            let appid = parse_steam_appid(line);
+            if let Some(id) = appid {
+                if steam_game_running(id) {
+                    tracing::info!(
+                        "app `{}`: Steam game {id} already running; focus/no-op, not relaunching",
+                        entry.slug
+                    );
+                    return Ok(None);
+                }
+            }
+            if steam_session_active() {
+                // Steam already owns a gamescope session in the stream; the URI
+                // handoff opens the game inside it.
+                tracing::info!(
+                    "app `{}`: live gamescope Steam session found — handing the launch off to it",
+                    entry.slug
+                );
+                spawn_steam_handoff_worker(entry, ctx, line, kind_shell)?;
+                return Ok(None);
+            }
+            let uri = appid.map(|id| format!("steam://rungameid/{id}"));
+            return launch_steam_session(entry, ctx, uri.as_deref());
+        }
+
+        // Non-Steam command in a plain nested gamescope (no `-e` — that flag is
+        // Steam-session integration). MangoHud cap/overlay are deliberately NOT
+        // injected: MANGOHUD=1 in this env would hook gamescope's own Vulkan
+        // renderer as well as the app (same rationale as the Steam session).
+        if entry.fps_cap.resolve(ctx.output_fps).is_some() || entry.perf_overlay {
+            tracing::info!(
+                "app `{}`: fps_cap/perf_overlay are skipped under gamescope — put \
+                 MANGOHUD_CONFIG in the entry's env (it applies inside the wrap) instead",
+                entry.slug
+            );
+        }
+        let (w, h) = ctx.output_size.unwrap_or((1920, 1080));
+        let extra = std::env::var("PHAROS_GAMESCOPE_ARGS")
+            .map(|s| tokenize(&s))
+            .unwrap_or_default();
+        let mut args: Vec<String> = vec![
+            "-f".into(),
+            "-W".into(),
+            w.to_string(),
+            "-H".into(),
+            h.to_string(),
+        ];
+        if let Some(f) = ctx.output_fps.filter(|f| *f > 0) {
+            args.push("-r".into());
+            args.push(f.to_string());
+        }
+        args.extend(extra);
+        args.push("--".into());
+        if kind_shell || entry.shell {
+            args.push("/bin/sh".into());
+            args.push("-c".into());
+            args.push(line.to_string());
+        } else {
+            args.extend(tokenize(line));
+        }
+        let mut cmd = Command::new("gamescope");
+        cmd.args(&args);
+        if let Some(sock) = &ctx.wayland_socket {
+            cmd.env("WAYLAND_DISPLAY", sock);
+        }
+        // gamescope brings its own XWayland for the app; scrub the host's
+        // DISPLAY so nothing inside can escape to the real X11 session.
+        cmd.env_remove("DISPLAY");
+        if let Some(sink) = &ctx.audio_sink {
+            cmd.env("PULSE_SINK", sink);
+        }
+        if let Some(dir) = &entry.cwd {
+            if !dir.trim().is_empty() {
+                cmd.current_dir(dir);
+            }
+        }
+        for (k, v) in &entry.env {
+            cmd.env(k, v);
+        }
+        tracing::info!(
+            "launching app `{}` in gamescope: gamescope {}",
+            entry.slug,
+            args.join(" ")
+        );
+        let child = cmd
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("spawn gamescope for app `{}`: {e}", entry.slug))?;
+        register_pid(&entry.slug, child.id());
+        Ok(Some(child))
+    }
+}
+
+/// Launch an entry whose [`AppCompositor`] is `Xwayland`: bring up a rootful,
+/// fullscreen Xwayland on the virtual display, wait for its socket, then run
+/// the app against it (`DISPLAY=:N`, `WAYLAND_DISPLAY` scrubbed so an
+/// X11-capable toolkit can't silently prefer Wayland). No window manager runs
+/// inside the X server — right for fullscreen games/emulators, wrong for
+/// multi-window desktop apps. `-terminate` makes the server exit on its own
+/// when its last client disconnects; until a client connects (or on a failed
+/// app spawn) we kill it ourselves, and [`end_app`] reaps it as a registered
+/// companion of the slug.
+fn launch_in_xwayland(
+    entry: &AppEntry,
+    ctx: &LaunchContext,
+    line: &str,
+    kind_shell: bool,
+) -> anyhow::Result<Option<Child>> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (ctx, line, kind_shell);
+        anyhow::bail!(
+            "app `{}` selects the xwayland compositor, which is Linux-only",
+            entry.slug
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if entry.target.is_physical_target() {
+            anyhow::bail!(
+                "app `{}` selects xwayland but targets {:?} (the host's PHYSICAL desktop); \
+                 the per-app Xwayland lives on the virtual display — use a virtual-display target",
+                entry.slug,
+                entry.target
+            );
+        }
+        if launches_via_steam(line) {
+            anyhow::bail!(
+                "app `{}` selects xwayland, but it launches via the Steam client, whose spawn \
+                 environment Pharos doesn't control — use `gamescope` (Steam boots inside the \
+                 session) or `builtin` (the display-redirect shim) instead",
+                entry.slug
+            );
+        }
+
+        let (w, h) = ctx.output_size.unwrap_or((1920, 1080));
+        let xdpy = free_x_display()?;
+        let mut xcmd = Command::new("Xwayland");
+        xcmd.arg(format!(":{xdpy}"))
+            .arg("-fullscreen")
+            .arg("-geometry")
+            .arg(format!("{w}x{h}"))
+            .arg("-terminate");
+        if let Some(sock) = &ctx.wayland_socket {
+            xcmd.env("WAYLAND_DISPLAY", sock);
+        }
+        xcmd.env_remove("DISPLAY");
+        let mut xchild = xcmd.spawn().map_err(|e| {
+            anyhow::anyhow!(
+                "spawn Xwayland for app `{}`: {e} (is xorg-xwayland installed?)",
+                entry.slug
+            )
+        })?;
+
+        // Readiness: poll for the X socket. A server that dies during startup
+        // (bad flag, no Wayland socket) fails the launch with its exit status
+        // instead of a timeout.
+        let sock_path = format!("/tmp/.X11-unix/X{xdpy}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::path::Path::new(&sock_path).exists() {
+                break;
+            }
+            if let Ok(Some(status)) = xchild.try_wait() {
+                anyhow::bail!(
+                    "Xwayland for app `{}` exited during startup ({status})",
+                    entry.slug
+                );
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = xchild.kill();
+                anyhow::bail!("Xwayland for app `{}` didn't come up within 5s", entry.slug);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let mut cmd = build_command(entry, line, kind_shell)?;
+        cmd.env("DISPLAY", format!(":{xdpy}"));
+        cmd.env_remove("WAYLAND_DISPLAY");
+        if let Some(sink) = &ctx.audio_sink {
+            cmd.env("PULSE_SINK", sink);
+        }
+        // Direct spawn: the MangoHud cap/overlay env works exactly as on the
+        // builtin path (it hooks the app, not a wrapper).
+        for (k, v) in mangohud_env(entry.fps_cap.resolve(ctx.output_fps), entry.perf_overlay) {
+            cmd.env(k, v);
+        }
+        if let Some(dir) = &entry.cwd {
+            if !dir.trim().is_empty() {
+                cmd.current_dir(dir);
+            }
+        }
+        for (k, v) in &entry.env {
+            cmd.env(k, v);
+        }
+        tracing::info!(
+            "launching app `{}` ({}) on Xwayland :{}",
+            entry.slug,
+            line,
+            xdpy
+        );
+        let child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = xchild.kill();
+                return Err(anyhow::anyhow!(
+                    "spawn `{}` for app `{}`: {e}",
+                    line,
+                    entry.slug
+                ));
+            }
+        };
+        register_pid(&entry.slug, child.id());
+        register_companion(&entry.slug, xchild.id());
+        Ok(Some(child))
+    }
+}
+
+/// Pick a free X display number by probing the lock file + socket. Racy in
+/// principle (TOCTOU against another X server starting concurrently), but the
+/// range starts well above desktop displays, and a collision surfaces as a
+/// failed Xwayland startup — which fails this launch cleanly, not the host.
+#[cfg(target_os = "linux")]
+fn free_x_display() -> anyhow::Result<u32> {
+    for n in 50..100u32 {
+        let lock = format!("/tmp/.X{n}-lock");
+        let sock = format!("/tmp/.X11-unix/X{n}");
+        if !std::path::Path::new(&lock).exists() && !std::path::Path::new(&sock).exists() {
+            return Ok(n);
+        }
+    }
+    anyhow::bail!("no free X display number in :50..:100")
 }
 
 /// Translate a resolved FPS limit into the MangoHud environment that turns it
@@ -965,6 +1275,38 @@ fn register_pid(slug: &str, pid: u32) {
     map.insert(slug.to_string(), pid);
 }
 
+/// Companion processes a launch spawned ALONGSIDE the app (today: the per-app
+/// rootful Xwayland), keyed by slug. Not the app's own tree — [`end_app`] adds
+/// live companions to its kill roots and drops the slot either way.
+fn companion_registry() -> &'static Mutex<HashMap<String, Vec<u32>>> {
+    static COMPANIONS: OnceLock<Mutex<HashMap<String, Vec<u32>>>> = OnceLock::new();
+    COMPANIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record a companion process for `slug` (see [`companion_registry`]).
+#[cfg(target_os = "linux")]
+fn register_companion(slug: &str, pid: u32) {
+    companion_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(slug.to_string())
+        .or_default()
+        .push(pid);
+}
+
+/// Remove and return `slug`'s still-alive companions (dead ones are dropped).
+#[cfg(target_os = "linux")]
+fn take_live_companions(slug: &str) -> Vec<u32> {
+    companion_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(slug)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|&p| pid_alive(p))
+        .collect()
+}
+
 /// The registered pid for `slug` *if it is still alive*. A stale (dead) entry is
 /// pruned and treated as absent so the next launch spawns fresh.
 fn live_registered_pid(slug: &str) -> Option<u32> {
@@ -1118,7 +1460,7 @@ pub fn running_slugs(entries: &[AppEntry]) -> std::collections::HashSet<String> 
 pub fn end_app(entry: &AppEntry) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let roots: Vec<u32> = if let Some(appid) = entry_steam_appid(entry) {
+        let mut roots: Vec<u32> = if let Some(appid) = entry_steam_appid(entry) {
             // Every process whose cmdline references the appid (the reaper + the
             // proton wrapper); tree-walking each catches the game .exe, wine
             // services, AND the crash reporter (all reaper descendants).
@@ -1128,6 +1470,10 @@ pub fn end_app(entry: &AppEntry) -> anyhow::Result<()> {
         } else {
             Vec::new()
         };
+        // Companions (a per-app Xwayland) die with the app. `-terminate` usually
+        // reaps them on its own once the last X client is gone; this covers a
+        // wedged client and the pre-first-client window.
+        roots.extend(take_live_companions(&entry.slug));
         if roots.is_empty() {
             tracing::info!("end_app `{}`: nothing running", entry.slug);
             return Ok(());
@@ -1551,7 +1897,8 @@ mod tests {
 
     /// The gamescope argv is deterministic and ordered: integration+fullscreen,
     /// output size, refresh (only when known), user extras, then `-- <client>
-    /// -gamepadui`. This is the whole session command — worth pinning exactly.
+    /// -gamepadui` (+ the boot-to-game URI when given). This is the whole
+    /// session command — worth pinning exactly.
     #[cfg(target_os = "linux")]
     #[test]
     fn steam_session_args_shape() {
@@ -1561,6 +1908,7 @@ mod tests {
             Some(60),
             &["--hdr-enabled".into()],
             &["steam".into()],
+            None,
         );
         let want: Vec<String> = [
             "-e",
@@ -1581,8 +1929,23 @@ mod tests {
         .collect();
         assert_eq!(a, want);
         // Unknown refresh → no -r flag at all rather than a guess.
-        let a = steam_session_args(1920, 1080, None, &[], &["steam".into()]);
+        let a = steam_session_args(1920, 1080, None, &[], &["steam".into()], None);
         assert!(!a.contains(&"-r".to_string()), "{a:?}");
+        // Boot-to-game: the autolaunch URI rides LAST, after -gamepadui, so the
+        // client parses all its flags before the game URI (the SteamOS shape).
+        let a = steam_session_args(
+            1920,
+            1080,
+            None,
+            &[],
+            &["steam".into()],
+            Some("steam://rungameid/275850"),
+        );
+        assert_eq!(
+            a.last().map(String::as_str),
+            Some("steam://rungameid/275850")
+        );
+        assert_eq!(a[a.len() - 2], "-gamepadui");
     }
 
     /// A steam-session pointed at the physical desktop makes no sense (the

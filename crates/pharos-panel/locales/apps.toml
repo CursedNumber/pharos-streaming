@@ -316,3 +316,23 @@ nb = "Fjernet"
 ["apps.launched"]
 en = "Launching"
 nb = "Starter"
+
+["apps.field.compositor"]
+en = "Compositor"
+nb = "Kompositor"
+
+["apps.field.compositor_desc"]
+en = "Which display server hosts this app on the virtual output. Built-in = the compositor's own Wayland socket (native Wayland apps). Xwayland = a per-app rootful X server (X11-only apps; no window manager, best for fullscreen games/emulators). gamescope = a nested gamescope session; a Steam game boots the whole Steam client inside it, straight into the game (Steam Input works, no Big Picture navigation)."
+nb = "Hvilken skjermtjener som er vert for dette programmet p\u00e5 den virtuelle skjermen. Innebygd = kompositorens egen Wayland-socket (native Wayland-programmer). Xwayland = en egen rootful X-tjener per program (kun X11-programmer; ingen vindusbehandler, best for fullskjermspill/emulatorer). gamescope = en n\u00f8stet gamescope-\u00f8kt; et Steam-spill starter hele Steam-klienten inni den, rett inn i spillet (Steam Input virker, ingen Big Picture-navigering)."
+
+["apps.compositor.builtin"]
+en = "Built-in \u2014 Wayland"
+nb = "Innebygd \u2014 Wayland"
+
+["apps.compositor.xwayland"]
+en = "Xwayland \u2014 X11 apps"
+nb = "Xwayland \u2014 X11-programmer"
+
+["apps.compositor.gamescope"]
+en = "gamescope \u2014 nested session"
+nb = "gamescope \u2014 n\u00f8stet \u00f8kt"
