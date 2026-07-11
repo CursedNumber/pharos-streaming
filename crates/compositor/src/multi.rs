@@ -117,6 +117,13 @@ pub struct MultiCfg {
     /// `PHAROS_MAX_BITRATE_KBPS` overrides.
     #[serde(default)]
     pub max_bitrate_kbps: Option<u32>,
+    /// Ceiling (kbit/s) for CLIENT-requested bitrate caps (the Trireme slider,
+    /// Stage 3). Deliberately a separate knob from `bitrate_kbps` — that is the
+    /// host's own operating point, which a client cap is designed to override.
+    /// Unset = a built-in 500 Mbps sanity cap. `PHAROS_CLIENT_MAX_BITRATE_KBPS`
+    /// overrides.
+    #[serde(default)]
+    pub client_max_bitrate_kbps: Option<u32>,
     #[serde(rename = "output")]
     pub outputs: Vec<OutputCfg>,
 }
@@ -170,6 +177,7 @@ impl MultiCfg {
             fps_auto: false,
             bitrate_kbps: None,
             max_bitrate_kbps: None,
+            client_max_bitrate_kbps: None,
             outputs: vec![OutputCfg {
                 name: "HEADLESS-1".to_string(),
                 w: width,
@@ -1071,6 +1079,27 @@ fn resolve_rc_bitrate(cfg: &MultiCfg) -> Option<(u32, u32)> {
         .unwrap_or(avg)
         .max(avg);
     Some((avg, max))
+}
+
+/// Sanity ceiling for client-requested caps when neither the env override nor
+/// `client_max_bitrate_kbps` is set. Above the top Trireme slider stop (300 Mbps)
+/// so the shipped ladder is never clamped by default, below silly (a fat-fingered
+/// future numeric input can't drive NVENC to Gbps rates).
+const CLIENT_CAP_HARD_MAX_KBPS: u32 = 500_000;
+
+/// The ceiling applied to a CLIENT-requested bitrate cap (Stage 3) before it
+/// drives RC. Precedence: `PHAROS_CLIENT_MAX_BITRATE_KBPS` env, then
+/// [`MultiCfg::client_max_bitrate_kbps`], then [`CLIENT_CAP_HARD_MAX_KBPS`].
+/// Deliberately NOT derived from `bitrate_kbps`: that is the host's operating
+/// point, which the client cap is designed to override (clamping to it would
+/// undo the Phase 3 lever).
+fn client_bitrate_ceiling(cfg: &MultiCfg) -> u32 {
+    std::env::var("PHAROS_CLIENT_MAX_BITRATE_KBPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .or(cfg.client_max_bitrate_kbps)
+        .unwrap_or(CLIENT_CAP_HARD_MAX_KBPS)
+        .max(NET_FLOOR_KBPS)
 }
 
 /// Live-reconfigure the RC bitrate on every streaming pipeline's NVENC session
@@ -4716,15 +4745,26 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                     if min_kbps != 0 || max_kbps != 0 {
                         // Cap = the client max, or — uncapped — the host's configured
                         // cap (80 Mbps fallback when the host preset left RC unset).
+                        // Either way clamped to the host's client-cap ceiling: the
+                        // host knows its encoder and uplink, so a client can't
+                        // command a rate past what the host allows.
                         const UNCAPPED_DEFAULT_KBPS: u32 = 80_000;
                         const HARD_MIN_FLOOR_KBPS: u32 = 500;
-                        let avg_cap = if max_kbps != 0 {
+                        let ceiling = client_bitrate_ceiling(cfg);
+                        let requested = if max_kbps != 0 {
                             max_kbps
                         } else {
                             resolve_rc_bitrate(cfg)
                                 .map(|(avg, _)| avg)
                                 .unwrap_or(UNCAPPED_DEFAULT_KBPS)
                         };
+                        let avg_cap = requested.min(ceiling);
+                        if avg_cap < requested {
+                            tracing::info!(
+                                target: "compositor::wire",
+                                "client bitrate cap {requested}kbps clamped to host ceiling {ceiling}kbps",
+                            );
+                        }
                         let max_cap = avg_cap.saturating_mul(3) / 2;
                         bitrate_floor_kbps = if min_kbps == 0 {
                             NET_FLOOR_KBPS
