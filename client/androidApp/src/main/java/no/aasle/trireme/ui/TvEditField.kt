@@ -215,8 +215,13 @@ private fun DpadEditField(
                         editing = true; kb?.show(); true // enter edit; Compose auto-starts the session
                     }
                     // Keyboard is down (see above), so RIGHT jumps to the action button.
+                    // The requester's target may not be composed right now (the pair
+                    // dialog swaps Start — which carries the requester — for Close after
+                    // success); requestFocus() on a detached requester throws
+                    // IllegalStateException and killed the app on the X90J. Fall back to
+                    // default D-pad focus search instead of consuming the key.
                     ev.key == Key.DirectionRight && rightFocus != null -> {
-                        rightFocus.requestFocus(); true
+                        runCatching { rightFocus.requestFocus() }.isSuccess
                     }
                     else -> false
                 }
