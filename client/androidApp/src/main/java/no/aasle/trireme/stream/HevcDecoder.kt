@@ -31,8 +31,10 @@ private fun decodeTraceEnabled(): Boolean = try {
     false
 }
 
-// Decode/pace constants for the live HEVC path. These mirror the host's encode
-// config (1080p60 HEVC); the cadence is then measured at runtime and re-hinted.
+// Decode/pace constants for the live HEVC path. WIDTH/HEIGHT are the LAST-RESORT
+// configure size (used only when neither a known stream geometry nor panel caps
+// are available); the real configure size is computed per-instance — see the
+// geometry fields in [HevcDecoder]. FPS seeds cadence; measured + re-hinted live.
 private const val TAG = "Trireme"
 private const val WIDTH = 1920
 private const val HEIGHT = 1080
@@ -123,6 +125,19 @@ class HevcDecoder(
     /// uses this to letterbox to the TRUE source aspect instead of a hardcoded 16:9
     /// — so a 20:9 (2712x1220) stream fills a 20:9 phone. Wired in release too.
     private val onAspect: ((Float) -> Unit)? = null,
+    /// Last-known stream geometry (from a previous instance's
+    /// INFO_OUTPUT_FORMAT_CHANGED) — the preferred configure size on a rebuild.
+    /// 0 = unknown → configure at panel native (caps), else the 1080p fallback.
+    private val initW: Int = 0,
+    private val initH: Int = 0,
+    /// Fired (on the decode thread) when the stream's coded size changes from what
+    /// this codec instance was configured for — the MTK OMX decoder on the Bravia
+    /// X90J renders such frames at the wrong stride (tiled/quadrant picture over
+    /// uninitialized garbage) instead of adapting, even though it ADVERTISES
+    /// FEATURE_AdaptivePlayback. The loop stops itself first; the receiver
+    /// (StreamHub) rebuilds a decoder with the reported size as the new configure
+    /// hint and requests an IDR, so the switch lands in well under a second.
+    private val onGeometry: ((Int, Int) -> Unit)? = null,
 ) {
     // Codec selection: enumerate MediaCodecList for the first HEVC decoder that
     // is hardware-accelerated and NOT a known software fallback (OMX.google.*,
@@ -162,10 +177,30 @@ class HevcDecoder(
     // Wall-clock anchor — set on the first feed() — against which
     // last_presented_pts is compared to derive decode_pts_lag_ms.
     @Volatile private var firstFeedNs = 0L
+    // ---- Configure geometry ----
+    // The codec is configured at the best size we know — the last-seen stream
+    // geometry (rebuild), else panel native (caps, landscape-normalised), else the
+    // 1080p fallback. The old hardcoded 1920x1080 configure relied on the codec's
+    // in-place port reconfigure when the real SPS arrived; the X90J's MtkOmxVdec
+    // sometimes botches that (wrong-stride tiled frames over green uninitialized
+    // rows), which is exactly the corruption this replaces.
+    private val cfgW = if (initW > 0 && initH > 0) initW else if (caps.width > 0) caps.width else WIDTH
+    private val cfgH = if (initW > 0 && initH > 0) initH else if (caps.height > 0) caps.height else HEIGHT
+    // Diagnostic ONLY — logged at start, never trusted. In-place adaptive
+    // switching (FEATURE_AdaptivePlayback + KEY_MAX_WIDTH/HEIGHT) was the first
+    // design: the X90J's MtkOmxVdec CLAIMS the feature but rendered stale-stride
+    // quadrant/garbage frames on a live 2160→1440→1080 down-switch (2026-07-11).
+    // So ANY coded-size change now rebuilds the decoder instead (see
+    // captureOutputFormat); resync is <1s via the requested IDR.
+    private val adaptiveOk: Boolean = runCatching {
+        codec.codecInfo.getCapabilitiesForType(mime)
+            .isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_AdaptivePlayback)
+    }.getOrDefault(false)
+
     // Actual decoder OUTPUT geometry, captured on INFO_OUTPUT_FORMAT_CHANGED.
-    // Seeded to the init constants until the first format change arrives.
-    @Volatile private var outW = WIDTH
-    @Volatile private var outH = HEIGHT
+    // Seeded to the configure size until the first format change arrives.
+    @Volatile private var outW = cfgW
+    @Volatile private var outH = cfgH
 
     private val frameDurNs = 1_000_000_000L / FPS
     private var baseNs = 0L // SMOOTH: cadence anchor
@@ -186,12 +221,16 @@ class HevcDecoder(
     // the loop's finally{} can emit a single 'decoder restart cause=...' line.
     // The caller (StreamHub) drives the *next* restart; this log surfaces *why
     // this instance stopped*, which is the same information from the decoder's
-    // POV. Values: clean_stop | interrupted | mediacodec_err | error
+    // POV. Values: clean_stop | interrupted | mediacodec_err | error | geometry
     @Volatile private var exitCause: String = "clean_stop"
     @Volatile private var exitErr: String? = null
 
     init {
-        val fmt = MediaFormat.createVideoFormat(mime, WIDTH, HEIGHT)
+        // Configure at exactly the expected stream size — no KEY_MAX_WIDTH/HEIGHT
+        // adaptive pre-sizing. Every coded-size change rebuilds the decoder (the
+        // only path the MTK OMX decoder gets right), so the hints would only make
+        // the codec pre-allocate panel-native buffers it never adapts into.
+        val fmt = MediaFormat.createVideoFormat(mime, cfgW, cfgH)
         if ((pace == PaceMode.LOW_LATENCY || pace == PaceMode.VRR) && Build.VERSION.SDK_INT >= 30) {
             fmt.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
         }
@@ -205,7 +244,8 @@ class HevcDecoder(
         // with the existing "decoder restart cause=" line on teardown.
         Log.i(
             TAG,
-            "video decoder started (mime=$mime, pace=$pace, queue=$capacity, codec=$codecName, hw=$codecIsHw)"
+            "video decoder started (mime=$mime, pace=$pace, queue=$capacity, codec=$codecName, " +
+                "hw=$codecIsHw, cfg=${cfgW}x${cfgH}, adaptive=$adaptiveOk[unused])"
         )
     }
 
@@ -419,6 +459,15 @@ class HevcDecoder(
     /// Read the decoder's output MediaFormat (called on INFO_OUTPUT_FORMAT_CHANGED)
     /// to capture the true presented geometry. Prefers the crop rectangle (the
     /// visible size) over the buffer width/height when present.
+    ///
+    /// Also the geometry-mismatch tripwire: if the stream's coded size moved away
+    /// from what this codec was configured for, stop BEFORE the wrong-geometry
+    /// frames are dequeued — the format change arrives ahead of its buffers, so
+    /// exiting here means no corrupt frame is ever presented — and hand the new
+    /// size to StreamHub for a rebuild. ANY change restarts: in-place adaptive
+    /// switching is deliberately not attempted even when the codec advertises
+    /// FEATURE_AdaptivePlayback, because the X90J's MtkOmxVdec advertises it and
+    /// then renders stale-stride garbage on a live down-switch (2026-07-11).
     private fun captureOutputFormat() {
         runCatching {
             val of = codec.outputFormat
@@ -434,7 +483,16 @@ class HevcDecoder(
             outW = w
             outH = h
             if (w > 0 && h > 0) onAspect?.invoke(w.toFloat() / h.toFloat())
-            Log.i(TAG, "output format: ${w}x${h} (mime=$mime)")
+            Log.i(TAG, "output format: ${w}x${h} (mime=$mime, cfg=${cfgW}x${cfgH})")
+            // Compare CROP size (the true video size) — buffer dims carry codec row
+            // alignment (e.g. 1088 for 1080) and would false-trip a rebuild loop.
+            val changed = w > 0 && h > 0 && (w != cfgW || h != cfgH)
+            if (changed) {
+                exitCause = "geometry"
+                exitErr = "${w}x${h} vs cfg ${cfgW}x${cfgH} (adaptive=$adaptiveOk, not trusted)"
+                running = false
+                onGeometry?.invoke(w, h)
+            }
         }
     }
 

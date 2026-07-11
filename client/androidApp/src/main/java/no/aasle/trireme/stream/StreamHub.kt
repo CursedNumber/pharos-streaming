@@ -205,6 +205,11 @@ object StreamHub {
     // for direct-launched apps, the game render). Seeded from prefs in [init].
     @Volatile private var fpsMin: Int = 0
     @Volatile private var fpsMax: Int = 0
+    // Last-known coded stream size, from the decoder's INFO_OUTPUT_FORMAT_CHANGED
+    // (via onGeometry). The next decoder configures at this size directly, so a
+    // geometry-triggered rebuild converges in one step. Cleared on host switch —
+    // the new host's stream size is unrelated.
+    @Volatile private var lastVideoSize: Pair<Int, Int>? = null
     // The single decoder. Exists only while there is a Surface AND a Live active
     // session; recreated on (re)attach, destroyed on surface-destroyed/switch.
     @Volatile private var decoder: HevcDecoder? = null
@@ -1002,6 +1007,9 @@ object StreamHub {
         }
         stopDecoderLocked()
         stopAudioAndControllersLocked()
+        // The new host's stream size is unrelated — let the next decoder configure
+        // from panel caps and learn the real size from its first format change.
+        lastVideoSize = null
 
         target.active = true
         postActive(hostId, target.status)
@@ -1041,15 +1049,39 @@ object StreamHub {
         // so the decoder skips it entirely (one per-second null check).
         val statsSink: ((DecoderStats) -> Unit)? =
             if (no.aasle.trireme.BuildConfig.DEBUG) { s -> _debugMetrics.value = s } else null
+        val (kw, kh) = lastVideoSize ?: (0 to 0)
         decoder = runCatching {
             HevcDecoder(
                 surf, effectivePace(active.pace), caps, streamMime,
                 onStats = statsSink,
                 onAspect = { a -> _videoAspect.value = a },
+                initW = kw,
+                initH = kh,
+                onGeometry = { w, h -> onDecoderGeometry(w, h) },
             )
         }.getOrElse {
             Log.e(TAG, "decoder create failed: ${it.message}")
             null
+        }
+    }
+
+    /// Decoder reported a coded-size change it can't absorb in place (see
+    /// HevcDecoder.captureOutputFormat): it has already stopped its own loop
+    /// without presenting any wrong-geometry frame. Rebuild a decoder configured
+    /// at the reported size. Invoked on the decode thread → hop to main, where
+    /// every other decoder lifecycle op runs.
+    private fun onDecoderGeometry(w: Int, h: Int) {
+        main.post {
+            synchronized(lock) {
+                lastVideoSize = w to h
+                if (decoder == null) return@post
+                Log.i(TAG, "stream geometry ${w}x${h} beyond decoder config — rebuilding decoder")
+                stopDecoderLocked()
+                startDecoderLocked()
+                // Resync the fresh decoder in ~1 RTT instead of waiting for the
+                // host's next scheduled IDR (≤1s).
+                runCatching { requestKeyframe() }
+            }
         }
     }
 
