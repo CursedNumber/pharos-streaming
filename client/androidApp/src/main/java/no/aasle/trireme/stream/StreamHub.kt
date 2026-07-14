@@ -730,16 +730,24 @@ object StreamHub {
                 // Only the active session feeds the single decoder; everyone else
                 // is connected purely for catalog + launch, so drop their frames.
                 if (s.active) {
-                    // Auto-negotiate the codec from the first access unit (HEVC
-                    // Annex-B start code vs AV1 OBU temporal delimiter). If it
-                    // differs from the decoder we built (always HEVC by default),
-                    // swap to the matching one on the main thread.
+                    // Auto-negotiate the codec from the stream's access units.
+                    // Mid-GOP AUs (P-frame slices) are NOT classifiable — a
+                    // joiner's first AU usually is one, and H.264/HEVC/VVC
+                    // P-slices are mutually ambiguous — so the sniffer returns
+                    // null for them and we simply try the next AU: the host's
+                    // periodic IDR (≤1s, parameter sets attached) always
+                    // classifies. Only a definite classification may (re)build
+                    // the decoder — this is what keeps a remembered mime from
+                    // being clobbered by an unclassifiable frame (the live
+                    // black-screen bug of 2026-07-14).
                     if (!sniffed) {
-                        sniffed = true
                         val want = sniffCodecMime(data)
-                        if (want != streamMime || decoder?.mime != want) {
-                            streamMime = want
-                            main.post { swapDecoderMimeIfNeeded(want) }
+                        if (want != null) {
+                            sniffed = true
+                            if (want != streamMime || decoder?.mime != want) {
+                                streamMime = want
+                                main.post { swapDecoderMimeIfNeeded(want) }
+                            }
                         }
                     }
                     // Feed only a decoder whose MIME matches the stream — never
@@ -1123,20 +1131,26 @@ object StreamHub {
         }
     }
 
-    /// Sniff the video MIME from the first access unit. AV1's low-overhead OBU
-    /// stream has no NAL start codes; H.264, HEVC and VVC are ALL Annex-B
-    /// (`00 00 [00] 01`), so they're told apart by the first NAL header — each
-    /// host encoder opens its stream (and every IDR AU, via parameter-set
-    /// repetition) with a distinctive NAL. Mirrors `media_decode::sniff_codec`
-    /// on the Rust side; keep the two in step. Defaults to HEVC when ambiguous.
-    private fun sniffCodecMime(au: ByteArray): String {
+    /// Sniff the video MIME from an access unit, or null when the AU can't be
+    /// classified. AV1's low-overhead OBU stream has no NAL start codes (and
+    /// every NVENC temporal unit opens with a temporal delimiter, so AV1
+    /// classifies on any AU); H.264, HEVC and VVC are ALL Annex-B
+    /// (`00 00 [00] 01`), told apart by the first NAL header — but ONLY on
+    /// "stream opener" NALs (parameter sets / IRAP / AUD / SEI), which every
+    /// host encoder attaches to each IDR via parameter-set repetition.
+    /// Mid-GOP P-slices are mutually ambiguous across the three NAL codecs
+    /// (e.g. `0x61` = an H.264 non-IDR slice, and HEVC TRAIL vs VVC TRAIL
+    /// share their first bytes exactly), so a mid-stream join returns null
+    /// until the next IDR (≤1s) rather than guessing wrong. Mirrors
+    /// `media_decode::sniff_codec` on the Rust side; keep the two in step.
+    private fun sniffCodecMime(au: ByteArray): String? {
         val mime = sniffCodecMimeInner(au)
         val head = au.take(16).joinToString(" ") { "%02x".format(it.toInt() and 0xff) }
-        Log.i(TAG, "codec sniff: [$head] (len=${au.size}) -> $mime")
+        Log.i(TAG, "codec sniff: [$head] (len=${au.size}) -> ${mime ?: "unclassified (mid-GOP; waiting for an IDR)"}")
         return mime
     }
 
-    private fun sniffCodecMimeInner(au: ByteArray): String {
+    private fun sniffCodecMimeInner(au: ByteArray): String? {
         // Annex-B: locate the first NAL header after the start code.
         val nalOff = if (au.size >= 3 && au[0].toInt() == 0 && au[1].toInt() == 0) {
             when {
@@ -1148,7 +1162,7 @@ object StreamHub {
             -1
         }
         if (nalOff >= 0) {
-            if (au.size < nalOff + 2) return "video/hevc"
+            if (au.size < nalOff + 2) return null
             val b0 = au[nalOff].toInt() and 0xff
             val b1 = au[nalOff + 1].toInt() and 0xff
             // VVC: base-layer first header byte is 0x00; type sits in the second
@@ -1171,7 +1185,8 @@ object StreamHub {
             // H.264: forbidden bit clear; opening types IDR 5, SEI 6, SPS 7,
             // PPS 8, AUD 9.
             if ((b0 and 0x80) == 0 && (b0 and 0x1f) in 5..9) return "video/avc"
-            return "video/hevc"
+            // Anything else (P/B slices, suffix NALs…) is not classifiable.
+            return null
         }
         if (au.isNotEmpty()) {
             val b = au[0].toInt() and 0xff
@@ -1180,7 +1195,7 @@ object StreamHub {
                 if (obuType == 1 || obuType == 2 || obuType == 6) return "video/av01"
             }
         }
-        return "video/hevc"
+        return null
     }
 
     /// Audio + controllers are owned per-active-session: they're created when a

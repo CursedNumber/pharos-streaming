@@ -335,11 +335,13 @@ pub fn codec_from_env(default: StreamCodec) -> StreamCodec {
     codec_override_from_env().unwrap_or(default)
 }
 
-/// Sniff the codec from the first bytes of an elementary stream. AV1 is easy —
-/// a low-overhead OBU stream has no NAL start codes. H.264, HEVC and VVC are
-/// ALL Annex-B (`00 00 [00] 01` start codes), so they're told apart by the
-/// first NAL header, exploiting that each host encoder opens its stream (and
-/// every IDR AU, via parameter-set repetition) with a distinctive NAL:
+/// Sniff the codec from the first bytes of an access unit, or `None` when the
+/// AU can't be classified. AV1 is easy — a low-overhead OBU stream has no NAL
+/// start codes, and every NVENC temporal unit opens with a temporal delimiter,
+/// so AV1 classifies on any AU. H.264, HEVC and VVC are ALL Annex-B
+/// (`00 00 [00] 01` start codes), told apart by the first NAL header — but
+/// ONLY on "stream opener" NALs (parameter sets / IRAP / AUD / SEI), which
+/// every host encoder attaches to each IDR via parameter-set repetition:
 ///
 /// * VVC's two-byte header is `layer-id byte` + `type(5)|tid+1(3)`: base-layer
 ///   parameter sets / AUD / picture-header / IRAP give `0x00` then a type-coded
@@ -349,8 +351,14 @@ pub fn codec_from_env(default: StreamCodec) -> StreamCodec {
 /// * H.264's one-byte header (`ref_idc(2)|type(5)`) opens with SPS/AUD/SEI/IDR
 ///   — types that don't parse as plausible HEVC or VVC openers.
 ///
-/// Defaults to HEVC (the project default) when ambiguous.
-pub fn sniff_codec(head: &[u8]) -> StreamCodec {
+/// Mid-GOP P-slices MUST return `None`, never a guess: a mid-stream joiner's
+/// first AU is usually one, and they are mutually ambiguous across the NAL
+/// codecs (`0x61` is an H.264 non-IDR slice; HEVC TRAIL_N and VVC TRAIL share
+/// their first two bytes exactly). Callers skip unclassifiable AUs and re-try
+/// on the next one — the host's periodic IDR (≤1s) always classifies. Guessing
+/// here is what put an HEVC decoder on a live AVC stream (black screen,
+/// 2026-07-14).
+pub fn sniff_codec(head: &[u8]) -> Option<StreamCodec> {
     let nal = if head.starts_with(&[0, 0, 0, 1]) {
         Some(&head[4..])
     } else if head.starts_with(&[0, 0, 1]) {
@@ -360,37 +368,38 @@ pub fn sniff_codec(head: &[u8]) -> StreamCodec {
     };
     if let Some(nal) = nal {
         let (Some(&b0), Some(&b1)) = (nal.first(), nal.get(1)) else {
-            return StreamCodec::Hevc;
+            return None;
         };
         // VVC: base layer (b0 == 0x00), second byte carries type + tid.
         // Types: IRAP 7..=9, VPS 14, SPS 15, PPS 16, prefix-APS 17, PH 19,
         // AUD 20, prefix-SEI 23. tid+1 must be non-zero.
         if b0 == 0x00 && (b1 & 0x07) != 0 && matches!(b1 >> 3, 7..=9 | 14..=17 | 19 | 20 | 23) {
-            return StreamCodec::Vvc;
+            return Some(StreamCodec::Vvc);
         }
-        // HEVC: layer-0 second byte is tid+1 (1..=7); plausible opening types:
+        // HEVC: layer-0 second byte is tid+1 (1..=7); opener types:
         // IRAP 16..=23, VPS/SPS/PPS 32..=34, AUD 35, prefix-SEI 39.
         let hevc_type = (b0 >> 1) & 0x3f;
         if (b0 & 0x81) == 0 && (1..=7).contains(&b1) && matches!(hevc_type, 16..=23 | 32..=35 | 39)
         {
-            return StreamCodec::Hevc;
+            return Some(StreamCodec::Hevc);
         }
-        // H.264: forbidden bit clear; opening types IDR 5, SEI 6, SPS 7,
+        // H.264: forbidden bit clear; opener types IDR 5, SEI 6, SPS 7,
         // PPS 8, AUD 9.
         if (b0 & 0x80) == 0 && matches!(b0 & 0x1f, 5..=9) {
-            return StreamCodec::H264;
+            return Some(StreamCodec::H264);
         }
-        return StreamCodec::Hevc;
+        // Anything else (P/B slices, suffix NALs…) is not classifiable.
+        return None;
     }
     if let Some(&b) = head.first() {
         let forbidden = b & 0x80;
         let obu_type = (b >> 3) & 0x0f;
         // 1 = sequence header, 2 = temporal delimiter, 6 = frame OBU.
         if forbidden == 0 && matches!(obu_type, 1 | 2 | 6) {
-            return StreamCodec::Av1;
+            return Some(StreamCodec::Av1);
         }
     }
-    StreamCodec::Hevc
+    None
 }
 
 /// Whether an access unit can start a fresh decode: it contains an HEVC IRAP
@@ -602,16 +611,37 @@ mod codec_tests {
 
     #[test]
     fn sniff_hevc_annexb() {
-        assert_eq!(sniff_codec(&[0, 0, 0, 1, 0x40]), StreamCodec::Hevc);
-        assert_eq!(sniff_codec(&[0, 0, 1, 0x40]), StreamCodec::Hevc);
+        assert_eq!(
+            sniff_codec(&[0, 0, 0, 1, 0x40, 0x01]),
+            Some(StreamCodec::Hevc)
+        );
+        assert_eq!(sniff_codec(&[0, 0, 1, 0x40, 0x01]), Some(StreamCodec::Hevc));
     }
 
     #[test]
     fn sniff_av1_obu() {
-        // Temporal-delimiter OBU (type 2, has_size=1) = 0x12.
-        assert_eq!(sniff_codec(&[0x12, 0x00]), StreamCodec::Av1);
+        // Temporal-delimiter OBU (type 2, has_size=1) = 0x12 — present on
+        // EVERY NVENC temporal unit, so AV1 classifies mid-GOP too.
+        assert_eq!(sniff_codec(&[0x12, 0x00]), Some(StreamCodec::Av1));
         // Sequence-header OBU (type 1) = 0x0a.
-        assert_eq!(sniff_codec(&[0x0a, 0x0e]), StreamCodec::Av1);
+        assert_eq!(sniff_codec(&[0x0a, 0x0e]), Some(StreamCodec::Av1));
+    }
+
+    #[test]
+    fn sniff_mid_gop_is_unclassified() {
+        // The live 2026-07-14 black-screen bytes: an H.264 non-IDR slice
+        // (0x61 = ref_idc 3, type 1) from a mid-stream join. Must be None —
+        // guessing HEVC here rebuilt the wrong decoder on a live AVC stream.
+        assert_eq!(sniff_codec(&[0, 0, 0, 1, 0x61, 0xe0, 0x82, 0xbf]), None);
+        // HEVC TRAIL_R P-slice (type 1 → 0x02 0x01): also not classifiable.
+        assert_eq!(sniff_codec(&[0, 0, 1, 0x02, 0x01, 0xd0]), None);
+        // HEVC TRAIL_N / VVC TRAIL share 0x00 0x01 exactly — never guess.
+        assert_eq!(sniff_codec(&[0, 0, 1, 0x00, 0x01, 0xd0]), None);
+        // Truncated AU (start code + one header byte): not classifiable.
+        assert_eq!(sniff_codec(&[0, 0, 0, 1, 0x40]), None);
+        // Garbage with no start code and no plausible OBU header.
+        assert_eq!(sniff_codec(&[0xff, 0xfe]), None);
+        assert_eq!(sniff_codec(&[]), None);
     }
 
     #[test]
@@ -678,32 +708,35 @@ mod codec_tests {
     #[test]
     fn sniff_h264_annexb() {
         // NVENC H.264 opens with SPS (0x67, High profile 0x64 follows).
-        assert_eq!(sniff_codec(&[0, 0, 0, 1, 0x67, 0x64]), StreamCodec::H264);
+        assert_eq!(
+            sniff_codec(&[0, 0, 0, 1, 0x67, 0x64]),
+            Some(StreamCodec::H264)
+        );
         // AUD-first (0x09) also reads as H.264.
-        assert_eq!(sniff_codec(&[0, 0, 1, 0x09, 0xF0]), StreamCodec::H264);
-        // IDR-first (0x65) mid-stream join.
-        assert_eq!(sniff_codec(&[0, 0, 1, 0x65, 0x88]), StreamCodec::H264);
+        assert_eq!(sniff_codec(&[0, 0, 1, 0x09, 0xF0]), Some(StreamCodec::H264));
+        // IDR-first (0x65) — the on-demand IDR a joiner requested.
+        assert_eq!(sniff_codec(&[0, 0, 1, 0x65, 0x88]), Some(StreamCodec::H264));
     }
 
     #[test]
     fn sniff_vvc_annexb() {
         // vvenc + aud=insert opens with AUD (type 20): 0x00 0xA1.
-        assert_eq!(sniff_codec(&[0, 0, 0, 1, 0x00, 0xA1]), StreamCodec::Vvc);
+        assert_eq!(
+            sniff_codec(&[0, 0, 0, 1, 0x00, 0xA1]),
+            Some(StreamCodec::Vvc)
+        );
         // SPS-first (type 15): 0x00 0x79.
-        assert_eq!(sniff_codec(&[0, 0, 1, 0x00, 0x79]), StreamCodec::Vvc);
+        assert_eq!(sniff_codec(&[0, 0, 1, 0x00, 0x79]), Some(StreamCodec::Vvc));
         // IDR_W_RADL-first (type 7): 0x00 0x39.
-        assert_eq!(sniff_codec(&[0, 0, 1, 0x00, 0x39]), StreamCodec::Vvc);
+        assert_eq!(sniff_codec(&[0, 0, 1, 0x00, 0x39]), Some(StreamCodec::Vvc));
     }
 
     #[test]
     fn sniff_hevc_not_confused_by_new_codecs() {
-        // NVENC HEVC opens with VPS: 0x40 0x01 — still HEVC.
-        assert_eq!(sniff_codec(&[0, 0, 0, 1, 0x40, 0x01]), StreamCodec::Hevc);
         // HEVC IDR_W_RADL (type 19 → 0x26 0x01).
-        assert_eq!(sniff_codec(&[0, 0, 1, 0x26, 0x01]), StreamCodec::Hevc);
-        // An HEVC TRAIL_N (0x00 0x01) must NOT sniff as VVC: VVC-type would be
-        // 0 (TRAIL), which isn't in the opener set.
-        assert_eq!(sniff_codec(&[0, 0, 1, 0x00, 0x01]), StreamCodec::Hevc);
+        assert_eq!(sniff_codec(&[0, 0, 1, 0x26, 0x01]), Some(StreamCodec::Hevc));
+        // HEVC CRA (type 21 → 0x2A 0x01).
+        assert_eq!(sniff_codec(&[0, 0, 1, 0x2A, 0x01]), Some(StreamCodec::Hevc));
     }
 
     #[test]

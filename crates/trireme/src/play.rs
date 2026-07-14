@@ -3310,23 +3310,30 @@ fn spawn_decode(
                 Some(client_identity.as_ref()),
                 |au| {
                     // The codec whose bitstream the key-AU gate parses: the cell
-                    // holds the TRIREME_CODEC override or a prior sniff; on the
-                    // FIRST AU of an un-overridden session it is still empty, so
-                    // sniff (NAL-header / OBU discrimination) and publish — the
-                    // reader is waiting on exactly this to spawn the right
-                    // ffmpeg. One atomic load per AU thereafter (the closure is
-                    // hot).
+                    // holds the TRIREME_CODEC override or a prior sniff; while it
+                    // is still empty (un-overridden session start), sniff each AU
+                    // and publish on the first CLASSIFIABLE one — the reader is
+                    // waiting on exactly this to spawn the right ffmpeg. A
+                    // mid-stream join's first AUs are usually unclassifiable
+                    // P-slices (sniff = None): drop those and nudge the host for
+                    // an IDR, whose parameter sets classify. Once published it's
+                    // one atomic load per AU (the closure is hot).
                     let stream_codec = match codec_from_u8(
                         sniffed_quic.load(std::sync::atomic::Ordering::Relaxed),
                     ) {
                         Some(c) => c,
-                        None => {
-                            let c = media_decode::sniff_codec(&au);
-                            sniffed_quic
-                                .store(codec_to_u8(c), std::sync::atomic::Ordering::Relaxed);
-                            tracing::info!("source[{idx}] stream codec sniffed: {}", c.label());
-                            c
-                        }
+                        None => match media_decode::sniff_codec(&au) {
+                            Some(c) => {
+                                sniffed_quic
+                                    .store(codec_to_u8(c), std::sync::atomic::Ordering::Relaxed);
+                                tracing::info!("source[{idx}] stream codec sniffed: {}", c.label());
+                                c
+                            }
+                            None => {
+                                request_idr_quic.store(true, std::sync::atomic::Ordering::Relaxed);
+                                return;
+                            }
+                        },
                     };
                     // TAKE the stdin out under the lock, then release before writing so a
                     // full-pipe `write_all` never blocks the reader's rebuild `lock()`.

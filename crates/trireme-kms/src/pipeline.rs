@@ -134,12 +134,18 @@ fn start_decode(
                 |au| {
                     if pipe.is_none() {
                         // Codec: a TRIREME_CODEC override wins; otherwise sniff
-                        // THIS first AU (NAL-header / OBU discrimination) so the
-                        // resident client follows whatever codec the host streams
-                        // (HEVC/AV1/AVC/VVC) with no configuration. The lazy
-                        // spawn-on-first-AU already gives the sniff its bytes.
-                        let codec = media_decode::codec_override_from_env()
-                            .unwrap_or_else(|| media_decode::sniff_codec(&au));
+                        // (NAL-header / OBU discrimination) so the resident
+                        // client follows whatever codec the host streams
+                        // (HEVC/AV1/AVC/VVC) with no configuration. A mid-stream
+                        // join's first AUs are usually unclassifiable P-slices
+                        // (sniff = None): skip those — the decoder spawns on the
+                        // first classifiable AU (the host's ≤1s periodic IDR
+                        // carries parameter sets, which always classify).
+                        let Some(codec) = media_decode::codec_override_from_env()
+                            .or_else(|| media_decode::sniff_codec(&au))
+                        else {
+                            return;
+                        };
                         tracing::info!("stream codec: {} — spawning decoder", codec.label());
                         match spawn_decoder(w, h, codec) {
                             Ok(mut child) => {
