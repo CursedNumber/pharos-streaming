@@ -326,6 +326,41 @@ impl State {
         }
     }
 
+    /// True when a mapped toplevel is smaller than the output it sits on, i.e. a
+    /// windowed dialog / launcher (the same shape `center_windows` re-centers) is
+    /// present. That's exactly when a streamed client (a TV with a mouse or a
+    /// controller-as-cursor) needs to SEE a host cursor to click; a fullscreen
+    /// app (size == output) manages its own cursor, so this stays false in-game.
+    pub fn windowed_dialog_present(&self) -> bool {
+        let outputs: Vec<(i32, i32)> = self
+            .space
+            .outputs()
+            .filter_map(|o| self.space.output_geometry(o).map(|g| (g.size.w, g.size.h)))
+            .collect();
+        if outputs.is_empty() {
+            return false;
+        }
+        self.space.elements().any(|w| {
+            let sz = w.geometry().size;
+            if sz.w <= 0 || sz.h <= 0 {
+                return false;
+            }
+            // Smaller than EVERY output ⇒ genuinely windowed (not just smaller
+            // than a mismatched secondary output in an extend layout).
+            outputs.iter().all(|&(ow, oh)| sz.w < ow || sz.h < oh)
+        })
+    }
+
+    /// The host pointer's current absolute location in compositor-logical pixels
+    /// (== physical at scale 1.0), for drawing the overlay cursor. `None` if no
+    /// pointer is bound yet.
+    pub fn pointer_location(&self) -> Option<(f64, f64)> {
+        self.seat
+            .get_pointer()
+            .map(|p| p.current_location())
+            .map(|l| (l.x, l.y))
+    }
+
     fn init_wayland_listener(
         display: Display<State>,
         event_loop: &mut EventLoop<CalloopData>,

@@ -118,6 +118,8 @@ fun SettingsPane(onOpenControllers: () -> Unit = {}) {
     // on-screen indicator stays in sync), and the hold-Start trigger option.
     val cursorOn by StreamHub.cursorMode.collectAsState()
     var holdStartCursor by remember { mutableStateOf(StreamHub.isHoldStartForCursor()) }
+    // Physical-mouse sensitivity, cycled through presets (D-pad friendly).
+    val mouseSens by StreamHub.mouseSensitivityFlow.collectAsState()
 
     // Master switches (both default off). USB/IP is persisted in UsbStore; controller
     // handling lives in StreamHub (which rebuilds the live ControllerManager on change).
@@ -332,6 +334,20 @@ fun SettingsPane(onOpenControllers: () -> Unit = {}) {
                 val next = !holdStartCursor
                 holdStartCursor = next
                 StreamHub.setHoldStartForCursor(next)
+            },
+        )
+        // --- Mouse sensitivity: click to cycle presets (higher = faster cursor) --
+        // A 4K host canvas at 1:1 feels sluggish; this multiplies raw mouse motion.
+        SettingRow(
+            title = "Mouse sensitivity",
+            summary = "How far the host cursor moves per mouse motion. Higher is faster; " +
+                "raise it if the pointer feels sluggish on a 4K screen. Tap to cycle.",
+            trailing = "${mouseSens}x",
+            state = "${mouseSens}x",
+            onClick = {
+                val stops = listOf(1.5f, 2.0f, 2.5f, 3.0f, 4.0f, 5.0f)
+                val next = stops.firstOrNull { it > mouseSens + 0.01f } ?: stops.first()
+                StreamHub.setMouseSensitivity(next)
             },
         )
 

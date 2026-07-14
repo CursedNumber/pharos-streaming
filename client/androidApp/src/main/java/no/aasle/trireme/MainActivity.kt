@@ -45,6 +45,7 @@ import androidx.compose.material3.Text
 import androidx.compose.ui.graphics.Color
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -286,6 +287,16 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
 
         val store = ServerStore(this)
         setContent {
+            // Mouse pointer capture is delivered to the FOCUSED view — the Compose
+            // host view, not the decorView — so attach the listener + capture there.
+            val composeView = LocalView.current
+            LaunchedEffect(composeView) {
+                composeView.isFocusableInTouchMode = true
+                captureView = composeView
+                composeView.setOnCapturedPointerListener { _, event -> handleCapturedMouse(event) }
+                Log.i(TAG, "mouseDiag capture listener attached to compose view")
+                updatePointerCapture()
+            }
             TriremeTheme {
                 ShellContent(
                     mode = navMode.value,
@@ -299,6 +310,10 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                 )
             }
         }
+
+        // Raw mouse via pointer capture is set up inside setContent on the Compose
+        // host view (the focused view that actually receives captured events).
+        Log.i(TAG, "mouseDiag build=pointer-capture-v2 (onCreate)")
     }
 
     override fun onResume() {
@@ -315,6 +330,8 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         // current phone clipboard to the host, since the change listener only fires
         // while we're focused and would have missed a copy made elsewhere.
         if (hasFocus) StreamHub.onClipboardFocusSync()
+        // Capture is dropped whenever the window loses focus; re-assert to match.
+        updatePointerCapture()
     }
 
     // ============================================================
@@ -333,16 +350,19 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         tScrolling = false
         if (navMode.value == NavMode.Hidden) navMode.value = NavMode.Peek
         peekTick.value++
+        updatePointerCapture() // navbar up → release capture so the remote drives it
     }
 
     /** Expand Peek → Full (rail + active pane); cancels the auto-hide timer. */
     private fun expandToFull() {
         navMode.value = NavMode.Full
+        updatePointerCapture()
     }
 
     /** Close the navbar back to full-screen stream (the stream never stopped). */
     private fun closeNavbar() {
         navMode.value = NavMode.Hidden
+        updatePointerCapture() // back to the stream → recapture the mouse
     }
 
     // ============================================================
@@ -551,7 +571,23 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         }
     }
 
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        if (event.isFromSource(android.view.InputDevice.SOURCE_MOUSE)) {
+            Log.i(TAG, "mouseDiag dispatchTouch source=${event.source} action=${event.actionMasked} btn=${event.buttonState} nav=${navMode.value}")
+            // A mouse click's ACTION_DOWN arrives via the touch pipeline. If Compose
+            // consumes it before onStreamTouch, forward it here at the Activity level
+            // (navbar hidden + streaming) so the click still reaches the host.
+            if (navMode.value == NavMode.Hidden && StreamHub.hasActiveSession() && forwardMouse(event)) {
+                return true
+            }
+        }
+        return super.dispatchTouchEvent(event)
+    }
+
     override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        if (event.isFromSource(android.view.InputDevice.SOURCE_MOUSE)) {
+            Log.i(TAG, "mouseDiag genericMotion source=${event.source} action=${event.actionMasked} nav=${navMode.value}")
+        }
         // Don't steer the host with the sticks / mouse while the navbar is up.
         if (navMode.value != NavMode.Hidden) return super.dispatchGenericMotionEvent(event)
         // A USB mouse connected to the TV drives the host cursor (hover motion,
@@ -579,6 +615,11 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
      *  path (hover, button events) and [onStreamTouch] (a drag with a button held,
      *  which Android routes through the touch pipeline). Returns true when consumed. */
     private fun forwardMouse(event: MotionEvent): Boolean {
+        Log.i(
+            TAG,
+            "mouseDiag forwardMouse action=${event.actionMasked} btnState=${event.buttonState} " +
+                "x=${event.x} y=${event.y} session=${StreamHub.hasActiveSession()} nav=${navMode.value}",
+        )
         if (!StreamHub.hasActiveSession()) return false
         if (event.actionMasked == MotionEvent.ACTION_SCROLL) {
             val h = event.getAxisValue(MotionEvent.AXIS_HSCROLL)
@@ -606,6 +647,74 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
             edge(MotionEvent.BUTTON_SECONDARY, 1) // right
             edge(MotionEvent.BUTTON_TERTIARY, 2) // middle
             lastMouseButtons = nb
+        }
+        return true
+    }
+
+    // --- Pointer capture (mouse) ---
+    // On this TV an absolute mouse's hover/click doesn't reach the Activity's touch
+    // / generic-motion dispatch in a usable form (it routes through hover + a system
+    // cursor), so a normal mouse can't drive the host. Pointer CAPTURE takes raw
+    // mouse input (relative motion + buttons) via onCapturedPointerListener, which
+    // bypasses that AND hides the OS cursor (no double-cursor). Held only while
+    // streaming full-screen (navbar hidden, window focused, session live); released
+    // when the navbar opens so the remote can drive the Trireme menu.
+    private var lastCapturedButtons = 0
+    // The view that owns pointer capture + the captured-event listener. MUST be the
+    // FOCUSED view (the Compose host view, via LocalView) — captured events are
+    // dispatched to whatever holds input focus, so the decorView never sees them.
+    private var captureView: android.view.View? = null
+
+    /** Request or release mouse pointer-capture to match the current state. Called
+     *  on focus change and every navbar transition; idempotent. */
+    private fun updatePointerCapture() {
+        val v = captureView ?: return
+        val want = hasWindowFocus() && navMode.value == NavMode.Hidden &&
+            StreamHub.hasActiveSession()
+        runCatching {
+            if (want) {
+                v.requestFocus()
+                v.requestPointerCapture()
+            } else {
+                v.releasePointerCapture()
+            }
+        }
+    }
+
+    /** Raw captured mouse → host pointer: relative motion, buttons (edge-diffed),
+     *  and wheel scroll. Returns true (consumed). */
+    private fun handleCapturedMouse(event: MotionEvent): Boolean {
+        if (!StreamHub.hasActiveSession()) return false
+        if (event.actionMasked == MotionEvent.ACTION_SCROLL) {
+            StreamHub.pointerScroll(
+                event.getAxisValue(MotionEvent.AXIS_HSCROLL),
+                event.getAxisValue(MotionEvent.AXIS_VSCROLL),
+            )
+            return true
+        }
+        // In capture mode motion is RELATIVE. Prefer the dedicated relative axes;
+        // fall back to x/y (relative while captured) for HW that doesn't set them.
+        var dx = event.getAxisValue(MotionEvent.AXIS_RELATIVE_X)
+        var dy = event.getAxisValue(MotionEvent.AXIS_RELATIVE_Y)
+        if (dx == 0f && dy == 0f) {
+            dx = event.x; dy = event.y
+        }
+        // Scale raw device deltas by the user's sensitivity: a 4K host canvas at
+        // 1:1 feels sluggish (a lot of physical travel to cross the screen).
+        val sens = StreamHub.mouseSensitivity()
+        Log.i(TAG, "mouseDiag captured action=${event.actionMasked} dx=$dx dy=$dy sens=$sens btn=${event.buttonState}")
+        if (dx != 0f || dy != 0f) StreamHub.pointerRel(dx * sens, dy * sens)
+        val nb = event.buttonState
+        if (nb != lastCapturedButtons) {
+            fun edge(mask: Int, host: Int) {
+                if ((lastCapturedButtons and mask) != (nb and mask)) {
+                    StreamHub.pointerButton(host, (nb and mask) != 0)
+                }
+            }
+            edge(MotionEvent.BUTTON_PRIMARY, 0)
+            edge(MotionEvent.BUTTON_SECONDARY, 1)
+            edge(MotionEvent.BUTTON_TERTIARY, 2)
+            lastCapturedButtons = nb
         }
         return true
     }
@@ -1094,7 +1203,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
             // child = topmost z-order; touch/D-pad inert (see DebugHud). Gated on
             // the Settings toggle (StreamHub.debugHud) so it can be hidden live.
             val debugHudOn by StreamHub.debugHud.collectAsState()
-            if (BuildConfig.DEBUG && debugHudOn) {
+            if (debugHudOn) {
                 DebugHud(Modifier.align(Alignment.TopEnd))
             }
         }

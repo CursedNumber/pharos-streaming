@@ -59,11 +59,15 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::input::KeyState;
 use smithay::backend::renderer::damage::OutputDamageTracker;
+use smithay::backend::renderer::element::solid::SolidColorRenderElement;
+use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::element::{Id, Kind};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexProgram, GlesTexture};
+use smithay::backend::renderer::utils::CommitCounter;
 use smithay::backend::renderer::{
-    Bind, Blit, ExportMem, Frame, ImportDma, Offscreen, Renderer, TextureFilter,
+    Bind, Blit, Color32F, ExportMem, Frame, ImportDma, Offscreen, Renderer, TextureFilter,
 };
-use smithay::desktop::space::space_render_elements;
+use smithay::desktop::space::{space_render_elements, SpaceRenderElements};
 use smithay::input::keyboard::{FilterResult, Keycode};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::EventLoop;
@@ -842,6 +846,111 @@ fn reconcile_redirect_marker(pipelines: &[Option<Pipeline>], socket_name: &std::
 /// The CUDA device buffer (cuda_buf) and Smithay output/target/damage are
 /// kept; only the NVENC chain is rebuilt — that's what gives the next
 /// `encode_picture` call a clean picture-0 IDR.
+///
+/// Classic left-pointing arrow cursor (X11 `left_ptr`), hotspot at the top-left
+/// cell (0,0). `'o'` = black outline, `'X'` = white fill, `' '` = transparent.
+/// Rasterised + scaled by [`cursor_overlay_rects`] and painted as a per-frame
+/// overlay so a streamed client (a TV mouse / controller-as-cursor) can see
+/// where it's pointing when a windowed dialog is up.
+const CURSOR_BITMAP: &[&str] = &[
+    "o           ",
+    "oo          ",
+    "oXo         ",
+    "oXXo        ",
+    "oXXXo       ",
+    "oXXXXo      ",
+    "oXXXXXo     ",
+    "oXXXXXXo    ",
+    "oXXXXXXXo   ",
+    "oXXXXXXXXo  ",
+    "oXXXXXoooo  ",
+    "oXXoXXo     ",
+    "oXo oXXo    ",
+    "oo  oXXo    ",
+    "o    oXXo   ",
+    "      oo    ",
+];
+
+// A render element that is EITHER a normal space (window) element OR one of the
+// solid-colour rectangles that make up the overlay cursor. Wrapping both into a
+// single type lets the cursor be composited INSIDE `render_output`'s one
+// damage-tracked pass (same GPU pass + fence as the app frame) instead of a
+// second draw the encoder could capture mid-way — which flickered.
+smithay::backend::renderer::element::render_elements! {
+    OverlayRenderElements<=GlesRenderer>;
+    Space = SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
+    Cursor = SolidColorRenderElement,
+}
+
+/// One opaque cursor rectangle as a render element. A fresh `Id` per frame is
+/// fine: the damage tracker only retains the previous frame's element set, and
+/// the render loop always drives `render_output` with `age = 0` (full redraw),
+/// so there's no stale-damage or unbounded-state concern.
+fn cursor_solid(geo: Rectangle<i32, Physical>, color: [f32; 4]) -> SolidColorRenderElement {
+    SolidColorRenderElement::new(
+        Id::new(),
+        geo,
+        CommitCounter::default(),
+        Color32F::from(color),
+        Kind::Unspecified,
+    )
+}
+
+/// The physical rectangles making up one colour layer of the overlay cursor.
+type CursorRects = Vec<Rectangle<i32, Physical>>;
+
+/// Physical scale for the overlay cursor. Proportional to resolution so the
+/// apparent size is stable across outputs, tuned smaller than a 2x desktop
+/// cursor (users found 4px/cell too big at 4K). `PHAROS_CURSOR_SCALE` overrides.
+/// Clamped to a minimum of 2 so it's never sub-pixel.
+fn cursor_scale(height: u32) -> i32 {
+    if let Some(s) = std::env::var("PHAROS_CURSOR_SCALE")
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+    {
+        return s.clamp(1, 16);
+    }
+    ((height as f32 / 800.0).round() as i32).max(2)
+}
+
+/// Rasterise [`CURSOR_BITMAP`] at physical `loc`, scaled by `scale`, into two
+/// rectangle lists `(outline, fill)` — outline drawn first, fill on top — so the
+/// arrow reads on any background. Consecutive same-kind cells merge into one
+/// rect per run to keep the draw-call count low. Pure (unit-tested).
+fn cursor_overlay_rects(loc: (f64, f64), scale: i32) -> (CursorRects, CursorRects) {
+    let ox = loc.0.round() as i32;
+    let oy = loc.1.round() as i32;
+    let mut outline = Vec::new();
+    let mut fill = Vec::new();
+    for (row, line) in CURSOR_BITMAP.iter().enumerate() {
+        let y = oy + row as i32 * scale;
+        let bytes = line.as_bytes();
+        let mut col = 0usize;
+        while col < bytes.len() {
+            let c = bytes[col];
+            if c == b' ' {
+                col += 1;
+                continue;
+            }
+            // Extend the run over identical cells.
+            let start = col;
+            while col < bytes.len() && bytes[col] == c {
+                col += 1;
+            }
+            let run = (col - start) as i32;
+            let rect = Rectangle::<i32, Physical>::new(
+                (ox + start as i32 * scale, y).into(),
+                Size::from((run * scale, scale)),
+            );
+            match c {
+                b'o' => outline.push(rect),
+                _ => fill.push(rect),
+            }
+        }
+    }
+    (outline, fill)
+}
+
 /// NVENC encode GUID for a [`VideoCodec`]. Only call for NVENC codecs
 /// (`codec.is_nvenc()`): VVC has no NVENC GUID — the pipeline builder routes it
 /// to the software backend (`swenc`) before ever asking for one.
@@ -3033,7 +3142,16 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
     let mut last_input_conn: Option<String> = None;
     let mut last_input_conn_check = std::time::Instant::now();
     let mut held_ptr_buttons: std::collections::HashSet<u8> = std::collections::HashSet::new();
-    let (input_w, input_h) = (cfg.outputs[0].w, cfg.outputs[0].h);
+    // Pointer clamp / gyro-cursor centering bounds. Use the LIVE primary output
+    // size, NOT the config: a client can grow the envelope above config (e.g. a
+    // 4K panel over a 1080p `multi.toml`), and the process rebuilds the output at
+    // that size. Snapshotting `cfg.outputs[0]` here left the cursor clamped to
+    // the 1080p config on a 4K canvas — reachable area was the top-left quadrant.
+    // `p.width/p.height` are set once at pipeline build (the envelope) and never
+    // mutated by DRC (which only reconfigures the coded/encode size), so this
+    // snapshot stays correct for the session's lifetime.
+    let (input_w, input_h) =
+        primary_output_size(&pipelines).unwrap_or((cfg.outputs[0].w, cfg.outputs[0].h));
     // USB/IP-imported keyboards (vhci) → seat. Reads only vhci devices, so the
     // host's own keyboard is untouched. Always on; idle when none are imported.
     let usbkbd = crate::usbkbd::UsbKbd::spawn();
@@ -4336,6 +4454,47 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
             } else {
                 None
             };
+            // Overlay host cursor: only when a windowed dialog / launcher is up (a
+            // fullscreen game manages its own cursor, so this stays off in-game)
+            // and we're painting the app composite — never over a desktop mirror
+            // (that stream already carries the real host cursor) or the idle
+            // screen. Gives a streamed TV mouse / controller-cursor a visible
+            // pointer to aim with. Rects are physical (session scale 1.0).
+            let cursor_overlay =
+                if mirror_el.is_none() && idle_el.is_none() && data.state.windowed_dialog_present()
+                {
+                    data.state
+                        .pointer_location()
+                        .map(|loc| cursor_overlay_rects(loc, cursor_scale(p.height)))
+                } else {
+                    None
+                };
+            // Wrap the space elements, with the cursor rectangles stacked ON TOP,
+            // into ONE list. render_output composites the whole list in a single
+            // damage-tracked pass, so the cursor shares the app frame's GPU pass
+            // and fence — the encoder never grabs a frame with a half-drawn
+            // overlay (a separate post-render draw pass flickered). Element order
+            // is topmost-first: cursor FILL above OUTLINE above the app windows,
+            // so the black border shows only where the white fill doesn't cover.
+            let app_elements: Vec<OverlayRenderElements> = {
+                let mut v: Vec<OverlayRenderElements> = Vec::with_capacity(elements.len() + 48);
+                if let Some((outline, fill)) = &cursor_overlay {
+                    for r in fill {
+                        v.push(OverlayRenderElements::Cursor(cursor_solid(
+                            *r,
+                            [1.0, 1.0, 1.0, 1.0],
+                        )));
+                    }
+                    for r in outline {
+                        v.push(OverlayRenderElements::Cursor(cursor_solid(
+                            *r,
+                            [0.0, 0.0, 0.0, 1.0],
+                        )));
+                    }
+                }
+                v.extend(elements.into_iter().map(OverlayRenderElements::Space));
+                v
+            };
             // Stage C: does the mapped app actually declare HDR (via
             // wp_color_manager_v1, stored per-surface by crate::color_mgmt)? Only
             // then run the scRGB→PQ conversion — the idle screen / an SDR desktop
@@ -4412,7 +4571,7 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                                 &mut renderer,
                                 &mut sfb,
                                 0,
-                                &elements,
+                                &app_elements,
                                 [0.05, 0.05, 0.08, 1.0],
                             )?;
                         }
@@ -4475,7 +4634,7 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                             &mut renderer,
                             &mut fb,
                             0,
-                            &elements,
+                            &app_elements,
                             [0.05, 0.05, 0.08, 1.0],
                         )?;
                     }
@@ -6069,6 +6228,54 @@ impl FrameTimings {
         self.h_post.reset();
         self.h_pace.reset();
         self.h_status.reset();
+    }
+}
+
+#[cfg(test)]
+mod cursor_overlay_tests {
+    use super::{cursor_overlay_rects, cursor_scale, CURSOR_BITMAP};
+
+    #[test]
+    fn scale_tracks_resolution() {
+        // Env override must be absent for the proportional formula to apply.
+        assert!(std::env::var("PHAROS_CURSOR_SCALE").is_err());
+        assert_eq!(cursor_scale(1080), 2);
+        assert_eq!(cursor_scale(2160), 3);
+        // Never sub-pixel, even on a tiny output.
+        assert_eq!(cursor_scale(240), 2);
+    }
+
+    #[test]
+    fn hotspot_is_top_left_and_rects_scale() {
+        let scale = 3;
+        let (outline, fill) = cursor_overlay_rects((100.0, 50.0), scale);
+        // The very first cell (row 0, col 0) is an outline pixel at the hotspot.
+        let tip = outline
+            .iter()
+            .find(|r| r.loc.x == 100 && r.loc.y == 50)
+            .expect("outline rect at the hotspot");
+        assert_eq!(tip.size.h, scale, "one bitmap row tall");
+        assert!(tip.size.w >= scale, "at least one cell wide");
+        // Both colours are present, and every rect is a positive-area multiple
+        // of the scale (runs merge whole cells).
+        assert!(!fill.is_empty() && !outline.is_empty());
+        for r in outline.iter().chain(fill.iter()) {
+            assert!(r.size.w > 0 && r.size.h == scale);
+            assert_eq!(r.size.w % scale, 0);
+        }
+    }
+
+    #[test]
+    fn total_cells_match_bitmap() {
+        // Sum of rect widths (in cells) equals the count of non-space glyphs —
+        // the rasteriser drops nothing and invents nothing.
+        let (outline, fill) = cursor_overlay_rects((0.0, 0.0), 1);
+        let drawn: i32 = outline.iter().chain(fill.iter()).map(|r| r.size.w).sum();
+        let glyphs = CURSOR_BITMAP
+            .iter()
+            .map(|l| l.bytes().filter(|&b| b != b' ').count() as i32)
+            .sum::<i32>();
+        assert_eq!(drawn, glyphs);
     }
 }
 

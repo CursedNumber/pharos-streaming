@@ -180,6 +180,11 @@ object StreamHub {
     // takes effect on the NEXT dial (the v2 auth handshake sends the flag once).
     @Volatile private var gyroEnabled: Boolean = false
     @Volatile private var holdStartForCursor: Boolean = false
+    // Physical-mouse (pointer-capture) sensitivity multiplier applied to raw
+    // relative deltas before they're sent as PointerRel. A host canvas can be 4K,
+    // so 1:1 device deltas feel sluggish; default 2.5. Seeded in [init], tuned
+    // live via the Settings slider ([setMouseSensitivity]).
+    @Volatile private var mouseSensitivity: Float = 2.5f
     // Touch-pointer mode. true = absolute (tap-to-position), false = trackpad
     // (relative drag → PointerRel). Seeded in [init]; flipped live via
     // [setTouchAbsolute] (takes effect immediately, no re-dial).
@@ -334,6 +339,8 @@ object StreamHub {
             gyroEnabled = readGyroEnabledPref(this.appContext)
             touchAbsolute = readTouchAbsolutePref(this.appContext)
             holdStartForCursor = readHoldStartForCursorPref(this.appContext)
+            mouseSensitivity = readMouseSensitivityPref(this.appContext)
+            _mouseSensitivity.value = mouseSensitivity
             controllerHandling = readControllerHandlingPref(this.appContext)
             val sp = this.appContext.getSharedPreferences("trireme.settings", Context.MODE_PRIVATE)
             resTargetH = sp.getInt("res_target_h", 0)
@@ -781,6 +788,28 @@ object StreamHub {
         ctx.getSharedPreferences("trireme.settings", Context.MODE_PRIVATE)
             .getBoolean("hold_start_cursor", false)
 
+    /** Current physical-mouse sensitivity multiplier (read at input time). */
+    fun mouseSensitivity(): Float = mouseSensitivity
+
+    private val _mouseSensitivity = MutableStateFlow(2.5f)
+    val mouseSensitivityFlow: StateFlow<Float> = _mouseSensitivity.asStateFlow()
+
+    /** Persist + apply the mouse sensitivity multiplier (Settings slider). */
+    fun setMouseSensitivity(v: Float) {
+        val clamped = v.coerceIn(1.0f, 6.0f)
+        mouseSensitivity = clamped
+        _mouseSensitivity.value = clamped
+        appContext.getSharedPreferences("trireme.settings", Context.MODE_PRIVATE)
+            .edit()
+            .putFloat("mouse_sensitivity", clamped)
+            .apply()
+        Log.i(TAG, "mouse sensitivity = $clamped")
+    }
+
+    private fun readMouseSensitivityPref(ctx: Context): Float =
+        ctx.getSharedPreferences("trireme.settings", Context.MODE_PRIVATE)
+            .getFloat("mouse_sensitivity", 2.5f)
+
     /**
      * Live slot index of the controller with this VID:PID on the active session,
      * or null if none is attached locally. Lets the panel's swap-toggle row relay
@@ -1175,10 +1204,10 @@ object StreamHub {
         // Build for the remembered codec (HEVC until the first AU is sniffed; the
         // right codec on a reconnect). The first frame re-sniffs and swaps if the
         // host's codec changed.
-        // The onStats sink is wired ONLY in the debug variant — release passes null
-        // so the decoder skips it entirely (one per-second null check).
-        val statsSink: ((DecoderStats) -> Unit)? =
-            if (no.aasle.trireme.BuildConfig.DEBUG) { s -> _debugMetrics.value = s } else null
+        // The onStats sink drives the debug HUD. Wired in ALL variants now (a
+        // per-second callback is negligible) so the HUD works on the signed release
+        // APKs we deploy to the TV, gated only by the user's `debugHud` toggle.
+        val statsSink: ((DecoderStats) -> Unit) = { s -> _debugMetrics.value = s }
         val (kw, kh) = lastVideoSize ?: (0 to 0)
         decoder = runCatching {
             HevcDecoder(
