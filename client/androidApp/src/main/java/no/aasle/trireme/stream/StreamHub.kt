@@ -35,6 +35,10 @@ import uniffi.core_ffi.StreamMode
 import uniffi.core_ffi.startVideoStream
 
 private const val TAG = "TriremeHub"
+// Delay before retrying a decoder build that lost the Surface-handoff race on a
+// codec swap (see [decoderRetryPending]); the old codec's producer disconnect
+// completes well within this on MTK OMX.
+private const val DECODER_RETRY_MS = 150L
 
 // Last-deliberately-used input source, for pad-vs-pointer arbitration (mirrors the
 // desktop client's gamepad.rs/play.rs SRC_KBDMOUSE/SRC_GAMEPAD). The host turns
@@ -226,6 +230,13 @@ object StreamHub {
     // experimental VVC path.
     @Volatile private var streamMime: String = "video/hevc"
     @Volatile private var sniffed: Boolean = false
+    // A codec swap (default HEVC → the sniffed AVC/VVC) rebuilds a decoder on the
+    // SAME Surface; the just-released old decoder can still hold the Surface's
+    // producer connection for a few ms on MTK OMX (the X90J), so the new
+    // codec.configure(surface) throws `nativeWindowConnect … -22` and the stream
+    // goes black. This gates a ONE-shot delayed retry so a transient loss becomes
+    // a ~150ms hiccup instead of a dead stream. Guarded so retries never stack.
+    private var decoderRetryPending = false
 
     // --- Per-host session bookkeeping ---
     /// One connected host. `gamepad` is the FFI back-channel; `active` flips the
@@ -1101,6 +1112,9 @@ object StreamHub {
     private fun startDecoderLocked() {
         val surf = surface ?: return
         if (decoder != null) return
+        // A one-shot retry is already scheduled (a prior build lost the Surface
+        // race); don't stack a second build on top of it.
+        if (decoderRetryPending) return
         val active = activeSessionLocked() ?: return
         // Bind once the connection is up (Connecting too) so the decoder is ready
         // to consume the first frame, which is what promotes the session to Live.
@@ -1122,12 +1136,39 @@ object StreamHub {
                 initH = kh,
                 onGeometry = { w, h -> onDecoderGeometry(w, h) },
             )
-        }.getOrElse {
-            Log.e(
-                TAG,
-                "decoder create failed for $streamMime: ${it.message} — this device has no " +
-                    "usable decoder for that codec; switch the host to HEVC/AVC in the panel",
-            )
+        }.getOrElse { err ->
+            if (!decoderRetryPending) {
+                // Most likely the Surface-handoff race on a codec swap (see
+                // decoderRetryPending): the old decoder hasn't finished releasing
+                // the Surface. Retry ONCE after a short delay — by then it has. A
+                // genuinely-absent decoder (e.g. VVC on a TV without one) fails the
+                // retry too and falls through to the permanent log below.
+                decoderRetryPending = true
+                Log.w(
+                    TAG,
+                    "decoder create for $streamMime failed (${err.message}); " +
+                        "retrying in ${DECODER_RETRY_MS}ms (Surface may still be releasing)",
+                )
+                main.postDelayed({
+                    synchronized(lock) {
+                        decoderRetryPending = false
+                        if (decoder == null) {
+                            startDecoderLocked()
+                            // The IDR that drove the swap is long gone; fetch a
+                            // fresh one so the rebuilt decoder resyncs in ~1 RTT.
+                            if (decoder != null) runCatching { requestKeyframe() }
+                        }
+                    }
+                }, DECODER_RETRY_MS)
+            } else {
+                decoderRetryPending = false
+                Log.e(
+                    TAG,
+                    "decoder create failed for $streamMime after retry: ${err.message} — this " +
+                        "device has no usable decoder for that codec; switch the host to " +
+                        "HEVC/AVC in the panel",
+                )
+            }
             null
         }
     }
@@ -1155,6 +1196,8 @@ object StreamHub {
     private fun stopDecoderLocked() {
         decoder?.stop()
         decoder = null
+        // Any scheduled build-retry is moot now (we're tearing down / rebuilding).
+        decoderRetryPending = false
         // Clear the HUD metrics so it reads "no stream" rather than a stale snapshot.
         _debugMetrics.value = null
         // Re-arm sniffing so the next stream/decoder re-detects the codec.
@@ -1178,6 +1221,11 @@ object StreamHub {
             // stopDecoderLocked re-arms `sniffed`; we already consumed the sniff
             // for this stream, so keep it armed only if there's no decoder to build.
             startDecoderLocked()
+            // The freshly-swapped decoder missed the IDR that classified the codec;
+            // fetch a new one so it resyncs in ~1 RTT rather than waiting out the
+            // host's periodic IDR. (On a build that lost the Surface race, the
+            // retry path requests its own keyframe once it succeeds.)
+            if (decoder != null) runCatching { requestKeyframe() }
             sniffed = true
         }
     }
