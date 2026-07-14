@@ -817,28 +817,60 @@ fn map_decode_caps(caps: &media_decode::Capabilities) -> Vec<CapabilityUi> {
     out
 }
 
-/// AV1 client decoders surfaced on the Video tab dashboard. Marked available
-/// (the capability exists in a modern ffmpeg / on AV1-capable clients) but not
-/// yet `validated` — proving each one end-to-end is the client-decode slice.
+/// AV1 / AVC / VVC client decoders surfaced on the Video tab dashboard. Marked
+/// available (the capability exists in a modern ffmpeg / on capable clients)
+/// but not yet `validated` — proving each one end-to-end is the client-decode
+/// slice. The HEVC rows above are the genuinely-probed ones; these are
+/// reference rows so every host codec has a visible decode counterpart.
 fn av1_decode_display_rows() -> Vec<CapabilityUi> {
-    let mk = |id: &str, label: &str, vendor: &str, token: &str, rank: u8| CapabilityUi {
-        stage: PipelineStage::Decode,
-        id: id.into(),
-        label: label.into(),
-        vendor: vendor.into(),
-        codec: "AV1".into(),
-        token: token.into(),
-        available: true,
-        validated: false,
-        validated_on: None,
-        perf_rank: rank,
-        side: "client".into(),
-        detail: format!("AV1 decode via {token} (pending end-to-end validation)"),
-    };
+    let mk =
+        |id: &str, label: &str, vendor: &str, token: &str, codec: &str, rank: u8| CapabilityUi {
+            stage: PipelineStage::Decode,
+            id: id.into(),
+            label: label.into(),
+            vendor: vendor.into(),
+            codec: codec.into(),
+            token: token.into(),
+            available: true,
+            validated: false,
+            validated_on: None,
+            perf_rank: rank,
+            side: "client".into(),
+            detail: format!("{codec} decode via {token} (pending end-to-end validation)"),
+        };
     vec![
-        mk("cuvid-av1", "NVIDIA NVDEC", "NVIDIA", "av1_cuvid", 1),
-        mk("qsv-av1", "Quick Sync AV1", "Intel", "av1_qsv", 2),
-        mk("dav1d", "dav1d (software)", "VideoLAN", "libdav1d", 5),
+        mk("cuvid-av1", "NVIDIA NVDEC", "NVIDIA", "av1_cuvid", "AV1", 1),
+        mk("qsv-av1", "Quick Sync AV1", "Intel", "av1_qsv", "AV1", 2),
+        mk(
+            "dav1d",
+            "dav1d (software)",
+            "VideoLAN",
+            "libdav1d",
+            "AV1",
+            5,
+        ),
+        // AVC: hardware H.264 decode is the one truly universal capability.
+        mk(
+            "cuvid-h264",
+            "NVIDIA NVDEC",
+            "NVIDIA",
+            "h264_cuvid",
+            "AVC",
+            1,
+        ),
+        mk("qsv-h264", "Quick Sync AVC", "Intel", "h264_qsv", "AVC", 2),
+        mk("software-h264", "Software (CPU)", "CPU", "h264", "AVC", 4),
+        // VVC: hardware decode barely exists (Intel Lunar Lake); nearly every
+        // client lands on ffmpeg's native software decoder — CPU-heavy.
+        mk("qsv-vvc", "Quick Sync VVC", "Intel", "vvc_qsv", "VVC", 2),
+        mk(
+            "software-vvc",
+            "Software (native VVC)",
+            "CPU",
+            "vvc",
+            "VVC",
+            6,
+        ),
     ]
 }
 
@@ -951,6 +983,36 @@ pub fn encode_capabilities() -> Vec<CapabilityUi> {
             2,
         ),
         (
+            "nvenc-h264",
+            "NVENC AVC",
+            "NVIDIA",
+            "h264_nvenc",
+            "AVC",
+            false,
+            None,
+            1,
+        ),
+        (
+            "qsv-h264",
+            "Quick Sync AVC",
+            "Intel",
+            "h264_qsv",
+            "AVC",
+            false,
+            None,
+            2,
+        ),
+        (
+            "amf-h264",
+            "AMD AMF AVC",
+            "AMD",
+            "h264_amf",
+            "AVC",
+            false,
+            None,
+            2,
+        ),
+        (
             "software",
             "Software (libx265)",
             "CPU",
@@ -970,6 +1032,28 @@ pub fn encode_capabilities() -> Vec<CapabilityUi> {
             None,
             6,
         ),
+        (
+            "software-h264",
+            "Software (libx264)",
+            "CPU",
+            "libx264",
+            "AVC",
+            false,
+            None,
+            5,
+        ),
+        // VVC's ONLY encoder anywhere: no consumer GPU encodes H.266, so the
+        // host software-encodes via ffmpeg's libvvenc. Experimental.
+        (
+            "software-vvc",
+            "vvenc VVC (software)",
+            "Fraunhofer",
+            "libvvenc",
+            "VVC",
+            false,
+            None,
+            5,
+        ),
     ];
 
     rows.iter()
@@ -979,6 +1063,9 @@ pub fn encode_capabilities() -> Vec<CapabilityUi> {
             let available = match *id {
                 "software" => has("libx265") || has("hevc"),
                 "software-av1" => has("libsvtav1") || has("libaom-av1") || has("av1"),
+                "software-h264" => has("libx264") || has("h264"),
+                // No built-in fallback exists for VVC — libvvenc or nothing.
+                "software-vvc" => has("libvvenc"),
                 _ => has(token),
             };
             let detail = if available {

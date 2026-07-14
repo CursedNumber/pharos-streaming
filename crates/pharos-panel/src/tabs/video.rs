@@ -921,10 +921,13 @@ fn matrix(ui: &mut egui::Ui, state: &mut PanelState, show_unavailable: bool) {
         decoders.sort_by_key(|c| float_rank(c, active_key, pending_key, false));
 
         // Exactly one card per column is the active one: the first available
-        // card whose codec matches the host's live codec (encoder must also be a
-        // hardware/NVENC path — that's what the host runs).
+        // card whose codec matches the host's live codec (encoder must also be
+        // a hardware/NVENC path — that's what the host runs — EXCEPT VVC, whose
+        // only host path is the software libvvenc encoder).
         let active_enc = encoders.iter().position(|c| {
-            c.available && Some(codec_key(&c.codec)) == active_key && is_hw(&c.token)
+            c.available
+                && Some(codec_key(&c.codec)) == active_key
+                && (is_hw(&c.token) || codec_key(&c.codec) == "VVC")
         });
         let active_dec = decoders
             .iter()
@@ -947,8 +950,10 @@ fn matrix(ui: &mut egui::Ui, state: &mut PanelState, show_unavailable: bool) {
                     let is_active = Some(i) == active_enc;
                     let is_pending = pending_key == Some(codec_key(&cap.codec))
                         && active_key != Some(codec_key(&cap.codec));
+                    // Hardware-path cards drive a host codec switch; the one
+                    // software exception is VVC (libvvenc IS the host path).
                     let switchable = switch_codec_for(&cap.codec).is_some()
-                        && is_hw(&cap.token)
+                        && (is_hw(&cap.token) || codec_key(&cap.codec) == "VVC")
                         && cap.available;
                     // The encoder card shows ITS step — the encode stage — not the
                     // whole-pipeline total. Measured when this card is live and a
@@ -1089,25 +1094,31 @@ fn impact_colors() -> [Color32; 3] {
     ]
 }
 
-/// Normalise any codec string ("H.265", "hevc", "AV1", "h264") to a stable key.
+/// Normalise any codec string ("H.265", "hevc", "AVC", "h264", "VVC", "h266")
+/// to a stable abbreviation key: "HEVC" / "AV1" / "AVC" / "VVC".
 fn codec_key(codec: &str) -> &'static str {
     let c = codec.to_ascii_uppercase();
     if c.contains("AV1") {
         "AV1"
-    } else if c.contains("264") {
-        "H264"
+    } else if c.contains("264") || c.contains("AVC") {
+        "AVC"
+    } else if c.contains("266") || c.contains("VVC") {
+        "VVC"
     } else {
         "HEVC"
     }
 }
 
 /// The host video codec a card maps to when clicked, or `None` if selecting it
-/// can't drive a host switch (decoders are client-side; H.264 isn't a host
-/// encode option here). HEVC + AV1 route to `Request::SetVideoCodec`.
+/// can't drive a host switch (decoders are client-side). All four codecs route
+/// to `Request::SetVideoCodec`; the host preflights VVC (software libvvenc) and
+/// refuses with a readable error when its ffmpeg can't encode it.
 fn switch_codec_for(codec: &str) -> Option<VideoCodec> {
     match codec_key(codec) {
         "HEVC" => Some(VideoCodec::Hevc),
         "AV1" => Some(VideoCodec::Av1),
+        "AVC" => Some(VideoCodec::H264),
+        "VVC" => Some(VideoCodec::Vvc),
         _ => None,
     }
 }
@@ -1119,16 +1130,21 @@ fn is_hw(token: &str) -> bool {
         || t.contains("libsvt")
         || t.contains("libaom")
         || t.contains("dav1d")
+        || t.contains("vvenc")
+        || t.contains("vvdec")
         || t.contains("software"))
 }
 
 /// Relative GPU / CPU / Network impact (each 0..1) for the mini chart. GPU-vs-CPU
 /// is set by whether the path is hardware; Network is the codec's relative
-/// bitrate (AV1 < HEVC < H.264). A static reference profile, not live data.
+/// bitrate (VVC < AV1 < HEVC < AVC). A static reference profile, not live data.
 fn impact_profile(codec: &str, token: &str, stage: PipelineStage) -> [f32; 3] {
     let net = match codec_key(codec) {
         "AV1" => 0.38,
-        "H264" => 0.80,
+        "AVC" => 0.80,
+        // Realtime vvenc at streaming presets keeps only part of VVC's paper
+        // gain over HEVC; still the smallest stream of the four.
+        "VVC" => 0.34,
         _ => 0.55,
     };
     let (gpu, cpu) = if is_hw(token) {
@@ -1137,8 +1153,8 @@ fn impact_profile(codec: &str, token: &str, stage: PipelineStage) -> [f32; 3] {
         } else {
             (0.72, 0.15)
         }
-    } else if codec_key(codec) == "AV1" {
-        (0.05, 0.96) // software AV1 is the heaviest CPU path
+    } else if matches!(codec_key(codec), "AV1" | "VVC") {
+        (0.05, 0.96) // software AV1/VVC are the heaviest CPU paths
     } else {
         (0.06, 0.82)
     };
@@ -1220,12 +1236,16 @@ fn encode_reference_ms(token: &str) -> f32 {
         if t.contains("av1") {
             5.0
         } else {
-            4.0
+            4.0 // hevc/h264 — same NVENC latency class
         }
     } else if t.contains("qsv") || t.contains("amf") || t.contains("vaapi") {
         6.0
     } else if t.contains("svtav1") || t.contains("aom") {
         30.0
+    } else if t.contains("vvenc") {
+        45.0 // software VVC (vvenc "faster", 1080p) — the slowest encode here
+    } else if t.contains("x264") {
+        12.0 // libx264 software — much lighter than x265
     } else {
         22.0 // libx265 software
     }
@@ -1247,6 +1267,10 @@ fn decode_reference_ms(token: &str) -> f32 {
         8.0
     } else if t.contains("av1") {
         7.0 // hw av1 decode
+    } else if t.contains("vvc") || t.contains("vvdec") {
+        18.0 // software VVC decode (ffmpeg native / vvdec) — heaviest here
+    } else if t.contains("h264") {
+        6.0 // software H.264 — the lightest software decode
     } else {
         10.0 // software
     }
@@ -1262,7 +1286,11 @@ fn float_rank(
     want_hw: bool,
 ) -> u8 {
     let k = Some(codec_key(&cap.codec));
-    let is_active = cap.available && k == active_key && (!want_hw || is_hw(&cap.token));
+    // want_hw gates "active" to hardware paths in the encoder column, except
+    // VVC — its only host encoder is software (libvvenc).
+    let is_active = cap.available
+        && k == active_key
+        && (!want_hw || is_hw(&cap.token) || codec_key(&cap.codec) == "VVC");
     let is_pending = k == pending_key && k != active_key;
     if is_active {
         0
@@ -1585,21 +1613,44 @@ fn codec_cards(
     pending_key: Option<&str>,
     clicked: &mut Option<VideoCodec>,
 ) -> Option<egui::Rect> {
-    // (key, display name, mono token, perf rank, switchable, bitrate hint)
-    let codecs: [(&str, &str, &str, u8, bool, &str); 3] = [
-        ("HEVC", "H.265", "hevc · H.265", 1, true, "baseline bitrate"),
-        ("AV1", "AV1", "av1 · AV1", 1, true, "−31% bitrate vs HEVC"),
+    // (abbreviation key = the card headline, full standard name, multi.toml
+    //  value, perf rank, switchable, one-line trade-off hint)
+    let codecs: [(&str, &str, &str, u8, bool, &str); 4] = [
         (
-            "H264",
-            "H.264",
-            "h264 · H.264",
+            "HEVC",
+            "H.265 · High Efficiency Video Coding",
+            "hevc",
+            1,
+            true,
+            "The default — best balance of quality, latency, and device support",
+        ),
+        (
+            "AV1",
+            "AOMedia Video 1",
+            "av1",
+            1,
+            true,
+            "−31% bitrate vs HEVC · needs Ada+ NVENC and an AV1-capable client",
+        ),
+        (
+            "AVC",
+            "H.264 · Advanced Video Coding",
+            "h264",
             2,
-            false,
-            "+38% bitrate vs HEVC",
+            true,
+            "+38% bitrate vs HEVC · decodes on virtually every device ever made",
+        ),
+        (
+            "VVC",
+            "H.266 · Versatile Video Coding",
+            "vvc",
+            5,
+            true,
+            "Smallest stream · SOFTWARE encode (CPU-heavy) — experimental",
         ),
     ];
     let mut active_rect = None;
-    for (key, name, token, rank, switchable, hint) in codecs {
+    for (key, name, toml_value, rank, switchable, hint) in codecs {
         let is_active = active_key == Some(key);
         let is_selected = pending_key == Some(key) && !is_active;
         let stroke = if is_active {
@@ -1627,7 +1678,10 @@ fn codec_cards(
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    let mut t = RichText::new(name).strong();
+                    // Headline: the codec ABBREVIATION (HEVC/AV1/AVC/VVC) — the
+                    // name the rest of the stack (status line, logs, client
+                    // sniffer) uses; the full standard name is the line below.
+                    let mut t = RichText::new(key).strong().size(15.0);
                     if !switchable && !is_active {
                         t = t.weak();
                     }
@@ -1636,9 +1690,15 @@ fn codec_cards(
                         perf_chip(ui, rank);
                     });
                 });
+                ui.label(RichText::new(name).small().weak());
                 ui.add_space(3.0);
                 ui.label(RichText::new(hint).small().weak());
-                ui.label(RichText::new(token).monospace().small().weak());
+                ui.label(
+                    RichText::new(format!("video_codec = \"{toml_value}\""))
+                        .monospace()
+                        .small()
+                        .weak(),
+                );
                 ui.add_space(5.0);
                 ui.horizontal(|ui| {
                     let wash = ui.visuals().faint_bg_color;
@@ -1659,7 +1719,10 @@ fn codec_cards(
                             .background_color(wash),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
-                        impact_bars(ui, impact_profile(key, "hardware", PipelineStage::Encode));
+                        // VVC has no hardware encoder anywhere — its bars show
+                        // the software-encode reality, not a GPU path.
+                        let token = if key == "VVC" { "software" } else { "hardware" };
+                        impact_bars(ui, impact_profile(key, token, PipelineStage::Encode));
                     });
                 });
             })
@@ -1681,10 +1744,12 @@ fn codec_cards(
             if hit.clicked() {
                 *clicked = switch_codec_for(key);
             }
-            hit.describe(format!("{name} — click to stream this codec ({hint})."));
+            hit.describe(format!(
+                "{key} ({name}) — click to stream this codec. {hint}."
+            ));
         } else {
             resp.describe(format!(
-                "{name} — {hint}. Not a host encode option here (HEVC/AV1 only)."
+                "{key} ({name}) — {hint}. Not a host encode option here."
             ));
         }
         ui.add_space(6.0);

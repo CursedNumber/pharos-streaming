@@ -136,8 +136,8 @@ en = "CODEC"
 nb = "KODEK"
 
 ["video.col.codec_desc"]
-en = "The video codec on the wire — the middle of the pipeline. Transport is always QUIC (TLS 1.3, congestion-controlled), so it isn't a choice; the codec is. HEVC is active today; the pipeline is structured so H.264 and AV1 can slot in."
-nb = "Videokodeken på ledningen — midten av pipelinen. Transporten er alltid QUIC (TLS 1.3, med overbelastningskontroll), så den er ikke et valg; det er kodeken. HEVC er aktiv i dag; pipelinen er bygd slik at H.264 og AV1 kan settes inn."
+en = "The video codec on the wire — the middle of the pipeline. Transport is always QUIC (TLS 1.3, congestion-controlled), so it isn't a choice; the codec is. Four are on offer: HEVC (the default), AV1 (smaller streams, Ada+ NVENC), AVC/H.264 (largest streams, universal device compatibility), and VVC/H.266 (smallest streams, experimental software encode). Click a card to switch the host live."
+nb = "Videokodeken på ledningen — midten av pipelinen. Transporten er alltid QUIC (TLS 1.3, med overbelastningskontroll), så den er ikke et valg; det er kodeken. Fire tilbys: HEVC (standard), AV1 (mindre strømmer, Ada+ NVENC), AVC/H.264 (størst strømmer, universell enhetskompatibilitet) og VVC/H.266 (minst strømmer, eksperimentell programvareenkoding). Klikk et kort for å bytte verten direkte."
 
 # --- codecs (the middle column) ---------------------------------------------
 ["video.codec.hevc"]
