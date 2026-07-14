@@ -114,6 +114,10 @@ fun SettingsPane(onOpenControllers: () -> Unit = {}) {
     var gyroOn by remember { mutableStateOf(StreamHub.isGyroEnabled()) }
     // Touch-pointer mode (absolute vs trackpad). Applies immediately — no re-dial.
     var touchAbs by remember { mutableStateOf(StreamHub.isTouchAbsolute()) }
+    // Controller-as-cursor: the manual on/off (tracks the shared StateFlow so the
+    // on-screen indicator stays in sync), and the hold-Start trigger option.
+    val cursorOn by StreamHub.cursorMode.collectAsState()
+    var holdStartCursor by remember { mutableStateOf(StreamHub.isHoldStartForCursor()) }
 
     // Master switches (both default off). USB/IP is persisted in UsbStore; controller
     // handling lives in StreamHub (which rebuilds the live ControllerManager on change).
@@ -303,6 +307,31 @@ fun SettingsPane(onOpenControllers: () -> Unit = {}) {
                 val next = !touchAbs
                 touchAbs = next
                 StreamHub.setTouchAbsolute(next)
+            },
+        )
+
+        // --- Controller as cursor: manual on/off + the hold-Start trigger ---
+        // For mouse-driven UIs (a game launcher, a menu, the desktop) on a TV with
+        // no touchscreen. Right stick moves the host cursor, A = left / B = right
+        // click. Applies immediately.
+        SettingRow(
+            title = "Controller as cursor",
+            summary = "Right stick moves the host mouse; A = left click, B = right click. " +
+                "For launcher dialogs and menus on a TV with no touchscreen.",
+            trailing = if (cursorOn) "On" else "Off",
+            state = if (cursorOn) "On" else "Off",
+            onClick = { StreamHub.setCursorMode(!cursorOn) },
+        )
+        SettingRow(
+            title = "Hold Start for cursor",
+            summary = "While held, Start turns the controller into a cursor momentarily " +
+                "(released on let-go). Turn off to keep Start as a normal pad button.",
+            trailing = if (holdStartCursor) "On" else "Off",
+            state = if (holdStartCursor) "On" else "Off",
+            onClick = {
+                val next = !holdStartCursor
+                holdStartCursor = next
+                StreamHub.setHoldStartForCursor(next)
             },
         )
 

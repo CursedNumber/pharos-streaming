@@ -274,6 +274,58 @@ impl State {
         self.app_surfaces.retain(|_, s| live.contains(s));
     }
 
+    /// Center each mapped toplevel on its output when it renders SMALLER than the
+    /// output — a fixed-size dialog (e.g. Cyberpunk's REDprelauncher) that ignored
+    /// the fullscreen configure would otherwise sit in the output's top-left corner
+    /// (`new_toplevel` maps at the output origin). A fullscreen app whose geometry
+    /// equals the output size gets a zero offset, so this is a no-op for the common
+    /// case. Called once per frame after `space.refresh()`; re-mapping to the same
+    /// location is cheap, so it's idempotent and self-correcting as the dialog
+    /// resizes. Per-output so an `extend` layout centers each stream independently.
+    pub fn center_windows(&mut self) {
+        let outputs: Vec<(i32, i32, i32, i32)> = self
+            .space
+            .outputs()
+            .filter_map(|o| {
+                self.space
+                    .output_geometry(o)
+                    .map(|g| (g.loc.x, g.loc.y, g.size.w, g.size.h))
+            })
+            .collect();
+        if outputs.is_empty() {
+            return;
+        }
+        // Snapshot (window, current loc, rendered size) so we don't borrow the
+        // space while re-mapping below.
+        let windows: Vec<(Window, i32, i32, i32, i32)> = self
+            .space
+            .elements()
+            .filter_map(|w| {
+                let loc = self.space.element_location(w)?;
+                let sz = w.geometry().size;
+                Some((w.clone(), loc.x, loc.y, sz.w, sz.h))
+            })
+            .collect();
+        for (w, lx, ly, sw, sh) in windows {
+            if sw <= 0 || sh <= 0 {
+                continue; // not presenting a real buffer yet
+            }
+            // The output this window currently sits on (its loc falls within),
+            // else the first output.
+            let (ox, oy, ow, oh) = outputs
+                .iter()
+                .copied()
+                .find(|&(x, y, w2, h2)| lx >= x && lx < x + w2 && ly >= y && ly < y + h2)
+                .unwrap_or(outputs[0]);
+            // Center, clamped so an oversized window never pushes off the top-left.
+            let cx = ox + ((ow - sw) / 2).max(0);
+            let cy = oy + ((oh - sh) / 2).max(0);
+            if (cx, cy) != (lx, ly) {
+                self.space.map_element(w, (cx, cy), false);
+            }
+        }
+    }
+
     fn init_wayland_listener(
         display: Display<State>,
         event_loop: &mut EventLoop<CalloopData>,

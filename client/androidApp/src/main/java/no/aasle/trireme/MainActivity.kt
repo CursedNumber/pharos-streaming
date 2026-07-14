@@ -167,6 +167,57 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     private var tScrolling = false // two-finger scroll active
     private var tScrollLastY = 0f
     private var tPressed = false // a left button is held down (absolute drag)
+    // --- Controller-as-cursor state ---
+    // When active (the Settings toggle OR Start held with the option on), the right
+    // stick drives the host cursor via a ~60Hz ticker (a held stick fires only one
+    // motion event, so a poll loop is needed) and A/B become left/right click. The
+    // ticker runs only while active, so it's zero-cost otherwise.
+    private var startHeldForCursor = false // Start currently held with the option on
+    @Volatile private var rStickX = 0f
+    @Volatile private var rStickY = 0f
+    private val cursorHandler by lazy { Handler(Looper.getMainLooper()) }
+    private var cursorTickerRunning = false
+    // Host cursor pixels per tick at full stick deflection (~60Hz → ~840 px/s).
+    private val cursorSpeed = 14f
+    private val cursorDeadzone = 0.12f
+
+    private fun cursorActive(): Boolean = StreamHub.isCursorMode() || startHeldForCursor
+
+    private fun ensureCursorTicker() {
+        if (cursorTickerRunning || !cursorActive()) return
+        cursorTickerRunning = true
+        val tick = object : Runnable {
+            override fun run() {
+                if (!cursorActive() || !StreamHub.hasActiveSession() ||
+                    navMode.value != NavMode.Hidden
+                ) {
+                    cursorTickerRunning = false
+                    return
+                }
+                val x = rStickX
+                val y = rStickY
+                val mag = kotlin.math.hypot(x, y)
+                if (mag > cursorDeadzone) {
+                    // Rescale past the deadzone so slow movement stays precise, and
+                    // square the magnitude for finer control near center.
+                    val scaled = ((mag - cursorDeadzone) / (1f - cursorDeadzone)).coerceIn(0f, 1f)
+                    val f = scaled * scaled / mag * cursorSpeed
+                    StreamHub.pointerRel(x * f, y * f)
+                }
+                cursorHandler.postDelayed(this, 16L)
+            }
+        }
+        cursorHandler.post(tick)
+    }
+
+    // --- USB-mouse → host pointer state ---
+    // A mouse connected to the TV drives the host cursor directly (absolute over
+    // the video rect). Android splits mouse input awkwardly — hover comes via
+    // generic-motion, drags via the touch pipeline, buttons via a bitmask on both
+    // — so one forwardMouse() handles all three; this tracks the last button
+    // bitmask so a press and release each fire exactly once.
+    private var lastMouseButtons = 0
+
     // Trackpad advanced gestures (desktop-only): long-press → right-click,
     // double-tap-hold → left-drag. All driven from handleTrackpadTouch.
     private val touchHandler by lazy { Handler(Looper.getMainLooper()) }
@@ -326,9 +377,42 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         val comboOpen = down &&
             (kc == KeyEvent.KEYCODE_BUTTON_START || kc == KeyEvent.KEYCODE_BUTTON_SELECT) &&
             startDown && selectDown
+        // Always release the hold-Start cursor trigger on Start-up, whatever the
+        // navbar state, so it can never latch on after a combo raised the navbar.
+        if (kc == KeyEvent.KEYCODE_BUTTON_START && up) startHeldForCursor = false
 
         if (navMode.value == NavMode.Hidden) {
             // --- Stream (navbar HIDDEN) ---
+            // Controller-as-cursor input runs BEFORE the pad forwarding below, so A/B/
+            // Start drive the host cursor instead of the game pad while it's active.
+            //   • Hold Start (Artemis-style, gated by the Settings option) activates
+            //     the cursor while held; consumed so it never reaches the pad. The
+            //     Start+Select navbar combo still works (it fires on the Select event),
+            //     so Start is skipped here when Select is already down.
+            if (kc == KeyEvent.KEYCODE_BUTTON_START && StreamHub.isHoldStartForCursor() && !selectDown) {
+                if (down && event.repeatCount == 0) {
+                    startHeldForCursor = true
+                    ensureCursorTicker()
+                }
+                return true
+            }
+            //   • While cursor mode is active, A = left click, B = right click.
+            //     Consume ALL A/B events (incl. held repeats) so they never leak to
+            //     the pad; the button edge fires on the first down and the up.
+            if (cursorActive()) {
+                when (kc) {
+                    KeyEvent.KEYCODE_BUTTON_A -> {
+                        if (down && event.repeatCount == 0) StreamHub.pointerButton(0, true)
+                        else if (up) StreamHub.pointerButton(0, false)
+                        return true
+                    }
+                    KeyEvent.KEYCODE_BUTTON_B -> {
+                        if (down && event.repeatCount == 0) StreamHub.pointerButton(1, true)
+                        else if (up) StreamHub.pointerButton(1, false)
+                        return true
+                    }
+                }
+            }
             // Forward to the active session FIRST: ControllerManager only consumes
             // input from a REGISTERED gamepad (incl. its d-pad → host hat axes), so a
             // connected pad's DPAD_LEFT/UP reaches the game instead of being eaten by
@@ -441,10 +525,62 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     }
 
     override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
-        // Don't steer the host with the sticks while the navbar is up.
+        // Don't steer the host with the sticks / mouse while the navbar is up.
         if (navMode.value != NavMode.Hidden) return super.dispatchGenericMotionEvent(event)
+        // A USB mouse connected to the TV drives the host cursor (hover motion,
+        // button press/release, and scroll all arrive here as generic motion).
+        if (event.isFromSource(android.view.InputDevice.SOURCE_MOUSE) && forwardMouse(event)) {
+            return true
+        }
+        // Controller-as-cursor: capture the right stick (AXIS_Z/RZ — the same axes
+        // ControllerManager maps to the pad's right stick) for the cursor ticker.
+        // Still forward the event to the pad: a mouse-UI launcher ignores the pad,
+        // and suppressing only the right stick would need per-axis surgery for no
+        // real benefit here.
+        if (cursorActive() && event.isFromSource(android.view.InputDevice.SOURCE_JOYSTICK)) {
+            rStickX = event.getAxisValue(MotionEvent.AXIS_Z)
+            rStickY = event.getAxisValue(MotionEvent.AXIS_RZ)
+            ensureCursorTicker()
+        }
         if (StreamHub.dispatchControllerMotion(event)) return true
         return super.dispatchGenericMotionEvent(event)
+    }
+
+    /** Forward one mouse MotionEvent to the host pointer: absolute position over the
+     *  video content rect, button press/release (diffed from the button bitmask so
+     *  each edge fires once), and wheel scroll. Called from BOTH the generic-motion
+     *  path (hover, button events) and [onStreamTouch] (a drag with a button held,
+     *  which Android routes through the touch pipeline). Returns true when consumed. */
+    private fun forwardMouse(event: MotionEvent): Boolean {
+        if (!StreamHub.hasActiveSession()) return false
+        if (event.actionMasked == MotionEvent.ACTION_SCROLL) {
+            val h = event.getAxisValue(MotionEvent.AXIS_HSCROLL)
+            val v = event.getAxisValue(MotionEvent.AXIS_VSCROLL)
+            StreamHub.pointerScroll(h, v)
+            return true
+        }
+        // Position → absolute, normalised over the letterboxed video rect (bars
+        // clamp to the edges rather than being ignored, so a click never no-ops).
+        contentRect()?.let { r ->
+            if (r[2] > 0f && r[3] > 0f) {
+                val nx = ((event.x - r[0]) / r[2]).coerceIn(0f, 1f)
+                val ny = ((event.y - r[1]) / r[3]).coerceIn(0f, 1f)
+                StreamHub.pointerAbs(nx, ny)
+            }
+        }
+        val nb = event.buttonState
+        if (nb != lastMouseButtons) {
+            fun edge(mask: Int, hostButton: Int) {
+                val was = (lastMouseButtons and mask) != 0
+                val now = (nb and mask) != 0
+                if (was != now) StreamHub.pointerButton(hostButton, now)
+            }
+            edge(MotionEvent.BUTTON_PRIMARY, 0) // left
+            edge(MotionEvent.BUTTON_SECONDARY, 1) // right
+            edge(MotionEvent.BUTTON_TERTIARY, 2) // middle
+            lastMouseButtons = nb
+        }
+        return true
     }
 
     // ============================================================
@@ -481,6 +617,12 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
      *  gestures. `Activity.onTouchEvent` can't be used: the ComposeView consumes the
      *  events before they reach the Activity. Returns true to consume. */
     fun onStreamTouch(event: MotionEvent): Boolean {
+        // A mouse's button-held DRAG lands here (Android routes it through the touch
+        // pipeline, not generic-motion). Forward it as mouse, NOT as a finger touch,
+        // so the two input models never fight over the host cursor.
+        if (event.isFromSource(android.view.InputDevice.SOURCE_MOUSE)) {
+            return forwardMouse(event)
+        }
         // Always release a held button on UP/CANCEL, so it never sticks on the host.
         val a = event.actionMasked
         if ((a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) && tPressed) {

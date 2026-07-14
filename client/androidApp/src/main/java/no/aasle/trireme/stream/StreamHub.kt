@@ -179,6 +179,7 @@ object StreamHub {
     // because nothing on the wire asks for it. Flipped live via [setGyroEnabled];
     // takes effect on the NEXT dial (the v2 auth handshake sends the flag once).
     @Volatile private var gyroEnabled: Boolean = false
+    @Volatile private var holdStartForCursor: Boolean = true
     // Touch-pointer mode. true = absolute (tap-to-position), false = trackpad
     // (relative drag → PointerRel). Seeded in [init]; flipped live via
     // [setTouchAbsolute] (takes effect immediately, no re-dial).
@@ -332,6 +333,7 @@ object StreamHub {
             paceOverride = readPacePref(this.appContext)
             gyroEnabled = readGyroEnabledPref(this.appContext)
             touchAbsolute = readTouchAbsolutePref(this.appContext)
+            holdStartForCursor = readHoldStartForCursorPref(this.appContext)
             controllerHandling = readControllerHandlingPref(this.appContext)
             val sp = this.appContext.getSharedPreferences("trireme.settings", Context.MODE_PRIVATE)
             resTargetH = sp.getInt("res_target_h", 0)
@@ -744,6 +746,40 @@ object StreamHub {
     private fun readTouchAbsolutePref(ctx: Context): Boolean =
         ctx.getSharedPreferences("trireme.settings", Context.MODE_PRIVATE)
             .getBoolean("touch_absolute", true)
+
+    // --- Controller-as-cursor (for mouse-driven UIs like the Cyberpunk launcher
+    // on a TV that has no touchscreen) ---
+    // The manual on/off toggle, a StateFlow so the Settings pane and the on-screen
+    // cursor indicator both track it. MainActivity ORs this with the momentary
+    // hold-Start trigger to decide whether the right stick drives the host cursor.
+    private val _cursorMode = MutableStateFlow(false)
+    val cursorMode: StateFlow<Boolean> = _cursorMode.asStateFlow()
+
+    /** Manually turn controller-as-cursor on/off (Settings toggle). */
+    fun setCursorMode(on: Boolean) {
+        _cursorMode.value = on
+        Log.i(TAG, "controller-as-cursor (manual) = $on")
+    }
+
+    fun isCursorMode(): Boolean = _cursorMode.value
+
+    /** Whether holding Start momentarily activates controller-as-cursor (the
+     *  Artemis-style trigger). Read at input time by MainActivity. */
+    fun isHoldStartForCursor(): Boolean = holdStartForCursor
+
+    /** Persist + apply the hold-Start-for-cursor option. */
+    fun setHoldStartForCursor(on: Boolean) {
+        holdStartForCursor = on
+        appContext.getSharedPreferences("trireme.settings", Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean("hold_start_cursor", on)
+            .apply()
+        Log.i(TAG, "hold-Start-for-cursor = $on")
+    }
+
+    private fun readHoldStartForCursorPref(ctx: Context): Boolean =
+        ctx.getSharedPreferences("trireme.settings", Context.MODE_PRIVATE)
+            .getBoolean("hold_start_cursor", true)
 
     /**
      * Live slot index of the controller with this VID:PID on the active session,

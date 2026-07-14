@@ -3254,6 +3254,10 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
         // winewayland throwaway toplevel) so a later Switch-To can't raise a dead
         // surface. Cheap: no-op unless app_surfaces is non-empty.
         data.state.sweep_app_surfaces();
+        // Center any fixed-size dialog that ignored the fullscreen configure (e.g.
+        // Cyberpunk's REDprelauncher) instead of leaving it in the output's
+        // top-left corner. No-op for a fullscreen app (size == output).
+        data.state.center_windows();
         framing.dispatch += stage.mark();
 
         // Drain panel control commands (non-blocking). Each carries a oneshot
