@@ -78,6 +78,9 @@ pub mod multi;
 pub mod mirror_input;
 pub mod nvenc;
 pub mod pairing;
+// Software encode via an ffmpeg subprocess (VVC/libvvenc — no consumer GPU
+// encodes H.266, so `video_codec = "vvc"` bypasses NVENC entirely).
+pub mod swenc;
 // Desktop-mirror capture (mirror the user's real desktop via the
 // xdg-desktop-portal + PipeWire); on by default on Linux (issue #6).
 #[cfg(feature = "portal-mirror")]

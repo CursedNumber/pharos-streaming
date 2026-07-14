@@ -45,9 +45,9 @@ use cudarc::driver::result as curesult;
 use cudarc::driver::CudaContext;
 use nvidia_video_codec_sdk::sys::nvEncodeAPI::{
     NV_ENC_BUFFER_FORMAT::{NV_ENC_BUFFER_FORMAT_ABGR, NV_ENC_BUFFER_FORMAT_ABGR10},
-    NV_ENC_CODEC_AV1_GUID, NV_ENC_CODEC_HEVC_GUID, NV_ENC_INPUT_RESOURCE_TYPE,
-    NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_PARAMS_HEVC, NV_ENC_PIC_TYPE, NV_ENC_PRESET_P4_GUID,
-    NV_ENC_SEI_PAYLOAD, NV_ENC_TUNING_INFO,
+    NV_ENC_CODEC_AV1_GUID, NV_ENC_CODEC_H264_GUID, NV_ENC_CODEC_HEVC_GUID,
+    NV_ENC_INPUT_RESOURCE_TYPE, NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_PARAMS_HEVC, NV_ENC_PIC_TYPE,
+    NV_ENC_PRESET_P4_GUID, NV_ENC_SEI_PAYLOAD, NV_ENC_TUNING_INFO,
 };
 use nvidia_video_codec_sdk::{
     Bitstream, CodecPictureParams, EncodePictureParams, Encoder, EncoderInitParams, ErrorKind,
@@ -100,9 +100,11 @@ pub struct MultiCfg {
     /// is documentation/round-trip only unless those are absent.
     #[serde(default)]
     pub mode: Option<String>,
-    /// Video codec for every output's NVENC session (HEVC default; AV1 on Ada+).
-    /// The panel switches this via a sidecar override applied in
-    /// [`load_multi_config`], so the choice survives the relaunch that applies it.
+    /// Video codec for every output's encode session (HEVC default; AV1 on
+    /// Ada+; AVC/H.264 for legacy clients; VVC/H.266 experimental — software
+    /// encode via ffmpeg/libvvenc, since no GPU encodes it). The panel switches
+    /// this via a sidecar override applied in [`load_multi_config`], so the
+    /// choice survives the relaunch that applies it.
     #[serde(default)]
     pub video_codec: VideoCodec,
     /// W3b: opt-in target encoder bitrate (kbit/s) for every output's NVENC session.
@@ -205,7 +207,9 @@ fn read_codec_override(config_path: &Path) -> Option<VideoCodec> {
     let s = std::fs::read_to_string(codec_sidecar(config_path)).ok()?;
     match s.trim().to_ascii_lowercase().as_str() {
         "av1" => Some(VideoCodec::Av1),
-        "hevc" => Some(VideoCodec::Hevc),
+        "hevc" | "h265" => Some(VideoCodec::Hevc),
+        "avc" | "h264" => Some(VideoCodec::H264),
+        "vvc" | "h266" => Some(VideoCodec::Vvc),
         _ => None,
     }
 }
@@ -251,15 +255,13 @@ impl Drop for CudaBuf {
     }
 }
 
-#[allow(dead_code)] // `_session` field is held to keep its borrowers alive.
+#[allow(dead_code)] // the Nvenc backend's `_session` is held to keep its borrowers alive.
 struct Pipeline {
-    // Drop order is the field-declaration order. Keep these three in this exact
-    // order: bitstreams reference session; reg references session; _session
-    // owns the encoder. cuda_buf drops last so the unregister (in `reg`'s
-    // drop) happens while the device pointer is still valid.
-    bitstreams: Vec<Bitstream<'static>>,
-    reg: RegisteredResource<'static, ()>,
-    _session: Box<Session>,
+    // Drop order is the field-declaration order: the backend (whose NVENC
+    // variant holds the self-referential session chain) drops before cuda_buf,
+    // so the unregister (in the NVENC `reg`'s drop) happens while the device
+    // pointer is still valid.
+    backend: EncodeBackend,
     cuda_buf: CudaBuf,
 
     // Per-output rendering state.
@@ -269,7 +271,6 @@ struct Pipeline {
     output: Output,
     target: GlesTexture,
     damage: OutputDamageTracker,
-    num_bufs: usize,
     name: String,
     addr_label: String,
 
@@ -313,6 +314,22 @@ struct Pipeline {
     /// switch in `run_capture_zc_multi`.
     #[cfg(feature = "portal-mirror")]
     source: CaptureSource,
+}
+
+/// The per-output encoder a [`Pipeline`] feeds. HEVC/AV1/AVC run on NVENC
+/// (zero-copy from the CUDA linear buffer); VVC — which no GPU encodes — runs
+/// on the software `swenc` path (device→host readback into ffmpeg/libvvenc).
+enum EncodeBackend {
+    Nvenc {
+        // Drop order is the field-declaration order. Keep these three in this
+        // exact order: bitstreams reference session; reg references session;
+        // _session owns the encoder.
+        bitstreams: Vec<Bitstream<'static>>,
+        reg: RegisteredResource<'static, ()>,
+        _session: Box<Session>,
+        num_bufs: usize,
+    },
+    Soft(crate::swenc::SoftEncoder),
 }
 
 impl Pipeline {
@@ -825,11 +842,15 @@ fn reconcile_redirect_marker(pipelines: &[Option<Pipeline>], socket_name: &std::
 /// The CUDA device buffer (cuda_buf) and Smithay output/target/damage are
 /// kept; only the NVENC chain is rebuilt — that's what gives the next
 /// `encode_picture` call a clean picture-0 IDR.
-/// NVENC encode GUID for a [`VideoCodec`].
+/// NVENC encode GUID for a [`VideoCodec`]. Only call for NVENC codecs
+/// (`codec.is_nvenc()`): VVC has no NVENC GUID — the pipeline builder routes it
+/// to the software backend (`swenc`) before ever asking for one.
 fn codec_encode_guid(codec: VideoCodec) -> nvidia_video_codec_sdk::sys::nvEncodeAPI::GUID {
     match codec {
         VideoCodec::Av1 => NV_ENC_CODEC_AV1_GUID,
         VideoCodec::Hevc => NV_ENC_CODEC_HEVC_GUID,
+        VideoCodec::H264 => NV_ENC_CODEC_H264_GUID,
+        VideoCodec::Vvc => unreachable!("VVC is not an NVENC codec (software swenc path)"),
     }
 }
 
@@ -862,10 +883,10 @@ fn vbv_buffer_frames() -> u32 {
 
 /// Apply the codec-specific low-latency knobs onto a fresh preset config: a
 /// periodic IDR (see `idr_period_frames`) plus per-keyframe parameter-set
-/// repetition. HEVC repeats VPS/SPS/PPS (`repeatSPSPPS`); AV1 repeats the
-/// sequence-header OBU (`repeatSeqHdr`). `cfg` must be the preset returned by
-/// `get_preset_config` for this codec's GUID, so the active union variant
-/// matches the codec.
+/// repetition. HEVC repeats VPS/SPS/PPS (`repeatSPSPPS`); H.264 repeats SPS/PPS
+/// (same flag name in its config struct); AV1 repeats the sequence-header OBU
+/// (`repeatSeqHdr`). `cfg` must be the preset returned by `get_preset_config`
+/// for this codec's GUID, so the active union variant matches the codec.
 fn apply_codec_lowlatency(
     cfg: &mut nvidia_video_codec_sdk::sys::nvEncodeAPI::NV_ENC_CONFIG,
     codec: VideoCodec,
@@ -881,6 +902,13 @@ fn apply_codec_lowlatency(
                 cfg.encodeCodecConfig.hevcConfig.set_repeatSPSPPS(1);
             }
         }
+        VideoCodec::H264 => {
+            cfg.encodeCodecConfig.h264Config.idrPeriod = idr;
+            // SAFETY: the union is the H.264 variant (NV_ENC_CODEC_H264_GUID).
+            unsafe {
+                cfg.encodeCodecConfig.h264Config.set_repeatSPSPPS(1);
+            }
+        }
         VideoCodec::Av1 => {
             cfg.encodeCodecConfig.av1Config.idrPeriod = idr;
             // SAFETY: the union is the AV1 variant (NV_ENC_CODEC_AV1_GUID).
@@ -888,6 +916,9 @@ fn apply_codec_lowlatency(
                 cfg.encodeCodecConfig.av1Config.set_repeatSeqHdr(1);
             }
         }
+        // VVC never reaches NVENC config: the software path sets its own
+        // periodic IDR on the ffmpeg command line (`-g`).
+        VideoCodec::Vvc => {}
     }
 }
 
@@ -923,7 +954,10 @@ fn apply_hdr10(
             }
         }
         // AV1 10-bit HDR is a separate profile/signalling path — not wired yet.
-        VideoCodec::Av1 => {}
+        // H.264 has no practical HDR10 profile (High-10 has no HW decode), and
+        // the software VVC path is 8-bit RGBA readback — both stay SDR (the
+        // startup gate warns and clears `hdr` before this is ever called).
+        VideoCodec::Av1 | VideoCodec::H264 | VideoCodec::Vvc => {}
     }
 }
 
@@ -1122,14 +1156,26 @@ fn reconfigure_all_bitrate(
     for slot in pipelines.iter() {
         if let Some(p) = slot.as_ref() {
             if p.streamer.is_some() {
-                if let Err(e) = p._session.reconfigure_bitrate(
-                    NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_VBR,
-                    avg_bps,
-                    max_bps,
-                    vbv,
-                    force_idr,
-                ) {
-                    tracing::warn!("reconfigure bitrate: {e:?}");
+                match &p.backend {
+                    EncodeBackend::Nvenc { _session, .. } => {
+                        if let Err(e) = _session.reconfigure_bitrate(
+                            NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_VBR,
+                            avg_bps,
+                            max_bps,
+                            vbv,
+                            force_idr,
+                        ) {
+                            tracing::warn!("reconfigure bitrate: {e:?}");
+                        }
+                    }
+                    EncodeBackend::Soft(_) => {
+                        // An ffmpeg pipe has no live-reconfigure channel; the
+                        // software (VVC) session keeps its spawn-time bitrate.
+                        tracing::debug!(
+                            "reconfigure bitrate skipped on '{}' (software encoder)",
+                            p.name
+                        );
+                    }
                 }
             }
         }
@@ -1265,7 +1311,18 @@ fn apply_coded_resolution(p: &mut Pipeline, cw: u32, ch: u32) {
     if (cw, ch) == (p.coded_w, p.coded_h) {
         return;
     }
-    match p._session.reconfigure_resolution(cw, ch) {
+    let EncodeBackend::Nvenc { _session, .. } = &p.backend else {
+        // The software (VVC) encoder is spawned at a fixed size — an ffmpeg
+        // rawvideo pipe can't change frame geometry mid-stream. The ladder
+        // rung simply doesn't move; bandwidth pressure falls to bitrate RC.
+        tracing::debug!(
+            target: "compositor::res",
+            "output={} coded-resolution change skipped (software encoder)",
+            p.name
+        );
+        return;
+    };
+    match _session.reconfigure_resolution(cw, ch) {
         Ok(()) => {
             p.coded_w = cw;
             p.coded_h = ch;
@@ -1299,14 +1356,11 @@ fn rebuild_pipeline_session(
     codec: VideoCodec,
 ) -> Result<Pipeline> {
     use std::ffi::c_void;
-    // Drop the old NVENC chain in the correct order: bitstreams first
-    // (each borrows from _session), then reg (also borrows from _session),
-    // then _session itself. Vec::clear runs Drop for every element.
-    p.bitstreams.clear();
-    // RegisteredResource and Session don't implement Default, so we can't
-    // mem::take them out. Instead, swap a freshly-built Pipeline's bits
-    // into `p` — but to build those bits we need the same dptr, which we
-    // do still own. We work around by:
+    // NVENC-only (the VVC software backend has no session to rebuild). The old
+    // chain drops in the correct order — bitstreams first (each borrows from
+    // _session), then reg, then _session itself: the EncodeBackend::Nvenc
+    // field order — when `p.backend` is overwritten at the end. To build the
+    // new bits we need the same dptr, which we do still own. We work by:
     //   1. building the new session into a Box,
     //   2. transmuting a 'static ref out of it,
     //   3. building new reg + bitstreams against the new session,
@@ -1358,13 +1412,14 @@ fn rebuild_pipeline_session(
             p.pitch,
         )
         .map_err(|e| anyhow::anyhow!("register [{}]: {e:?}", p.name))?;
-    // Move the new chain in; the old session/reg drop here, with no
-    // borrowed `Bitstream`s outstanding (we cleared them above) and no
-    // `RegisteredResource` outstanding either (we're about to overwrite it).
-    p.reg = new_reg;
-    p._session = new_session;
-    p.bitstreams = new_bitstreams;
-    p.num_bufs = num_bufs;
+    // Move the new chain in; the old bitstreams/reg/session drop here, in
+    // EncodeBackend::Nvenc field-declaration order (bitstreams → reg → session).
+    p.backend = EncodeBackend::Nvenc {
+        bitstreams: new_bitstreams,
+        reg: new_reg,
+        _session: new_session,
+        num_bufs,
+    };
     Ok(p)
 }
 
@@ -2204,9 +2259,10 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
     let hdr = std::env::var_os("PHAROS_HDR").is_some()
         && match cfg.video_codec {
             VideoCodec::Hevc => true,
-            VideoCodec::Av1 => {
+            other => {
                 tracing::warn!(
-                    "PHAROS_HDR set but codec is AV1 — HDR10 wired for HEVC only; staying SDR"
+                    "PHAROS_HDR set but codec is {} — HDR10 wired for HEVC only; staying SDR",
+                    other.label()
                 );
                 false
             }
@@ -2321,106 +2377,150 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
             renderer.create_buffer(target_fourcc, (oc.w as i32, oc.h as i32).into())?;
         let damage = OutputDamageTracker::from_output(&output);
 
-        // NVENC: one Encoder + Session per output. start_session(self) consumes
-        // the Encoder, so the Session is fully owned.
-        let encoder = Encoder::initialize_with_cuda(cuda.clone())
-            .map_err(|e| anyhow::anyhow!("nvenc init [{}]: {e:?}", oc.name))?;
-        // Codec is global to the config (HEVC default, AV1 on Ada+); the GUID
-        // picks the union variant `apply_codec_lowlatency` then configures.
-        let encode_guid = codec_encode_guid(cfg.video_codec);
-        let preset_guid = NV_ENC_PRESET_P4_GUID;
-        let tuning = NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
-        let mut preset_config = encoder
-            .get_preset_config(encode_guid, preset_guid, tuning)
-            .map_err(|e| anyhow::anyhow!("preset [{}]: {e:?}", oc.name))?;
-        // Cap the GOP + IDR period (see `idr_period_frames`) so a client that
-        // reconnects mid-stream resumes decoding without a session-rebuild
-        // dance. The default for ULTRA_LOW_LATENCY is effectively "infinite"
-        // — fine for a single fixed connection, wrong for the multi-shot
-        // streamer. gopLength governs intra-distance; `apply_codec_lowlatency`
-        // sets the codec's IDR period + parameter-set repetition (HEVC
-        // VPS/SPS/PPS, AV1 sequence-header OBU) so the reconnecting decoder
-        // gets the headers an IDR/keyframe alone lacks.
-        preset_config.presetCfg.gopLength = idr_period_frames(cfg.fps);
-        preset_config.presetCfg.frameIntervalP = 1;
-        apply_codec_lowlatency(&mut preset_config.presetCfg, cfg.video_codec, cfg.fps);
-        if hdr {
-            apply_hdr10(&mut preset_config.presetCfg, cfg.video_codec);
-        }
-        // W3b: opt-in explicit rate control. Without a configured target the preset's
-        // heuristic RC is kept (today's behavior). With one, cap the bitrate so a high
-        // res/fps stream can't outrun the bounded QUIC flow window (PHAROS_STREAM_WINDOW_KB)
-        // — the ~2s-backlog recipe. CBR when only an average is set; capped-VBR when a
-        // higher ceiling is given. VBV is a few frames deep (`vbv_buffer_frames`) so
-        // it can absorb an IDR-sized spike instead of underflowing into blockiness.
-        if let Some((avg_kbps, max_kbps)) = resolve_rc_bitrate(cfg) {
-            let rc = &mut preset_config.presetCfg.rcParams;
-            let capped_vbr = max_kbps > avg_kbps;
-            rc.rateControlMode = if capped_vbr {
-                NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_VBR
-            } else {
-                NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR
-            };
-            rc.averageBitRate = avg_kbps.saturating_mul(1000);
-            rc.maxBitRate = max_kbps.saturating_mul(1000);
-            rc.vbvBufferSize =
-                (rc.averageBitRate / cfg.fps.max(1)).saturating_mul(vbv_buffer_frames());
-            rc.vbvInitialDelay = rc.vbvBufferSize;
-            info!(
-                "nvenc RC [{}]: {} avg={}kbps max={}kbps vbv={}B",
-                oc.name,
-                if capped_vbr { "capped-VBR" } else { "CBR" },
-                avg_kbps,
-                max_kbps,
-                rc.vbvBufferSize,
-            );
-        }
-        let mut init = EncoderInitParams::new(encode_guid, oc.w, oc.h);
-        init.preset_guid(preset_guid)
-            .tuning_info(tuning)
-            .framerate(cfg.fps, 1)
-            .enable_picture_type_decision()
-            // Resolution ladder (Phase 2): native is the envelope ceiling so the
-            // session can be live-reconfigured DOWN to any rung without a re-init
-            // (which would SIGSEGV the driver). The ladder never goes above native.
-            .max_encode_resolution(oc.w, oc.h)
-            .encode_config(&mut preset_config.presetCfg);
-        let buffer_format = if hdr {
-            NV_ENC_BUFFER_FORMAT_ABGR10
-        } else {
-            NV_ENC_BUFFER_FORMAT_ABGR
-        };
-        let session = Box::new(
-            encoder
-                .start_session(buffer_format, init)
-                .map_err(|e| anyhow::anyhow!("session [{}]: {e:?}", oc.name))?,
-        );
-        let num_bufs = (preset_config.presetCfg.frameIntervalP.max(0)
-            + preset_config.presetCfg.rcParams.lookaheadDepth as i32)
-            .max(1) as usize;
-
-        // SAFETY: see module-level "Why a self-referential Pipeline" — Box
-        // gives a stable address, and the field order below ensures these
-        // 'static borrows drop before the session does.
-        let session_ref: &'static Session =
-            unsafe { std::mem::transmute::<&Session, &'static Session>(&*session) };
-
-        let bitstreams: Vec<Bitstream<'static>> = (0..num_bufs)
-            .map(|_| session_ref.create_output_bitstream())
-            .collect::<std::result::Result<_, _>>()
-            .map_err(|e| anyhow::anyhow!("bitstream [{}]: {e:?}", oc.name))?;
-
+        // The per-output linear CUDA buffer the GL blit fills each frame. NVENC
+        // encodes straight from it (zero-copy); the software (VVC) path copies
+        // it device→host instead. Allocated before the backend branch — both
+        // backends need it.
         let pitch = oc.w * 4;
         let dptr = unsafe { curesult::malloc_sync((pitch * oc.h) as usize) }
             .map_err(|e| anyhow::anyhow!("cuMemAlloc [{}]: {e:?}", oc.name))?;
-        let reg: RegisteredResource<'static, ()> = session_ref
-            .register_generic_resource(
-                (),
-                NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
-                dptr as *mut c_void,
-                pitch,
-            )
-            .map_err(|e| anyhow::anyhow!("register [{}]: {e:?}", oc.name))?;
+
+        let backend = if cfg.video_codec.is_nvenc() {
+            // NVENC: one Encoder + Session per output. start_session(self) consumes
+            // the Encoder, so the Session is fully owned.
+            let encoder = Encoder::initialize_with_cuda(cuda.clone())
+                .map_err(|e| anyhow::anyhow!("nvenc init [{}]: {e:?}", oc.name))?;
+            // Codec is global to the config (HEVC default, AV1 on Ada+, AVC for
+            // legacy clients); the GUID picks the union variant
+            // `apply_codec_lowlatency` then configures.
+            let encode_guid = codec_encode_guid(cfg.video_codec);
+            let preset_guid = NV_ENC_PRESET_P4_GUID;
+            let tuning = NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
+            let mut preset_config = encoder
+                .get_preset_config(encode_guid, preset_guid, tuning)
+                .map_err(|e| anyhow::anyhow!("preset [{}]: {e:?}", oc.name))?;
+            // Cap the GOP + IDR period (see `idr_period_frames`) so a client that
+            // reconnects mid-stream resumes decoding without a session-rebuild
+            // dance. The default for ULTRA_LOW_LATENCY is effectively "infinite"
+            // — fine for a single fixed connection, wrong for the multi-shot
+            // streamer. gopLength governs intra-distance; `apply_codec_lowlatency`
+            // sets the codec's IDR period + parameter-set repetition (HEVC
+            // VPS/SPS/PPS, H.264 SPS/PPS, AV1 sequence-header OBU) so the
+            // reconnecting decoder gets the headers an IDR/keyframe alone lacks.
+            preset_config.presetCfg.gopLength = idr_period_frames(cfg.fps);
+            preset_config.presetCfg.frameIntervalP = 1;
+            apply_codec_lowlatency(&mut preset_config.presetCfg, cfg.video_codec, cfg.fps);
+            if hdr {
+                apply_hdr10(&mut preset_config.presetCfg, cfg.video_codec);
+            }
+            // W3b: opt-in explicit rate control. Without a configured target the preset's
+            // heuristic RC is kept (today's behavior). With one, cap the bitrate so a high
+            // res/fps stream can't outrun the bounded QUIC flow window (PHAROS_STREAM_WINDOW_KB)
+            // — the ~2s-backlog recipe. CBR when only an average is set; capped-VBR when a
+            // higher ceiling is given. VBV is a few frames deep (`vbv_buffer_frames`) so
+            // it can absorb an IDR-sized spike instead of underflowing into blockiness.
+            if let Some((avg_kbps, max_kbps)) = resolve_rc_bitrate(cfg) {
+                let rc = &mut preset_config.presetCfg.rcParams;
+                let capped_vbr = max_kbps > avg_kbps;
+                rc.rateControlMode = if capped_vbr {
+                    NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_VBR
+                } else {
+                    NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR
+                };
+                rc.averageBitRate = avg_kbps.saturating_mul(1000);
+                rc.maxBitRate = max_kbps.saturating_mul(1000);
+                rc.vbvBufferSize =
+                    (rc.averageBitRate / cfg.fps.max(1)).saturating_mul(vbv_buffer_frames());
+                rc.vbvInitialDelay = rc.vbvBufferSize;
+                info!(
+                    "nvenc RC [{}]: {} avg={}kbps max={}kbps vbv={}B",
+                    oc.name,
+                    if capped_vbr { "capped-VBR" } else { "CBR" },
+                    avg_kbps,
+                    max_kbps,
+                    rc.vbvBufferSize,
+                );
+            }
+            let mut init = EncoderInitParams::new(encode_guid, oc.w, oc.h);
+            init.preset_guid(preset_guid)
+                .tuning_info(tuning)
+                .framerate(cfg.fps, 1)
+                .enable_picture_type_decision()
+                // Resolution ladder (Phase 2): native is the envelope ceiling so the
+                // session can be live-reconfigured DOWN to any rung without a re-init
+                // (which would SIGSEGV the driver). The ladder never goes above native.
+                .max_encode_resolution(oc.w, oc.h)
+                .encode_config(&mut preset_config.presetCfg);
+            let buffer_format = if hdr {
+                NV_ENC_BUFFER_FORMAT_ABGR10
+            } else {
+                NV_ENC_BUFFER_FORMAT_ABGR
+            };
+            let session = Box::new(
+                encoder
+                    .start_session(buffer_format, init)
+                    .map_err(|e| anyhow::anyhow!("session [{}]: {e:?}", oc.name))?,
+            );
+            let num_bufs = (preset_config.presetCfg.frameIntervalP.max(0)
+                + preset_config.presetCfg.rcParams.lookaheadDepth as i32)
+                .max(1) as usize;
+
+            // SAFETY: see module-level "Why a self-referential Pipeline" — Box
+            // gives a stable address, and the field order below ensures these
+            // 'static borrows drop before the session does.
+            let session_ref: &'static Session =
+                unsafe { std::mem::transmute::<&Session, &'static Session>(&*session) };
+
+            let bitstreams: Vec<Bitstream<'static>> = (0..num_bufs)
+                .map(|_| session_ref.create_output_bitstream())
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| anyhow::anyhow!("bitstream [{}]: {e:?}", oc.name))?;
+
+            let reg: RegisteredResource<'static, ()> = session_ref
+                .register_generic_resource(
+                    (),
+                    NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
+                    dptr as *mut c_void,
+                    pitch,
+                )
+                .map_err(|e| anyhow::anyhow!("register [{}]: {e:?}", oc.name))?;
+
+            EncodeBackend::Nvenc {
+                bitstreams,
+                reg,
+                _session: session,
+                num_bufs,
+            }
+        } else {
+            // VVC (H.266): no consumer GPU encodes it, so this output runs the
+            // software ffmpeg/libvvenc path — see swenc.rs for the latency
+            // contract and its limitations vs NVENC. Frames leave the GPU via a
+            // device→host copy of the same CUDA buffer NVENC would encode from.
+            match crate::swenc::SoftEncoder::spawn(
+                oc.w,
+                oc.h,
+                cfg.fps,
+                idr_period_frames(cfg.fps),
+                resolve_rc_bitrate(cfg),
+            ) {
+                Ok(enc) => EncodeBackend::Soft(enc),
+                Err(e) => {
+                    // Self-heal: a persisted VVC override that can't spawn would
+                    // crash-loop this process under systemd until the StartLimit
+                    // breaker gives up. Clear the sidecar so the NEXT start falls
+                    // back to the multi.toml codec (HEVC default), and exit with
+                    // the real error in the journal.
+                    if let Ok(dir) = crate::pair::config_dir() {
+                        let _ = std::fs::remove_file(codec_sidecar(&dir.join("multi.toml")));
+                    }
+                    return Err(anyhow::anyhow!(
+                        "software VVC encoder failed to start [{}]: {e:#}; cleared the codec \
+                         override so the next start returns to the configured codec",
+                        oc.name
+                    ));
+                }
+            }
+        };
 
         let (streamer, file) = if let Some(addr_str) = oc.addr.strip_prefix("quic://") {
             let a: SocketAddr = addr_str
@@ -2463,9 +2563,7 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
         );
 
         pipelines.push(Some(Pipeline {
-            bitstreams,
-            reg,
-            _session: session,
+            backend,
             cuda_buf: CudaBuf(dptr),
             pitch,
             width: oc.w,
@@ -2473,7 +2571,6 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
             output,
             target,
             damage,
-            num_bufs,
             name: oc.name.clone(),
             addr_label: oc.addr.clone(),
             // Resolution ladder starts at native (coded == native, no downscale,
@@ -3090,11 +3187,18 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
     // alongside this log.
     for (idx, slot) in pipelines.iter().enumerate() {
         let Some(p) = slot.as_ref() else { continue };
-        tracing::info!(
-            target: "compositor::nvenc",
-            "nvenc init output[{idx}] '{}' codec={} w={} h={} fps={} preset=P4 tuning=ULTRA_LOW_LATENCY",
-            p.name, cfg.video_codec.label(), p.width, p.height, cfg.fps,
-        );
+        match &p.backend {
+            EncodeBackend::Nvenc { .. } => tracing::info!(
+                target: "compositor::nvenc",
+                "nvenc init output[{idx}] '{}' codec={} w={} h={} fps={} preset=P4 tuning=ULTRA_LOW_LATENCY",
+                p.name, cfg.video_codec.label(), p.width, p.height, cfg.fps,
+            ),
+            EncodeBackend::Soft(_) => tracing::info!(
+                target: "compositor::swenc",
+                "software encode init output[{idx}] '{}' codec={} w={} h={} fps={} (ffmpeg/libvvenc)",
+                p.name, cfg.video_codec.label(), p.width, p.height, cfg.fps,
+            ),
+        }
     }
 
     let mut i: u32 = 0;
@@ -3317,12 +3421,21 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                     // the sidecar next to the panel's multi.toml and relaunch;
                     // the fresh process reads the override in load_multi_config
                     // and builds its sessions with the new codec.
-                    let res = crate::pair::config_dir()
-                        .map_err(|e| e.to_string())
-                        .and_then(|dir| {
-                            write_codec_override(&dir.join("multi.toml"), codec)
-                                .map_err(|e| format!("persist video codec: {e}"))
-                        });
+                    //
+                    // VVC first: it has no NVENC path — it software-encodes via
+                    // ffmpeg's libvvenc — so preflight that BEFORE persisting +
+                    // relaunching. A box without the right ffmpeg gets the error
+                    // in the panel instead of a restart into a failed build.
+                    let res = if codec == VideoCodec::Vvc {
+                        crate::swenc::preflight()
+                    } else {
+                        Ok(())
+                    }
+                    .and_then(|()| crate::pair::config_dir().map_err(|e| e.to_string()))
+                    .and_then(|dir| {
+                        write_codec_override(&dir.join("multi.toml"), codec)
+                            .map_err(|e| format!("persist video codec: {e}"))
+                    });
                     match res {
                         Ok(()) => {
                             info!(
@@ -4354,229 +4467,293 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                 frame_gl_blit_us += t0.elapsed().as_micros() as u64;
             }
 
-            let ob_idx = (i as usize) % p.num_bufs;
-
-            // Software fault injection (P1 harness, mode B): exercise classify()
-            // on a healthy GPU with no faulty card. When a fault is due this
-            // frame we branch into the SAME handler a real NVENC error hits,
-            // WITHOUT calling encode_picture — so the bitstream buffer state is
-            // untouched, mirroring a real EncoderBusy (which produces no output).
-            // Unset PHAROS_FAULT_INJECT → `fault_inject` is None → no-op.
-            if let Some(kind) = fault_inject.as_ref().and_then(|f| f.due(i)) {
-                match classify(kind) {
-                    Severity::Transient => {
-                        if kind == ErrorKind::EncoderBusy {
-                            nvenc_busy[idx] = nvenc_busy[idx].saturating_add(1);
-                            slow_events.push_back(i); // feeds the windowed Degraded trigger
-                        }
-                        tracing::warn!(
-                            target: "compositor::nvenc",
-                            "INJECTED transient output={} kind={:?} frame={} busy_total={} — skipping emit (host must survive)",
-                            p.name, kind, i, nvenc_busy[idx]
-                        );
-                        continue;
-                    }
-                    Severity::Degraded | Severity::Fatal => {
-                        tracing::error!(
-                            target: "compositor::nvenc",
-                            "INJECTED fatal output={} kind={:?} frame={}", p.name, kind, i
-                        );
-                        return Err(fatal_err(&p.name, "encode(injected)", kind));
-                    }
-                }
-            }
-
-            let ob = &mut p.bitstreams[ob_idx];
-            // Latency stamp: encode start = just before NVENC encode_picture.
-            let encode_start_ns = if bench_this { unix_nanos_now() } else { 0 };
-            // Unconditional wall-clock timing of the NVENC critical path: this
-            // is the documented libnvcuvid wedge fingerprint, so we always
-            // measure it (one Instant::now() pair per output per frame; ~200ns
-            // cost). The framing histogram sees µs; the watchdog sees ms.
-            let encode_t0 = std::time::Instant::now();
             // On-demand IDR: if this output's streamer is asking for a keyframe
             // (it dropped an AU, or the client sent DG_REQUEST_IDR) and we haven't
             // just emitted one, force THIS frame to be an IDR so the client resyncs
             // in ~1 frame instead of waiting for the next periodic IDR (see
             // `idr_period_frames`). Rate-limited via last_idr_at so sustained
-            // loss can't trigger an IDR storm.
+            // loss can't trigger an IDR storm. Only NVENC can honour it mid-GOP;
+            // the software (VVC) backend resyncs on its periodic IDR instead.
             let force_idr = p.streamer.as_ref().is_some_and(|s| {
                 s.take_idr_request()
                     && last_idr_at[idx].is_none_or(|t| t.elapsed() >= min_idr_interval)
             });
-            // Severity-aware encode + lock. Pre-P1 a bare `?` here meant a single
-            // transient (EncoderBusy/NeedMoreInput/LockBusy) terminated the whole
-            // host; now a retryable kind skips just this output's frame (the
-            // client resyncs off the next periodic IDR) and only a fatal kind
-            // returns Err → the process exits + systemd respawns a FRESH NVENC
-            // process (never an in-process re-init, which SIGSEGVs libnvcuvid).
-            // HDR10 static metadata: re-emit MDCV(137)+CLL(144) on every IDR
-            // (idrPeriod == idr_period_frames, plus any on-demand force_idr) so
-            // a mid-stream joiner gets the mastering/CLL info alongside
-            // repeatSPSPPS at the next periodic IDR.
-            // The payload array must outlive the encode call; NVENC copies it.
-            let mut hdr_sei_arr;
-            let codec_params = match hdr_sei.as_ref() {
-                Some((mdcv, cll)) if force_idr || i.is_multiple_of(idr_period_frames(cfg.fps)) => {
-                    hdr_sei_arr = [
-                        NV_ENC_SEI_PAYLOAD {
-                            payloadSize: mdcv.len() as u32,
-                            payloadType: 137,
-                            payload: mdcv.as_ptr() as *mut u8,
-                        },
-                        NV_ENC_SEI_PAYLOAD {
-                            payloadSize: cll.len() as u32,
-                            payloadType: 144,
-                            payload: cll.as_ptr() as *mut u8,
-                        },
-                    ];
-                    // SAFETY: NV_ENC_PIC_PARAMS_HEVC is POD; zeroed is a valid
-                    // "no extra params" base and NVENC copies the SEI in-call.
-                    let mut pic: NV_ENC_PIC_PARAMS_HEVC = unsafe { std::mem::zeroed() };
-                    pic.seiPayloadArrayCnt = hdr_sei_arr.len() as u32;
-                    pic.seiPayloadArray = hdr_sei_arr.as_mut_ptr();
-                    Some(CodecPictureParams::Hevc(pic))
-                }
-                _ => None,
-            };
-            if let Err(e) = p._session.encode_picture(
-                &mut p.reg,
-                ob,
-                EncodePictureParams {
-                    force_idr,
-                    codec_params,
-                    ..Default::default()
-                },
-            ) {
-                match classify(e.kind()) {
-                    Severity::Transient => {
-                        if e.kind() == ErrorKind::EncoderBusy {
-                            nvenc_busy[idx] = nvenc_busy[idx].saturating_add(1);
-                            slow_events.push_back(i); // feeds the windowed Degraded trigger
+            // Latency stamp: encode start = just before the encode hand-off.
+            let encode_start_ns = if bench_this { unix_nanos_now() } else { 0 };
+            // Unconditional wall-clock timing of the encode critical path: on
+            // NVENC this is the documented libnvcuvid wedge fingerprint, so we
+            // always measure it (one Instant::now() pair per output per frame;
+            // ~200ns cost). The framing histogram sees µs; the watchdog sees ms.
+            let encode_t0 = std::time::Instant::now();
+
+            match &mut p.backend {
+                EncodeBackend::Soft(enc) => {
+                    // Software (VVC) backend: offer the freshly-blitted frame (the
+                    // device→host copy happens only when the encoder is ready for one)
+                    // and forward whatever AUs it finished since last tick. Never
+                    // blocks the render loop. Bench-window stage stamps aren't
+                    // meaningful here (AUs are asynchronous to render frames), so a
+                    // bench against a software session times out on the client side.
+                    if force_idr {
+                        tracing::debug!(
+                            target: "compositor::swenc",
+                            "IDR request on '{}' waits for the periodic IDR (no live control channel)",
+                            p.name
+                        );
+                    }
+                    // SAFETY: cuda_buf is this output's live linear allocation of
+                    // pitch*height bytes on the context bound to this render thread.
+                    unsafe { enc.submit_from_cuda(p.cuda_buf.0) };
+                    frame_encode_us += encode_t0.elapsed().as_micros() as u64;
+                    for au in enc.drain_aus() {
+                        if au.keyframe {
+                            last_idr_at[idx] = Some(std::time::Instant::now());
                         }
-                        tracing::warn!(
-                            target: "compositor::nvenc",
-                            "nvenc encode transient output={} kind={:?} busy_total={} — skipping frame",
-                            p.name, e.kind(), nvenc_busy[idx]
-                        );
-                        continue;
-                    }
-                    Severity::Degraded | Severity::Fatal => {
-                        return Err(fatal_err(&p.name, "encode", e.kind()));
+                        let au_bytes = au.data.len() as u64;
+                        let wire_t0 = if framing.enabled {
+                            Some(std::time::Instant::now())
+                        } else {
+                            None
+                        };
+                        if let Some(s) = &p.streamer {
+                            s.send_frame(au.data, au.keyframe);
+                            wire_frames_in_window = wire_frames_in_window.saturating_add(1);
+                            wire_bytes_in_window = wire_bytes_in_window.saturating_add(au_bytes);
+                        } else if let Some(f) = &mut p.file {
+                            f.write_all(&au.data)?;
+                        }
+                        if let Some(t0) = wire_t0 {
+                            frame_wire_us += t0.elapsed().as_micros() as u64;
+                        }
+                        if !first_sent[idx] {
+                            first_sent[idx] = true;
+                            info!(
+                                "output[{idx}] '{}' first frame sent → {}",
+                                p.name, p.addr_label
+                            );
+                        }
                     }
                 }
-            }
-            let lock = match ob.lock() {
-                Ok(l) => l,
-                Err(e) => match classify(e.kind()) {
-                    Severity::Transient => {
-                        tracing::warn!(
-                            target: "compositor::nvenc",
-                            "nvenc lock transient output={} kind={:?} — skipping frame",
-                            p.name, e.kind()
-                        );
-                        continue;
+                EncodeBackend::Nvenc {
+                    bitstreams,
+                    reg,
+                    _session,
+                    num_bufs,
+                } => {
+                    let ob_idx = (i as usize) % *num_bufs;
+
+                    // Software fault injection (P1 harness, mode B): exercise classify()
+                    // on a healthy GPU with no faulty card. When a fault is due this
+                    // frame we branch into the SAME handler a real NVENC error hits,
+                    // WITHOUT calling encode_picture — so the bitstream buffer state is
+                    // untouched, mirroring a real EncoderBusy (which produces no output).
+                    // Unset PHAROS_FAULT_INJECT → `fault_inject` is None → no-op.
+                    if let Some(kind) = fault_inject.as_ref().and_then(|f| f.due(i)) {
+                        match classify(kind) {
+                            Severity::Transient => {
+                                if kind == ErrorKind::EncoderBusy {
+                                    nvenc_busy[idx] = nvenc_busy[idx].saturating_add(1);
+                                    slow_events.push_back(i); // feeds the windowed Degraded trigger
+                                }
+                                tracing::warn!(
+                                    target: "compositor::nvenc",
+                                    "INJECTED transient output={} kind={:?} frame={} busy_total={} — skipping emit (host must survive)",
+                                    p.name, kind, i, nvenc_busy[idx]
+                                );
+                                continue;
+                            }
+                            Severity::Degraded | Severity::Fatal => {
+                                tracing::error!(
+                                    target: "compositor::nvenc",
+                                    "INJECTED fatal output={} kind={:?} frame={}", p.name, kind, i
+                                );
+                                return Err(fatal_err(&p.name, "encode(injected)", kind));
+                            }
+                        }
                     }
-                    Severity::Degraded | Severity::Fatal => {
-                        return Err(fatal_err(&p.name, "lock", e.kind()));
-                    }
-                },
-            };
-            let encode_elapsed = encode_t0.elapsed();
-            let encode_ms = encode_elapsed.as_millis() as u64;
-            frame_encode_us += encode_elapsed.as_micros() as u64;
-            // Watchdog: a healthy 1080p60 HEVC encode on a 4070 finishes in
-            // ~3-6ms; >50ms is a real stall worth a warn; 3 consecutive >200ms
-            // is the libnvcuvid-wedge fingerprint (memory `lesson-nvenc…`).
-            if encode_ms > 50 {
-                tracing::warn!(
-                    target: "compositor::nvenc",
-                    "nvenc encode_picture slow output={} ms={}",
-                    p.name, encode_ms
-                );
-            }
-            if encode_ms > 200 {
-                // Per-output consecutive-slow run = the libnvcuvid wedge
-                // fingerprint → Faulted (sticky). Also a windowed slow event that
-                // feeds the Degraded rate trigger evaluated after the output loop.
-                nvenc_consecutive_slow[idx] = nvenc_consecutive_slow[idx].saturating_add(1);
-                slow_events.push_back(i);
-                if nvenc_consecutive_slow[idx] >= 3 {
-                    tracing::error!(
-                        target: "compositor::nvenc",
-                        "NVENC LIKELY WEDGED (output={} consecutive_slow={} last_ms={})",
-                        p.name, nvenc_consecutive_slow[idx], encode_ms
-                    );
-                    set_gpu_health(
-                        HEALTH_FAULTED,
-                        &format!("NVENC wedge: 3×>200ms on '{}' (last {encode_ms}ms)", p.name),
-                    );
-                    // Faulted is sticky in the shared GPU_HEALTH (cleared only by a
-                    // fresh process, P5), so reset the per-output run here to keep
-                    // the log cadence sane while the wedge persists.
-                    nvenc_consecutive_slow[idx] = 0;
-                }
-            } else {
-                nvenc_consecutive_slow[idx] = 0;
-            }
-            // Latency stamp: encode done = after the NVENC bitstream lock.
-            let encode_done_ns = if bench_this { unix_nanos_now() } else { 0 };
-            let au_bytes = lock.data().len() as u64;
-            let wire_t0 = if framing.enabled {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
-            if let Some(s) = &p.streamer {
-                // Keyframe (IDR/I) AUs must never be dropped by the bounded send
-                // queue in favour of a P-frame backlog — losing one strands the
-                // decoder for a whole GOP (~1s of propagating "pink block"
-                // corruption), whereas a dropped P-frame is resynced by the next
-                // IDR. NVENC reports the picture type on the lock (PTD is enabled),
-                // so flag it for the queue's keyframe reserve.
-                let keyframe = matches!(
-                    lock.picture_type(),
-                    NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR | NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I
-                );
-                // Track the last keyframe (periodic or on-demand) for the IDR
-                // rate limiter that gates `force_idr` above.
-                if keyframe {
-                    last_idr_at[idx] = Some(std::time::Instant::now());
-                }
-                // During a bench window, send the AU + its host-stage stamps in one
-                // call; the transport fills wire_send_ns at write_all (leave it 0).
-                // The first meta is itself the bench-window start signal.
-                if bench_this {
-                    let meta = core_proto::FrameStageMeta {
-                        frame_idx: bench_frame_idx,
-                        capture_ns,
-                        encode_start_ns,
-                        encode_done_ns,
-                        wire_send_ns: 0,
+
+                    let ob = &mut bitstreams[ob_idx];
+                    // Severity-aware encode + lock. Pre-P1 a bare `?` here meant a single
+                    // transient (EncoderBusy/NeedMoreInput/LockBusy) terminated the whole
+                    // host; now a retryable kind skips just this output's frame (the
+                    // client resyncs off the next periodic IDR) and only a fatal kind
+                    // returns Err → the process exits + systemd respawns a FRESH NVENC
+                    // process (never an in-process re-init, which SIGSEGVs libnvcuvid).
+                    // HDR10 static metadata: re-emit MDCV(137)+CLL(144) on every IDR
+                    // (idrPeriod == idr_period_frames, plus any on-demand force_idr) so
+                    // a mid-stream joiner gets the mastering/CLL info alongside
+                    // repeatSPSPPS at the next periodic IDR.
+                    // The payload array must outlive the encode call; NVENC copies it.
+                    let mut hdr_sei_arr;
+                    let codec_params = match hdr_sei.as_ref() {
+                        Some((mdcv, cll))
+                            if force_idr || i.is_multiple_of(idr_period_frames(cfg.fps)) =>
+                        {
+                            hdr_sei_arr = [
+                                NV_ENC_SEI_PAYLOAD {
+                                    payloadSize: mdcv.len() as u32,
+                                    payloadType: 137,
+                                    payload: mdcv.as_ptr() as *mut u8,
+                                },
+                                NV_ENC_SEI_PAYLOAD {
+                                    payloadSize: cll.len() as u32,
+                                    payloadType: 144,
+                                    payload: cll.as_ptr() as *mut u8,
+                                },
+                            ];
+                            // SAFETY: NV_ENC_PIC_PARAMS_HEVC is POD; zeroed is a valid
+                            // "no extra params" base and NVENC copies the SEI in-call.
+                            let mut pic: NV_ENC_PIC_PARAMS_HEVC = unsafe { std::mem::zeroed() };
+                            pic.seiPayloadArrayCnt = hdr_sei_arr.len() as u32;
+                            pic.seiPayloadArray = hdr_sei_arr.as_mut_ptr();
+                            Some(CodecPictureParams::Hevc(pic))
+                        }
+                        _ => None,
                     };
-                    s.send_with_meta(lock.data().to_vec(), keyframe, meta);
-                    bench_frame_idx += 1;
-                    bench_remaining -= 1;
-                } else {
-                    s.send_frame(lock.data().to_vec(), keyframe);
+                    if let Err(e) = _session.encode_picture(
+                        reg,
+                        ob,
+                        EncodePictureParams {
+                            force_idr,
+                            codec_params,
+                            ..Default::default()
+                        },
+                    ) {
+                        match classify(e.kind()) {
+                            Severity::Transient => {
+                                if e.kind() == ErrorKind::EncoderBusy {
+                                    nvenc_busy[idx] = nvenc_busy[idx].saturating_add(1);
+                                    slow_events.push_back(i); // feeds the windowed Degraded trigger
+                                }
+                                tracing::warn!(
+                                    target: "compositor::nvenc",
+                                    "nvenc encode transient output={} kind={:?} busy_total={} — skipping frame",
+                                    p.name, e.kind(), nvenc_busy[idx]
+                                );
+                                continue;
+                            }
+                            Severity::Degraded | Severity::Fatal => {
+                                return Err(fatal_err(&p.name, "encode", e.kind()));
+                            }
+                        }
+                    }
+                    let lock = match ob.lock() {
+                        Ok(l) => l,
+                        Err(e) => match classify(e.kind()) {
+                            Severity::Transient => {
+                                tracing::warn!(
+                                    target: "compositor::nvenc",
+                                    "nvenc lock transient output={} kind={:?} — skipping frame",
+                                    p.name, e.kind()
+                                );
+                                continue;
+                            }
+                            Severity::Degraded | Severity::Fatal => {
+                                return Err(fatal_err(&p.name, "lock", e.kind()));
+                            }
+                        },
+                    };
+                    let encode_elapsed = encode_t0.elapsed();
+                    let encode_ms = encode_elapsed.as_millis() as u64;
+                    frame_encode_us += encode_elapsed.as_micros() as u64;
+                    // Watchdog: a healthy 1080p60 HEVC encode on a 4070 finishes in
+                    // ~3-6ms; >50ms is a real stall worth a warn; 3 consecutive >200ms
+                    // is the libnvcuvid-wedge fingerprint (memory `lesson-nvenc…`).
+                    if encode_ms > 50 {
+                        tracing::warn!(
+                            target: "compositor::nvenc",
+                            "nvenc encode_picture slow output={} ms={}",
+                            p.name, encode_ms
+                        );
+                    }
+                    if encode_ms > 200 {
+                        // Per-output consecutive-slow run = the libnvcuvid wedge
+                        // fingerprint → Faulted (sticky). Also a windowed slow event that
+                        // feeds the Degraded rate trigger evaluated after the output loop.
+                        nvenc_consecutive_slow[idx] = nvenc_consecutive_slow[idx].saturating_add(1);
+                        slow_events.push_back(i);
+                        if nvenc_consecutive_slow[idx] >= 3 {
+                            tracing::error!(
+                                target: "compositor::nvenc",
+                                "NVENC LIKELY WEDGED (output={} consecutive_slow={} last_ms={})",
+                                p.name, nvenc_consecutive_slow[idx], encode_ms
+                            );
+                            set_gpu_health(
+                                HEALTH_FAULTED,
+                                &format!(
+                                    "NVENC wedge: 3×>200ms on '{}' (last {encode_ms}ms)",
+                                    p.name
+                                ),
+                            );
+                            // Faulted is sticky in the shared GPU_HEALTH (cleared only by a
+                            // fresh process, P5), so reset the per-output run here to keep
+                            // the log cadence sane while the wedge persists.
+                            nvenc_consecutive_slow[idx] = 0;
+                        }
+                    } else {
+                        nvenc_consecutive_slow[idx] = 0;
+                    }
+                    // Latency stamp: encode done = after the NVENC bitstream lock.
+                    let encode_done_ns = if bench_this { unix_nanos_now() } else { 0 };
+                    let au_bytes = lock.data().len() as u64;
+                    let wire_t0 = if framing.enabled {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
+                    if let Some(s) = &p.streamer {
+                        // Keyframe (IDR/I) AUs must never be dropped by the bounded send
+                        // queue in favour of a P-frame backlog — losing one strands the
+                        // decoder for a whole GOP (~1s of propagating "pink block"
+                        // corruption), whereas a dropped P-frame is resynced by the next
+                        // IDR. NVENC reports the picture type on the lock (PTD is enabled),
+                        // so flag it for the queue's keyframe reserve.
+                        let keyframe = matches!(
+                            lock.picture_type(),
+                            NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR
+                                | NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I
+                        );
+                        // Track the last keyframe (periodic or on-demand) for the IDR
+                        // rate limiter that gates `force_idr` above.
+                        if keyframe {
+                            last_idr_at[idx] = Some(std::time::Instant::now());
+                        }
+                        // During a bench window, send the AU + its host-stage stamps in one
+                        // call; the transport fills wire_send_ns at write_all (leave it 0).
+                        // The first meta is itself the bench-window start signal.
+                        if bench_this {
+                            let meta = core_proto::FrameStageMeta {
+                                frame_idx: bench_frame_idx,
+                                capture_ns,
+                                encode_start_ns,
+                                encode_done_ns,
+                                wire_send_ns: 0,
+                            };
+                            s.send_with_meta(lock.data().to_vec(), keyframe, meta);
+                            bench_frame_idx += 1;
+                            bench_remaining -= 1;
+                        } else {
+                            s.send_frame(lock.data().to_vec(), keyframe);
+                        }
+                        // Ground-truth wire counter: every AU pushed to streamer.send()
+                        // counts as one frame on the wire, regardless of bench mode.
+                        wire_frames_in_window = wire_frames_in_window.saturating_add(1);
+                        wire_bytes_in_window = wire_bytes_in_window.saturating_add(au_bytes);
+                    } else if let Some(f) = &mut p.file {
+                        f.write_all(lock.data())?;
+                    }
+                    if let Some(t0) = wire_t0 {
+                        frame_wire_us += t0.elapsed().as_micros() as u64;
+                    }
+                    drop(lock);
+                    if !first_sent[idx] {
+                        first_sent[idx] = true;
+                        info!(
+                            "output[{idx}] '{}' first frame sent → {}",
+                            p.name, p.addr_label
+                        );
+                    }
                 }
-                // Ground-truth wire counter: every AU pushed to streamer.send()
-                // counts as one frame on the wire, regardless of bench mode.
-                wire_frames_in_window = wire_frames_in_window.saturating_add(1);
-                wire_bytes_in_window = wire_bytes_in_window.saturating_add(au_bytes);
-            } else if let Some(f) = &mut p.file {
-                f.write_all(lock.data())?;
-            }
-            if let Some(t0) = wire_t0 {
-                frame_wire_us += t0.elapsed().as_micros() as u64;
-            }
-            drop(lock);
-            if !first_sent[idx] {
-                first_sent[idx] = true;
-                info!(
-                    "output[{idx}] '{}' first frame sent → {}",
-                    p.name, p.addr_label
-                );
             }
         }
         // P3: per-frame GPU-health bookkeeping, after every output encoded this

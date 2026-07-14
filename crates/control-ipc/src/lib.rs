@@ -295,9 +295,13 @@ pub enum Audio {
 /// Which video codec the host encodes with. Shared so the panel's Video tab and
 /// the compositor agree on the vocabulary. `Hevc` (H.265) is the default and
 /// runs everywhere; `Av1` needs an Ada-or-newer NVIDIA encoder (the 4070 has
-/// it) and an AV1-capable decoder on the client. Serialised lowercase so it
-/// reads cleanly both in the panel's JSON and in `multi.toml`
-/// (`video_codec = "av1"`).
+/// it) and an AV1-capable decoder on the client; `H264` (AVC) is the
+/// compatibility codec — every hardware decoder made this century plays it, at
+/// ~+40% bitrate for equal quality; `Vvc` (H.266) is the experimental
+/// successor — no consumer GPU encodes it, so the host falls back to SOFTWARE
+/// encode via ffmpeg's `libvvenc` (CPU-heavy; realtime only at modest
+/// resolutions). Serialised lowercase so it reads cleanly both in the panel's
+/// JSON and in `multi.toml` (`video_codec = "av1"`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VideoCodec {
@@ -306,22 +310,56 @@ pub enum VideoCodec {
     Hevc,
     /// AV1 — ~30% smaller at equal quality; needs Ada+ encode and an AV1 decoder.
     Av1,
+    /// H.264 / AVC — the universal-compatibility codec; ~40% more bitrate than
+    /// HEVC for equal quality, and most AVC hardware decoders cap at 1080p60
+    /// (or 4K30), so prefer it only when the client can't decode HEVC/AV1.
+    #[serde(alias = "avc")]
+    H264,
+    /// H.266 / VVC — ~40% smaller than HEVC at equal quality, but with NO
+    /// hardware encoder on any consumer GPU: the host software-encodes via
+    /// ffmpeg `libvvenc`. Experimental; expect realtime only at 1080p-class
+    /// resolutions on a strong CPU, and hardware decode only on the newest
+    /// client SoCs (software decode elsewhere).
+    #[serde(alias = "h266")]
+    Vvc,
 }
 
 impl VideoCodec {
-    /// Short uppercase label for status/display (`"HEVC"` / `"AV1"`).
+    /// Short uppercase codec abbreviation for status/display
+    /// (`"HEVC"` / `"AV1"` / `"AVC"` / `"VVC"`).
     pub fn label(self) -> &'static str {
         match self {
             VideoCodec::Hevc => "HEVC",
             VideoCodec::Av1 => "AV1",
+            VideoCodec::H264 => "AVC",
+            VideoCodec::Vvc => "VVC",
         }
     }
-    /// The NVENC encoder label that pairs with this codec (`"NVENC HEVC"` …).
+    /// The ITU-T designation that pairs with the abbreviation
+    /// (`"H.265"` / `"—"` / `"H.264"` / `"H.266"`). AV1 is AOM, not ITU-T,
+    /// so it has no H.26x name.
+    pub fn itu_name(self) -> &'static str {
+        match self {
+            VideoCodec::Hevc => "H.265",
+            VideoCodec::Av1 => "AV1",
+            VideoCodec::H264 => "H.264",
+            VideoCodec::Vvc => "H.266",
+        }
+    }
+    /// The encoder label that pairs with this codec (`"NVENC HEVC"` …). VVC has
+    /// no NVENC path; it is software-encoded via ffmpeg `libvvenc`.
     pub fn encoder_label(self) -> &'static str {
         match self {
             VideoCodec::Hevc => "NVENC HEVC",
             VideoCodec::Av1 => "NVENC AV1",
+            VideoCodec::H264 => "NVENC AVC",
+            VideoCodec::Vvc => "vvenc VVC (software)",
         }
+    }
+    /// Whether the Linux host encodes this codec on NVENC (vs the software
+    /// ffmpeg/libvvenc fallback path).
+    pub fn is_nvenc(self) -> bool {
+        !matches!(self, VideoCodec::Vvc)
     }
 }
 

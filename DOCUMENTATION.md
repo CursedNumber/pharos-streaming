@@ -425,7 +425,7 @@ the codec across a panel relaunch.
 | `fps` | u32 (req) |  | shared frame rate (single pacer + NVENC rate) |
 | `fps_auto` | bool | false | adaptive pacing between ~24 fps and `fps` |
 | `frames` | u32 | 0 | frame budget (0 = until killed) |
-| `video_codec` | `hevc`\|`av1` | `hevc` | codec for every output (AV1 needs Ada+) |
+| `video_codec` | `hevc`\|`av1`\|`h264`\|`vvc` | `hevc` | codec for every output (AV1 needs Ada+; `h264`/`avc` = universal-compatibility fallback; `vvc`/`h266` = experimental SOFTWARE encode via ffmpeg libvvenc — needs ffmpeg ≥ 7.1 with `--enable-libvvenc`, CPU-heavy) |
 | `bitrate_kbps` | u32 | none | target average bitrate (else preset RC) |
 | `max_bitrate_kbps` | u32 | none (=avg→CBR) | capped-VBR ceiling |
 | `launch` | string | none | client launched into the shared socket |
