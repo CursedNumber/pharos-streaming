@@ -262,45 +262,56 @@ pub fn selected_label() -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Codec-aware decode (HEVC default; AV1 support)
+// Codec-aware decode (HEVC default; AV1/AVC/VVC support)
 // ---------------------------------------------------------------------------
 
 /// The video codec a stream carries. HEVC is the project default; AV1 is the
-/// opt-in the host can now encode on Ada+ NVENC.
+/// opt-in the host can encode on Ada+ NVENC; H264 (AVC) is the universal
+/// legacy-compatibility codec; Vvc (H.266) is the experimental successor the
+/// host software-encodes via libvvenc.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StreamCodec {
     Hevc,
     Av1,
+    H264,
+    Vvc,
 }
 
 impl StreamCodec {
-    /// The ffmpeg input demuxer (`-f`). HEVC = `hevc` (Annex-B). AV1 = `obu`
-    /// (NVENC emits the low-overhead OBU stream, which is also what `sniff_codec`
-    /// matches); override with `TRIREME_AV1_FORMAT` (`obu`|`av1`) if a host ever
-    /// produces Annex-B AV1 instead. This is the one bit worth confirming against
-    /// a live NVENC AV1 stream.
+    /// The ffmpeg input demuxer (`-f`). HEVC/H.264/VVC = their raw Annex-B
+    /// demuxers (`hevc`/`h264`/`vvc`). AV1 = `obu` (NVENC emits the
+    /// low-overhead OBU stream, which is also what `sniff_codec` matches);
+    /// override with `TRIREME_AV1_FORMAT` (`obu`|`av1`) if a host ever produces
+    /// Annex-B AV1 instead. This is the one bit worth confirming against a live
+    /// NVENC AV1 stream.
     pub fn ffmpeg_format(self) -> String {
         match self {
             StreamCodec::Hevc => "hevc".to_string(),
+            StreamCodec::H264 => "h264".to_string(),
+            StreamCodec::Vvc => "vvc".to_string(),
             StreamCodec::Av1 => std::env::var("TRIREME_AV1_FORMAT")
                 .ok()
                 .filter(|s| matches!(s.as_str(), "obu" | "av1"))
                 .unwrap_or_else(|| "obu".to_string()),
         }
     }
-    /// Short uppercase label.
+    /// Short uppercase codec abbreviation.
     pub fn label(self) -> &'static str {
         match self {
             StreamCodec::Hevc => "HEVC",
             StreamCodec::Av1 => "AV1",
+            StreamCodec::H264 => "AVC",
+            StreamCodec::Vvc => "VVC",
         }
     }
-    /// Parse a codec name (case-insensitive `hevc`/`h265` / `av1`); `None` if
-    /// unrecognised.
+    /// Parse a codec name (case-insensitive `hevc`/`h265` / `av1` /
+    /// `avc`/`h264` / `vvc`/`h266`); `None` if unrecognised.
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "hevc" | "h265" | "h.265" => Some(StreamCodec::Hevc),
             "av1" => Some(StreamCodec::Av1),
+            "avc" | "h264" | "h.264" => Some(StreamCodec::H264),
+            "vvc" | "h266" | "h.266" => Some(StreamCodec::Vvc),
             _ => None,
         }
     }
@@ -317,13 +328,51 @@ pub fn codec_from_env(default: StreamCodec) -> StreamCodec {
         .unwrap_or(default)
 }
 
-/// Sniff the codec from the first bytes of an elementary stream. HEVC (Annex-B)
-/// opens with a NAL start code `00 00 [00] 01`; an AV1 low-overhead OBU stream
-/// opens with an OBU header whose forbidden bit is 0 and whose type is a
-/// temporal delimiter / sequence header / frame. Defaults to HEVC when ambiguous
-/// (the project default). Provided for a future auto-detect decode path.
+/// Sniff the codec from the first bytes of an elementary stream. AV1 is easy —
+/// a low-overhead OBU stream has no NAL start codes. H.264, HEVC and VVC are
+/// ALL Annex-B (`00 00 [00] 01` start codes), so they're told apart by the
+/// first NAL header, exploiting that each host encoder opens its stream (and
+/// every IDR AU, via parameter-set repetition) with a distinctive NAL:
+///
+/// * VVC's two-byte header is `layer-id byte` + `type(5)|tid+1(3)`: base-layer
+///   parameter sets / AUD / picture-header / IRAP give `0x00` then a type-coded
+///   second byte — no other codec starts a NAL with `0x00` + those types.
+/// * HEVC's two-byte header is `type(6)<<1` + `layer/tid`: layer-0 gives a
+///   second byte of exactly `tid+1` (1..=7), and NVENC opens with VPS (0x40).
+/// * H.264's one-byte header (`ref_idc(2)|type(5)`) opens with SPS/AUD/SEI/IDR
+///   — types that don't parse as plausible HEVC or VVC openers.
+///
+/// Defaults to HEVC (the project default) when ambiguous.
 pub fn sniff_codec(head: &[u8]) -> StreamCodec {
-    if head.starts_with(&[0, 0, 0, 1]) || head.starts_with(&[0, 0, 1]) {
+    let nal = if head.starts_with(&[0, 0, 0, 1]) {
+        Some(&head[4..])
+    } else if head.starts_with(&[0, 0, 1]) {
+        Some(&head[3..])
+    } else {
+        None
+    };
+    if let Some(nal) = nal {
+        let (Some(&b0), Some(&b1)) = (nal.first(), nal.get(1)) else {
+            return StreamCodec::Hevc;
+        };
+        // VVC: base layer (b0 == 0x00), second byte carries type + tid.
+        // Types: IRAP 7..=9, VPS 14, SPS 15, PPS 16, prefix-APS 17, PH 19,
+        // AUD 20, prefix-SEI 23. tid+1 must be non-zero.
+        if b0 == 0x00 && (b1 & 0x07) != 0 && matches!(b1 >> 3, 7..=9 | 14..=17 | 19 | 20 | 23) {
+            return StreamCodec::Vvc;
+        }
+        // HEVC: layer-0 second byte is tid+1 (1..=7); plausible opening types:
+        // IRAP 16..=23, VPS/SPS/PPS 32..=34, AUD 35, prefix-SEI 39.
+        let hevc_type = (b0 >> 1) & 0x3f;
+        if (b0 & 0x81) == 0 && (1..=7).contains(&b1) && matches!(hevc_type, 16..=23 | 32..=35 | 39)
+        {
+            return StreamCodec::Hevc;
+        }
+        // H.264: forbidden bit clear; opening types IDR 5, SEI 6, SPS 7,
+        // PPS 8, AUD 9.
+        if (b0 & 0x80) == 0 && matches!(b0 & 0x1f, 5..=9) {
+            return StreamCodec::H264;
+        }
         return StreamCodec::Hevc;
     }
     if let Some(&b) = head.first() {
@@ -338,17 +387,20 @@ pub fn sniff_codec(head: &[u8]) -> StreamCodec {
 }
 
 /// Whether an access unit can start a fresh decode: it contains an HEVC IRAP
-/// NAL (IDR/CRA/BLA) or an AV1 key frame. The client's decode-chain rebuild
-/// (issue #32) gates what it feeds a freshly spawned ffmpeg on this — feeding a
-/// new decoder mid-GOP makes it emit zero-initialised concealment frames, which
-/// render as the green flash. False negatives would freeze the stream, so both
-/// parsers err permissive: HEVC keys on the NAL type alone, AV1 accepts either
-/// a sequence-header OBU (NVENC repeats it on every key frame, mirroring
-/// repeatSPSPPS) or an explicit KEY_FRAME frame header.
+/// NAL (IDR/CRA/BLA), an H.264 IDR, a VVC IRAP (IDR/CRA), or an AV1 key frame.
+/// The client's decode-chain rebuild (issue #32) gates what it feeds a freshly
+/// spawned ffmpeg on this — feeding a new decoder mid-GOP makes it emit
+/// zero-initialised concealment frames, which render as the green flash. False
+/// negatives would freeze the stream, so the parsers err permissive: the NAL
+/// codecs key on the NAL type alone, AV1 accepts either a sequence-header OBU
+/// (NVENC repeats it on every key frame, mirroring repeatSPSPPS) or an explicit
+/// KEY_FRAME frame header.
 pub fn is_keyframe_au(codec: StreamCodec, au: &[u8]) -> bool {
     match codec {
         StreamCodec::Hevc => hevc_has_irap(au),
         StreamCodec::Av1 => av1_has_key(au),
+        StreamCodec::H264 => h264_has_idr(au),
+        StreamCodec::Vvc => vvc_has_irap(au),
     }
 }
 
@@ -370,6 +422,62 @@ fn hevc_has_irap(au: &[u8]) -> bool {
             };
             if let Some(&b) = au.get(hdr) {
                 if (16..=23).contains(&((b >> 1) & 0x3f)) {
+                    return true;
+                }
+            }
+            i = hdr;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Scan an Annex-B AU for an H.264 IDR slice (`nal_unit_type` in the low 5
+/// bits of the header byte; type 5 = IDR). NVENC's repeatSPSPPS attaches
+/// SPS/PPS to every IDR AU, so keying on the IDR alone is sufficient.
+fn h264_has_idr(au: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < au.len() {
+        if au[i] == 0 && au[i + 1] == 0 {
+            let hdr = if au[i + 2] == 1 {
+                i + 3
+            } else if au[i + 2] == 0 && au.get(i + 3) == Some(&1) {
+                i + 4
+            } else {
+                i += 1;
+                continue;
+            };
+            if let Some(&b) = au.get(hdr) {
+                if (b & 0x80) == 0 && (b & 0x1f) == 5 {
+                    return true;
+                }
+            }
+            i = hdr;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Scan an Annex-B AU for a VVC IRAP NAL. The two-byte VVC header is
+/// `forbidden(1) reserved(1) layer_id(6)` + `nal_type(5) tid+1(3)`; IRAP types
+/// are IDR_W_RADL 7, IDR_N_LP 8, CRA 9, any of which starts a decodable chain.
+fn vvc_has_irap(au: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 4 < au.len() {
+        if au[i] == 0 && au[i + 1] == 0 {
+            let hdr = if au[i + 2] == 1 {
+                i + 3
+            } else if au[i + 2] == 0 && au.get(i + 3) == Some(&1) {
+                i + 4
+            } else {
+                i += 1;
+                continue;
+            };
+            if let (Some(&b0), Some(&b1)) = (au.get(hdr), au.get(hdr + 1)) {
+                if (b0 & 0xC0) == 0 && (7..=9).contains(&(b1 >> 3)) {
                     return true;
                 }
             }
@@ -436,32 +544,42 @@ fn av1_has_key(au: &[u8]) -> bool {
     false
 }
 
-/// ffmpeg input args for the chosen decoder, retargeted to `codec`. HEVC uses the
-/// probed decoder verbatim; AV1 maps the probed HW engine to its AV1 sibling
-/// (`hevc_cuvid`→`av1_cuvid`, `hevc_qsv`→`av1_qsv`, `hevc_rkmpp`→`av1_rkmpp`);
-/// codec-agnostic hwaccels (`-hwaccel vaapi/drm`) pass through; anything without
-/// a known AV1 HW sibling drops `-c:v` so ffmpeg falls back to its default AV1
-/// (software) decoder.
+/// ffmpeg input args for the chosen decoder, retargeted to `codec`. HEVC uses
+/// the probed decoder verbatim; the other codecs map the probed HW engine to
+/// their sibling decoder (`hevc_cuvid`→`av1_cuvid`/`h264_cuvid`, …) when one
+/// exists on that engine; codec-agnostic hwaccels (`-hwaccel vaapi/drm`) pass
+/// through (ffmpeg falls back to software by itself when the accel lacks the
+/// codec); anything without a known HW sibling drops `-c:v` so ffmpeg picks its
+/// default (software) decoder for that codec. VVC hardware decode barely exists
+/// (Intel Lunar Lake `vvc_qsv` only) — most boxes land on ffmpeg's native
+/// software VVC decoder.
 pub fn input_args_for(codec: StreamCodec) -> Vec<String> {
-    match codec {
-        StreamCodec::Hevc => input_args(),
-        StreamCodec::Av1 => retarget_av1(&input_args()),
-    }
+    retarget(codec, &input_args())
 }
 
-/// Retarget a HEVC decoder's ffmpeg args to AV1 (see [`input_args_for`]).
-fn retarget_av1(base: &[String]) -> Vec<String> {
-    const AV1_HW: &[&str] = &["av1_cuvid", "av1_qsv", "av1_rkmpp"];
+/// Retarget the probed HEVC decoder's ffmpeg args to `codec`
+/// (see [`input_args_for`]).
+fn retarget(codec: StreamCodec, base: &[String]) -> Vec<String> {
+    // Known hardware sibling decoders per codec (ffmpeg `-decoders` names).
+    let (sub, hw): (&str, &[&str]) = match codec {
+        StreamCodec::Hevc => return base.to_vec(),
+        StreamCodec::Av1 => ("av1", &["av1_cuvid", "av1_qsv", "av1_rkmpp"]),
+        StreamCodec::H264 => (
+            "h264",
+            &["h264_cuvid", "h264_qsv", "h264_rkmpp", "h264_v4l2m2m"],
+        ),
+        StreamCodec::Vvc => ("vvc", &["vvc_qsv"]),
+    };
     let mut out = Vec::with_capacity(base.len());
     let mut i = 0;
     while i < base.len() {
         if base[i] == "-c:v" && i + 1 < base.len() {
-            let av1 = base[i + 1].replace("hevc", "av1");
-            if AV1_HW.contains(&av1.as_str()) {
+            let sibling = base[i + 1].replace("hevc", sub);
+            if hw.contains(&sibling.as_str()) {
                 out.push("-c:v".to_string());
-                out.push(av1);
+                out.push(sibling);
             }
-            // else: omit `-c:v` → ffmpeg picks its default AV1 decoder.
+            // else: omit `-c:v` → ffmpeg picks its default decoder for `codec`.
             i += 2;
         } else {
             out.push(base[i].clone());
@@ -543,7 +661,80 @@ mod codec_tests {
     fn parse_roundtrip() {
         assert_eq!(StreamCodec::parse("AV1"), Some(StreamCodec::Av1));
         assert_eq!(StreamCodec::parse("hevc"), Some(StreamCodec::Hevc));
+        assert_eq!(StreamCodec::parse("h264"), Some(StreamCodec::H264));
+        assert_eq!(StreamCodec::parse("AVC"), Some(StreamCodec::H264));
+        assert_eq!(StreamCodec::parse("vvc"), Some(StreamCodec::Vvc));
+        assert_eq!(StreamCodec::parse("H.266"), Some(StreamCodec::Vvc));
         assert_eq!(StreamCodec::parse("vp9"), None);
+    }
+
+    #[test]
+    fn sniff_h264_annexb() {
+        // NVENC H.264 opens with SPS (0x67, High profile 0x64 follows).
+        assert_eq!(sniff_codec(&[0, 0, 0, 1, 0x67, 0x64]), StreamCodec::H264);
+        // AUD-first (0x09) also reads as H.264.
+        assert_eq!(sniff_codec(&[0, 0, 1, 0x09, 0xF0]), StreamCodec::H264);
+        // IDR-first (0x65) mid-stream join.
+        assert_eq!(sniff_codec(&[0, 0, 1, 0x65, 0x88]), StreamCodec::H264);
+    }
+
+    #[test]
+    fn sniff_vvc_annexb() {
+        // vvenc + aud=insert opens with AUD (type 20): 0x00 0xA1.
+        assert_eq!(sniff_codec(&[0, 0, 0, 1, 0x00, 0xA1]), StreamCodec::Vvc);
+        // SPS-first (type 15): 0x00 0x79.
+        assert_eq!(sniff_codec(&[0, 0, 1, 0x00, 0x79]), StreamCodec::Vvc);
+        // IDR_W_RADL-first (type 7): 0x00 0x39.
+        assert_eq!(sniff_codec(&[0, 0, 1, 0x00, 0x39]), StreamCodec::Vvc);
+    }
+
+    #[test]
+    fn sniff_hevc_not_confused_by_new_codecs() {
+        // NVENC HEVC opens with VPS: 0x40 0x01 — still HEVC.
+        assert_eq!(sniff_codec(&[0, 0, 0, 1, 0x40, 0x01]), StreamCodec::Hevc);
+        // HEVC IDR_W_RADL (type 19 → 0x26 0x01).
+        assert_eq!(sniff_codec(&[0, 0, 1, 0x26, 0x01]), StreamCodec::Hevc);
+        // An HEVC TRAIL_N (0x00 0x01) must NOT sniff as VVC: VVC-type would be
+        // 0 (TRAIL), which isn't in the opener set.
+        assert_eq!(sniff_codec(&[0, 0, 1, 0x00, 0x01]), StreamCodec::Hevc);
+    }
+
+    #[test]
+    fn keyframe_h264_idr() {
+        // SPS + PPS + IDR = key AU.
+        assert!(is_keyframe_au(
+            StreamCodec::H264,
+            &[0, 0, 0, 1, 0x67, 0x64, 0, 0, 1, 0x68, 0xEE, 0, 0, 1, 0x65, 0x88]
+        ));
+        // Non-IDR slice (type 1) is not.
+        assert!(!is_keyframe_au(
+            StreamCodec::H264,
+            &[0, 0, 0, 1, 0x41, 0x9A]
+        ));
+        // Parameter sets alone don't make a key AU.
+        assert!(!is_keyframe_au(
+            StreamCodec::H264,
+            &[0, 0, 0, 1, 0x67, 0x64]
+        ));
+    }
+
+    #[test]
+    fn keyframe_vvc_irap() {
+        // AUD + SPS + IDR_W_RADL (type 7 → 0x00 0x39) = key AU.
+        assert!(is_keyframe_au(
+            StreamCodec::Vvc,
+            &[0, 0, 1, 0x00, 0xA1, 0x50, 0, 0, 1, 0x00, 0x79, 0x02, 0, 0, 1, 0x00, 0x39, 0x01]
+        ));
+        // CRA (type 9 → 0x00 0x49) counts too.
+        assert!(is_keyframe_au(
+            StreamCodec::Vvc,
+            &[0, 0, 0, 1, 0x00, 0x49, 0x01]
+        ));
+        // TRAIL (type 0 → 0x00 0x01) does not.
+        assert!(!is_keyframe_au(
+            StreamCodec::Vvc,
+            &[0, 0, 0, 1, 0x00, 0x01, 0xD0]
+        ));
     }
 
     #[test]
@@ -556,17 +747,44 @@ mod codec_tests {
             "hevc_cuvid".into(),
         ];
         assert_eq!(
-            retarget_av1(&nvdec),
+            retarget(StreamCodec::Av1, &nvdec),
             vec!["-flags", "low_delay", "-c:v", "av1_cuvid"]
         );
         // hwaccel passes through unchanged (vaapi/drm decode AV1 too).
         let vaapi = vec!["-hwaccel".into(), "vaapi".into()];
-        assert_eq!(retarget_av1(&vaapi), vec!["-hwaccel", "vaapi"]);
+        assert_eq!(
+            retarget(StreamCodec::Av1, &vaapi),
+            vec!["-hwaccel", "vaapi"]
+        );
         // Software (no -c:v) stays empty → ffmpeg's default AV1 decoder.
-        assert!(retarget_av1(&[]).is_empty());
+        assert!(retarget(StreamCodec::Av1, &[]).is_empty());
         // A HW HEVC decoder with no AV1 sibling drops -c:v (software fallback).
         let amf = vec!["-c:v".into(), "hevc_amf".into()];
-        assert!(retarget_av1(&amf).is_empty());
+        assert!(retarget(StreamCodec::Av1, &amf).is_empty());
+    }
+
+    #[test]
+    fn retarget_h264_and_vvc() {
+        let nvdec = vec!["-c:v".into(), "hevc_cuvid".into()];
+        // Every probed HW engine has an H.264 sibling.
+        assert_eq!(
+            retarget(StreamCodec::H264, &nvdec),
+            vec!["-c:v", "h264_cuvid"]
+        );
+        let pi4 = vec!["-c:v".into(), "hevc_v4l2m2m".into()];
+        assert_eq!(
+            retarget(StreamCodec::H264, &pi4),
+            vec!["-c:v", "h264_v4l2m2m"]
+        );
+        // VVC: only vvc_qsv exists in hardware; NVDEC drops to software.
+        assert!(retarget(StreamCodec::Vvc, &nvdec).is_empty());
+        let qsv = vec!["-c:v".into(), "hevc_qsv".into()];
+        assert_eq!(retarget(StreamCodec::Vvc, &qsv), vec!["-c:v", "vvc_qsv"]);
+        // HEVC passes through verbatim.
+        assert_eq!(
+            retarget(StreamCodec::Hevc, &nvdec),
+            vec!["-c:v", "hevc_cuvid"]
+        );
     }
 }
 
