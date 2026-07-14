@@ -110,10 +110,11 @@ class HevcDecoder(
     private val surface: Surface,
     private val pace: PaceMode,
     private val caps: DisplayCaps,
-    /// The decode MIME — `video/hevc` (default) or `video/av01`. The stream's
-    /// codec is sniffed from the first access unit (see StreamHub); the host
-    /// repeats the sequence header / parameter sets every IDR (≤1s) so a decoder
-    /// bound to the right MIME resyncs quickly even mid-stream.
+    /// The decode MIME — `video/hevc` (default), `video/av01`, `video/avc`, or
+    /// `video/vvc`. The stream's codec is sniffed from the first access unit
+    /// (see StreamHub); the host repeats the sequence header / parameter sets
+    /// every IDR (≤1s) so a decoder bound to the right MIME resyncs quickly
+    /// even mid-stream.
     val mime: String = "video/hevc",
     /// Optional 1s-cadence stats sink for the debug HUD. Null in release (StreamHub
     /// only wires it under BuildConfig.DEBUG), so production decode pays nothing but
@@ -254,8 +255,10 @@ class HevcDecoder(
         /// Filters out OMX.google.* and c2.android.* (both Android's software
         /// fallbacks) and prefers `isHardwareAccelerated()` on API 29+. Falls back
         /// to `createDecoderByType(mime)` if nothing matches, with a loud warning
-        /// so the symptom is visible in logcat. Works for `video/hevc` and
-        /// `video/av01` (the X90J and most 2020+ Android TVs have HW AV1 decode).
+        /// so the symptom is visible in logcat. Works for `video/hevc`,
+        /// `video/av01` (the X90J and most 2020+ Android TVs have HW AV1 decode),
+        /// `video/avc` (universal), and `video/vvc` (H.266 — newest SoCs only;
+        /// elsewhere createDecoderByType throws and StreamHub logs the miss).
         private fun pickDecoder(mime: String): MediaCodec {
             val list = MediaCodecList(MediaCodecList.REGULAR_CODECS)
             val match: MediaCodecInfo? = list.codecInfos.firstOrNull { info ->

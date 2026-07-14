@@ -214,9 +214,13 @@ object StreamHub {
     // session; recreated on (re)attach, destroyed on surface-destroyed/switch.
     @Volatile private var decoder: HevcDecoder? = null
     // The stream's video MIME, sniffed from the first access unit of the active
-    // session (HEVC vs AV1). Remembered so a reconnect builds the right decoder
-    // directly; `sniffed` re-arms per decoder so a host that switched codec is
-    // re-detected. Default HEVC keeps the existing path byte-for-byte unchanged.
+    // session (HEVC / AV1 / AVC / VVC). Remembered so a reconnect builds the
+    // right decoder directly; `sniffed` re-arms per decoder so a host that
+    // switched codec is re-detected. Default HEVC keeps the existing path
+    // byte-for-byte unchanged. NB: "video/vvc" (H.266) decoders exist only on
+    // the newest SoCs (e.g. Dimensity 9300); everywhere else decoder creation
+    // fails loudly and the stream stays black — an expected limit of the
+    // experimental VVC path.
     @Volatile private var streamMime: String = "video/hevc"
     @Volatile private var sniffed: Boolean = false
 
@@ -1060,7 +1064,11 @@ object StreamHub {
                 onGeometry = { w, h -> onDecoderGeometry(w, h) },
             )
         }.getOrElse {
-            Log.e(TAG, "decoder create failed: ${it.message}")
+            Log.e(
+                TAG,
+                "decoder create failed for $streamMime: ${it.message} — this device has no " +
+                    "usable decoder for that codec; switch the host to HEVC/AVC in the panel",
+            )
             null
         }
     }
@@ -1115,10 +1123,12 @@ object StreamHub {
         }
     }
 
-    /// Sniff the video MIME from the first access unit. HEVC (Annex-B) opens with
-    /// a NAL start code `00 00 [00] 01`; an AV1 low-overhead OBU temporal unit
-    /// opens with an OBU header (forbidden bit 0) of type sequence-header (1),
-    /// temporal-delimiter (2) or frame (6). Defaults to HEVC when ambiguous.
+    /// Sniff the video MIME from the first access unit. AV1's low-overhead OBU
+    /// stream has no NAL start codes; H.264, HEVC and VVC are ALL Annex-B
+    /// (`00 00 [00] 01`), so they're told apart by the first NAL header — each
+    /// host encoder opens its stream (and every IDR AU, via parameter-set
+    /// repetition) with a distinctive NAL. Mirrors `media_decode::sniff_codec`
+    /// on the Rust side; keep the two in step. Defaults to HEVC when ambiguous.
     private fun sniffCodecMime(au: ByteArray): String {
         val mime = sniffCodecMimeInner(au)
         val head = au.take(16).joinToString(" ") { "%02x".format(it.toInt() and 0xff) }
@@ -1127,9 +1137,41 @@ object StreamHub {
     }
 
     private fun sniffCodecMimeInner(au: ByteArray): String {
-        if (au.size >= 3 && au[0].toInt() == 0 && au[1].toInt() == 0) {
-            if (au[2].toInt() == 1) return "video/hevc"
-            if (au.size >= 4 && au[2].toInt() == 0 && au[3].toInt() == 1) return "video/hevc"
+        // Annex-B: locate the first NAL header after the start code.
+        val nalOff = if (au.size >= 3 && au[0].toInt() == 0 && au[1].toInt() == 0) {
+            when {
+                au[2].toInt() == 1 -> 3
+                au.size >= 4 && au[2].toInt() == 0 && au[3].toInt() == 1 -> 4
+                else -> -1
+            }
+        } else {
+            -1
+        }
+        if (nalOff >= 0) {
+            if (au.size < nalOff + 2) return "video/hevc"
+            val b0 = au[nalOff].toInt() and 0xff
+            val b1 = au[nalOff + 1].toInt() and 0xff
+            // VVC: base-layer first header byte is 0x00; type sits in the second
+            // byte's top 5 bits — IRAP 7..9, VPS/SPS/PPS/APS 14..17, PH 19,
+            // AUD 20, prefix-SEI 23 — with a non-zero tid+1 in the low 3 bits.
+            val vvcType = b1 shr 3
+            if (b0 == 0x00 && (b1 and 0x07) != 0 &&
+                (vvcType in 7..9 || vvcType in 14..17 || vvcType == 19 || vvcType == 20 || vvcType == 23)
+            ) {
+                return "video/vvc"
+            }
+            // HEVC: layer-0 second header byte is tid+1 (1..7); opening types
+            // IRAP 16..23, VPS/SPS/PPS 32..34, AUD 35, prefix-SEI 39.
+            val hevcType = (b0 shr 1) and 0x3f
+            if ((b0 and 0x81) == 0 && b1 in 1..7 &&
+                (hevcType in 16..23 || hevcType in 32..35 || hevcType == 39)
+            ) {
+                return "video/hevc"
+            }
+            // H.264: forbidden bit clear; opening types IDR 5, SEI 6, SPS 7,
+            // PPS 8, AUD 9.
+            if ((b0 and 0x80) == 0 && (b0 and 0x1f) in 5..9) return "video/avc"
+            return "video/hevc"
         }
         if (au.isNotEmpty()) {
             val b = au[0].toInt() and 0xff
