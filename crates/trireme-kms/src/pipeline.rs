@@ -133,7 +133,15 @@ fn start_decode(
                 Some(client_identity.as_ref()),
                 |au| {
                     if pipe.is_none() {
-                        match spawn_decoder(w, h) {
+                        // Codec: a TRIREME_CODEC override wins; otherwise sniff
+                        // THIS first AU (NAL-header / OBU discrimination) so the
+                        // resident client follows whatever codec the host streams
+                        // (HEVC/AV1/AVC/VVC) with no configuration. The lazy
+                        // spawn-on-first-AU already gives the sniff its bytes.
+                        let codec = media_decode::codec_override_from_env()
+                            .unwrap_or_else(|| media_decode::sniff_codec(&au));
+                        tracing::info!("stream codec: {} — spawning decoder", codec.label());
+                        match spawn_decoder(w, h, codec) {
                             Ok(mut child) => {
                                 let stdin = child.stdin.take().expect("ffmpeg stdin");
                                 let stdout = child.stdout.take().expect("ffmpeg stdout");
@@ -444,7 +452,7 @@ pub fn run_test_pattern(card_path: &str, pref: Option<ModePref>, frames: u64) ->
     Ok(())
 }
 
-fn spawn_decoder(w: u32, h: u32) -> Result<Child> {
+fn spawn_decoder(w: u32, h: u32, codec: media_decode::StreamCodec) -> Result<Child> {
     // The HW decoder is chosen at runtime by `media_decode` (NVDEC `hevc_cuvid`,
     // Rockchip MPP `hevc_rkmpp`, V4L2 stateless `-hwaccel drm` on a Pi 5, …;
     // override with TRIREME_DECODER). Whatever wins, we force system-memory NV12
@@ -454,9 +462,9 @@ fn spawn_decoder(w: u32, h: u32) -> Result<Child> {
     // they make hevc_cuvid emit undecoded GREEN frames, and our stream has no
     // B-frames (ULTRA_LOW_LATENCY) so they'd buy nothing.
     let mut args: Vec<String> = vec!["-hide_banner".into(), "-loglevel".into(), "warning".into()];
-    // Codec: HEVC by default; AV1 when TRIREME_CODEC=av1 (the host switched to
-    // AV1). `input_args_for` retargets the probed HW decoder to its AV1 sibling.
-    let codec = media_decode::codec_from_env(media_decode::StreamCodec::Hevc);
+    // Codec: sniffed from the stream's first AU by the caller (TRIREME_CODEC
+    // overrides). `input_args_for` retargets the probed HW decoder to that
+    // codec's sibling.
     let input_args = media_decode::input_args_for(codec);
     // `-flags low_delay -fflags nobuffer` make hevc_cuvid (NVIDIA) emit GREEN frames
     // (see the note above), so gate them to a non-cuvid decoder — the Pi's V4L2 drm

@@ -2400,13 +2400,36 @@ fn reinsert_stdin(slot_empty: bool) -> bool {
     slot_empty
 }
 
-/// Build the full ffmpeg argument vector for the HEVC/AV1 → raw decode as the given
-/// chain: plain NV12, CPU-tonemapped NV12 (the zscale `-vf`), or P010 passthrough
-/// for the GPU tonemap (no filtering — the shader does the color transform).
-/// Factored out of [`spawn_decode`] so the reader thread can rebuild the child IN
-/// PLACE with another chain on a mid-session colorimetry flip (issue #16), reusing
-/// the exact same decoder/codec/loglevel setup rather than reconnecting.
-fn decode_ffmpeg_args(chain: DecodeChain) -> Vec<String> {
+/// `StreamCodec` → `AtomicU8` encoding for the sniffed-codec cell (0 = unknown).
+fn codec_to_u8(c: media_decode::StreamCodec) -> u8 {
+    match c {
+        media_decode::StreamCodec::Hevc => 1,
+        media_decode::StreamCodec::Av1 => 2,
+        media_decode::StreamCodec::H264 => 3,
+        media_decode::StreamCodec::Vvc => 4,
+    }
+}
+
+/// Inverse of [`codec_to_u8`]; `None` for 0 (codec not yet sniffed).
+fn codec_from_u8(v: u8) -> Option<media_decode::StreamCodec> {
+    Some(match v {
+        1 => media_decode::StreamCodec::Hevc,
+        2 => media_decode::StreamCodec::Av1,
+        3 => media_decode::StreamCodec::H264,
+        4 => media_decode::StreamCodec::Vvc,
+        _ => return None,
+    })
+}
+
+/// Build the full ffmpeg argument vector for the compressed → raw decode as the
+/// given chain: plain NV12, CPU-tonemapped NV12 (the zscale `-vf`), or P010
+/// passthrough for the GPU tonemap (no filtering — the shader does the color
+/// transform). `codec` is the stream's codec (first-AU sniff or TRIREME_CODEC
+/// override — see the reader's codec wait). Factored out of [`spawn_decode`] so
+/// the reader thread can rebuild the child IN PLACE with another chain on a
+/// mid-session colorimetry flip (issue #16), reusing the exact same
+/// decoder/codec/loglevel setup rather than reconnecting.
+fn decode_ffmpeg_args(chain: DecodeChain, codec: media_decode::StreamCodec) -> Vec<String> {
     let ff_debug = std::env::var_os("TRIREME_FFMPEG_DEBUG").is_some();
     let lead: &[&str] = if ff_debug {
         &["-hide_banner", "-loglevel", "info", "-stats"]
@@ -2414,7 +2437,6 @@ fn decode_ffmpeg_args(chain: DecodeChain) -> Vec<String> {
         &["-hide_banner", "-loglevel", "warning"]
     };
     let mut args: Vec<String> = lead.iter().map(|s| s.to_string()).collect();
-    let codec = media_decode::codec_from_env(media_decode::StreamCodec::Hevc);
     args.extend(media_decode::input_args_for(codec));
     args.push("-f".into());
     args.push(codec.ffmpeg_format());
@@ -2450,19 +2472,20 @@ fn decode_ffmpeg_args(chain: DecodeChain) -> Vec<String> {
 /// freshly-spawned child on the SAME QUIC connection.
 fn spawn_decode_ffmpeg(
     chain: DecodeChain,
+    codec: media_decode::StreamCodec,
 ) -> Result<(
     std::process::Child,
     std::process::ChildStdin,
     std::process::ChildStdout,
 )> {
-    let args = decode_ffmpeg_args(chain);
+    let args = decode_ffmpeg_args(chain, codec);
     let mut ff = Command::new(ffmpeg_program())
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("spawn ffmpeg (HEVC/AV1 decode)")?;
+        .context("spawn ffmpeg (video decode)")?;
     let stdin = ff.stdin.take().context("ffmpeg stdin")?;
     let stdout = ff.stdout.take().context("ffmpeg stdout")?;
     // Fatten the raw-frame pipes (Linux): a 4K P010 frame is ~25MB and the
@@ -2896,16 +2919,26 @@ fn spawn_decode(
             initial_chain.label()
         );
     }
-    let (ff, stdin0, mut stdout) = spawn_decode_ffmpeg(initial_chain)
-        .with_context(|| format!("spawn ffmpeg (source[{idx}] decode)"))?;
+    // The stream's codec, published as a codec_to_u8 value by the QUIC thread's
+    // first-AU sniff (0 = not yet known). An explicit TRIREME_CODEC override
+    // pre-fills the cell, so the sniff never runs and the env var keeps its old
+    // meaning. The reader waits on this before spawning the FIRST decode child —
+    // that ordering (sniff, THEN spawn) is what lets the desktop client follow
+    // whatever codec the host streams (HEVC/AV1/AVC/VVC) with no configuration,
+    // the same way the Android client does. Sniffed once per source: a host
+    // codec switch always relaunches the host, which ends this session, and the
+    // re-dial re-sniffs.
+    let sniffed_codec = Arc::new(std::sync::atomic::AtomicU8::new(
+        media_decode::codec_override_from_env().map_or(0, codec_to_u8),
+    ));
     // The stdin the on_frame closure writes each AU to. Wrapped so the reader thread
     // can SWAP it for a freshly-rebuilt child's stdin on a colorimetry flip WITHOUT
     // reconnecting: the QUIC connection (and this closure) stays alive across the
-    // rebuild, so the host never sees a drop and cannot preempt us. `None` briefly
-    // while the reader is mid-rebuild; writes in that window are dropped (the host
-    // re-sends an IDR ~1×/s so the new chain resyncs).
-    let shared_stdin: Arc<Mutex<Option<std::process::ChildStdin>>> =
-        Arc::new(Mutex::new(Some(stdin0)));
+    // rebuild, so the host never sees a drop and cannot preempt us. `None` until the
+    // reader has learned the codec and spawned the first child, and briefly while it
+    // is mid-rebuild; writes in those windows are dropped (the key-AU gate plus the
+    // host's IDR re-sync recover the fresh chain).
+    let shared_stdin: Arc<Mutex<Option<std::process::ChildStdin>>> = Arc::new(Mutex::new(None));
     // Set by the QUIC thread when the session ends (drop / host refusal / error) so the
     // reader can tell a genuine end-of-session from a colorimetry-rebuild window: once
     // the session is over there is nothing feeding a new decode child, so the reader
@@ -2933,6 +2966,7 @@ fn spawn_decode(
     let quic_done_dec = quic_done.clone();
     let await_key_dec = await_key.clone();
     let request_idr_dec = request_idr.clone();
+    let sniffed_dec = sniffed_codec.clone();
     std::thread::Builder::new()
         .name(format!("trireme-raw-{idx}"))
         .spawn(move || {
@@ -2973,7 +3007,8 @@ fn spawn_decode(
             let mut frames_this_chain: u64 = 0;
             // The current decode child, held in an Option so a rebuild can `take()` it
             // for reaping without leaving `ff` moved-out for the borrow checker.
-            let mut ff = Some(ff);
+            // `None` until the codec wait below spawns the first child.
+            let mut ff: Option<std::process::Child> = None;
             // Rebuild the decode ffmpeg IN PLACE with `to_tonemap` (issue #16). KILLS
             // and reaps the old child, spawns the new one, re-points the shared stdin
             // the on_frame closure writes to, and returns its stdout for the reader to
@@ -3022,7 +3057,13 @@ fn spawn_decode(
                 //    ChildStdin. A few AUs may fall in the None window; the host's ~1×/s
                 //    IDR re-sync papers over that on the new chain.)
                 *stdin_dec.lock().unwrap() = None;
-                match spawn_decode_ffmpeg(to_chain) {
+                // The codec is whatever the sniff/override published — the codec
+                // wait below guarantees it is known before the first spawn, and
+                // it never changes within a session (a host codec switch always
+                // relaunches the host, which ends this session).
+                let codec = codec_from_u8(sniffed_dec.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(media_decode::StreamCodec::Hevc);
+                match spawn_decode_ffmpeg(to_chain, codec) {
                     Ok((new_ff, new_stdin, new_stdout)) => {
                         // Arm the key-AU gate BEFORE the fresh stdin becomes reachable:
                         // a mid-GOP AU fed to the new child would decode as green
@@ -3043,6 +3084,42 @@ fn spawn_decode(
                         tracing::error!("source[{idx}] decode-chain rebuild failed: {e:#}");
                         None
                     }
+                }
+            };
+            // Wait for the stream's codec before spawning the FIRST decode child:
+            // a TRIREME_CODEC override resolved instantly (the cell is pre-filled);
+            // otherwise the QUIC thread publishes the first AU's sniff. No
+            // timeout — with no AU there is nothing to decode, and a session that
+            // ends first breaks the wait via quic_done. This ordering (learn the
+            // codec, THEN pick the demuxer/decoder) is what lets the desktop
+            // client follow a host codec switch with zero configuration.
+            let codec = loop {
+                if let Some(c) =
+                    codec_from_u8(sniffed_dec.load(std::sync::atomic::Ordering::Relaxed))
+                {
+                    break c;
+                }
+                if quic_done_dec.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(
+                        "source[{idx}] decode reader exited (session ended before any AU)"
+                    );
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            tracing::info!(
+                "source[{idx}] decode chain: {} ({}-colorimetry)",
+                codec.label(),
+                chain.label()
+            );
+            let mut stdout = match rebuild(ff.take(), chain) {
+                Some((new_ff, new_stdout)) => {
+                    ff = Some(new_ff);
+                    new_stdout
+                }
+                None => {
+                    tracing::info!("source[{idx}] decode reader exited (no decode chain)");
+                    return;
                 }
             };
             // Last host-announced cursor-capture state we forwarded to the app (from
@@ -3223,9 +3300,7 @@ fn spawn_decode(
     let stdin_quic = shared_stdin.clone();
     let await_key_quic = await_key.clone();
     let request_idr_quic = request_idr.clone();
-    // The codec whose bitstream the key-AU gate parses. Same env-derived choice
-    // `decode_ffmpeg_args` makes, resolved once — the QUIC closure is hot.
-    let stream_codec = media_decode::codec_from_env(media_decode::StreamCodec::Hevc);
+    let sniffed_quic = sniffed_codec.clone();
     std::thread::Builder::new()
         .name(format!("trireme-quic-{idx}"))
         .spawn(move || {
@@ -3234,6 +3309,25 @@ fn spawn_decode(
                 expected_pubkey,
                 Some(client_identity.as_ref()),
                 |au| {
+                    // The codec whose bitstream the key-AU gate parses: the cell
+                    // holds the TRIREME_CODEC override or a prior sniff; on the
+                    // FIRST AU of an un-overridden session it is still empty, so
+                    // sniff (NAL-header / OBU discrimination) and publish — the
+                    // reader is waiting on exactly this to spawn the right
+                    // ffmpeg. One atomic load per AU thereafter (the closure is
+                    // hot).
+                    let stream_codec = match codec_from_u8(
+                        sniffed_quic.load(std::sync::atomic::Ordering::Relaxed),
+                    ) {
+                        Some(c) => c,
+                        None => {
+                            let c = media_decode::sniff_codec(&au);
+                            sniffed_quic
+                                .store(codec_to_u8(c), std::sync::atomic::Ordering::Relaxed);
+                            tracing::info!("source[{idx}] stream codec sniffed: {}", c.label());
+                            c
+                        }
+                    };
                     // TAKE the stdin out under the lock, then release before writing so a
                     // full-pipe `write_all` never blocks the reader's rebuild `lock()`.
                     // The key-AU gate (issue #32) is checked under the SAME guard: the
@@ -3254,6 +3348,16 @@ fn spawn_decode(
                                 // landed right after the respawn's leading IDR, which
                                 // the OLD chain consumed) would leave the gate closed
                                 // until the next periodic IDR.
+                                request_idr_quic.store(true, std::sync::atomic::Ordering::Relaxed);
+                                return;
+                            }
+                            // A key AU but no decode child to feed yet (the reader
+                            // is still in its codec wait / mid-spawn): keep the
+                            // gate ARMED so the next key AU opens it for the fresh
+                            // child, instead of this one disarming into a `None`
+                            // slot and the child then starting mid-GOP (green
+                            // concealment frames).
+                            if slot.is_none() {
                                 request_idr_quic.store(true, std::sync::atomic::Ordering::Relaxed);
                                 return;
                             }

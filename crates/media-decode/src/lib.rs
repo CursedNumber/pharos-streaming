@@ -317,15 +317,22 @@ impl StreamCodec {
     }
 }
 
-/// The codec the client should decode: the `TRIREME_CODEC` env override if set
-/// (mirrors `TRIREME_DECODER`), else `default`. Lets the desktop client follow a
-/// host that switched to AV1 without a rebuild; over-the-wire auto-negotiation is
-/// the next step.
-pub fn codec_from_env(default: StreamCodec) -> StreamCodec {
+/// The explicit `TRIREME_CODEC` override, if set to a recognised codec name
+/// (mirrors `TRIREME_DECODER`). Unlike [`codec_from_env`] this distinguishes
+/// "unset" (`None` — the caller may sniff the stream instead) from an explicit
+/// user choice that must never be second-guessed by a sniff.
+pub fn codec_override_from_env() -> Option<StreamCodec> {
     std::env::var("TRIREME_CODEC")
         .ok()
         .and_then(|s| StreamCodec::parse(&s))
-        .unwrap_or(default)
+}
+
+/// The codec the client should decode: the `TRIREME_CODEC` env override if set,
+/// else `default`. Callers that can see the bitstream should prefer
+/// [`codec_override_from_env`] + [`sniff_codec`] on the first AU, which follows
+/// a host codec switch with no env var at all.
+pub fn codec_from_env(default: StreamCodec) -> StreamCodec {
+    codec_override_from_env().unwrap_or(default)
 }
 
 /// Sniff the codec from the first bytes of an elementary stream. AV1 is easy —
