@@ -3117,6 +3117,15 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
     // uncapped). Seeded 0 = the inert default the streamer atomic reports until a
     // client sends a real range, so it's a no-op from t=0 and only fires on change.
     let mut last_client_bitratepref: u64 = 0;
+    // Connect-time bandwidth probe (issue #40): whether a probe has been kicked
+    // for the CURRENT Auto client (reset when its pref clears on disconnect),
+    // whether its result was applied, and the transport hint it was bounded by
+    // (a mid-session WiFi↔Ethernet flip re-probes). PHAROS_PROBE=0 disables the
+    // whole mechanism — Auto then resolves to the configured RC as before.
+    let probe_enabled = std::env::var("PHAROS_PROBE").map_or(true, |v| v.trim() != "0");
+    let mut probe_kicked = false;
+    let mut probe_applied = false;
+    let mut probe_transport: u8 = 0;
     // Last client framerate pref applied, packed (min_fps<<32)|max_fps (max=0=Auto).
     // Seeded 0 so it's inert until a client sends a real range; on change it sets
     // cfg_fps_cap (the encode-pace ceiling, ≤ cfg.fps) and fps_floor.
@@ -4963,8 +4972,84 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                             bitrate_floor_kbps, avg_cap, max_kbps == 0,
                         );
                     } else {
-                        // Client cleared its pref → restore the host's configured floor.
+                        // Client cleared its pref → restore the host's configured floor
+                        // and disarm the bandwidth probe: the pref only reads (0,0)
+                        // when the client disconnected, so the next client (or the
+                        // same one reconnecting) probes fresh.
                         bitrate_floor_kbps = NET_FLOOR_KBPS;
+                        probe_kicked = false;
+                        probe_applied = false;
+                        probe_transport = 0;
+                    }
+                }
+            }
+
+            // Issue #40: measured Auto bitrate. For a client that chose Auto
+            // (max=0, uncapped) AND proves it can report delivered goodput
+            // (v2 QoS with recv_kbps — an old APK never does, and then none of
+            // this runs), run ONE connect-time bandwidth probe and resolve the
+            // Auto cap from the MEASUREMENT instead of the configured guess.
+            // The stream runs at the conservative configured cap in parallel,
+            // so first light is never delayed; the deficit actuator keeps
+            // adapting BELOW the measured cap exactly as before. The client's
+            // transport hint only BOUNDS the probe's offered load (Ethernet
+            // probes higher than WiFi so a fat pipe is found, WiFi stays
+            // polite to the RF, unknown stays conservative) — it never sets
+            // the cap: QUIC datagrams are congestion-controlled, so even a too
+            // -high ceiling cannot push more than BBR allows onto the wire.
+            if probe_enabled {
+                if let Some(s) = bench_output
+                    .and_then(|idx| pipelines[idx].as_ref())
+                    .and_then(|p| p.streamer.as_ref())
+                {
+                    let (min_kbps, max_kbps) = s.client_bitrate_pref();
+                    let uncapped_auto = (min_kbps != 0 || max_kbps != 0) && max_kbps == 0;
+                    if uncapped_auto && s.client_reports_goodput() {
+                        let transport = s.client_transport();
+                        let retransport =
+                            probe_kicked && transport != probe_transport && transport != 0;
+                        if !probe_kicked || retransport {
+                            // Probe ceiling by transport hint (offered load only).
+                            let ceiling_kbps = match transport {
+                                core_proto::latency::TRANSPORT_ETHERNET => 400_000,
+                                core_proto::latency::TRANSPORT_WIFI => 250_000,
+                                _ => 120_000,
+                            };
+                            s.start_probe(ceiling_kbps, 2_000);
+                            probe_kicked = true;
+                            probe_applied = false;
+                            probe_transport = transport;
+                            tracing::info!(
+                                target: "compositor::wire",
+                                "probe: Auto bitrate — probing up to {ceiling_kbps}kbps                                  (transport hint {transport}{})",
+                                if retransport { ", transport changed" } else { "" },
+                            );
+                        }
+                        if !probe_applied {
+                            if let Some(measured) = s.probe_result() {
+                                probe_applied = true;
+                                // 80% of peak delivered goodput, bounded by the
+                                // client floor and the host's client-cap ceiling.
+                                let ceiling = client_bitrate_ceiling(cfg);
+                                let avg_cap = (measured.saturating_mul(4) / 5)
+                                    .max(bitrate_floor_kbps)
+                                    .min(ceiling);
+                                let max_cap = avg_cap.saturating_mul(3) / 2;
+                                rc_caps = Some((avg_cap, max_cap));
+                                net_allowed_kbps = avg_cap;
+                                last_reconfig_kbps = avg_cap;
+                                net_lowwater_kbps = avg_cap;
+                                net_low_ticks = 0;
+                                net_clear_ticks = 0;
+                                reconfigure_all_bitrate(
+                                    &pipelines, avg_cap, avg_cap, max_cap, cfg.fps, true,
+                                );
+                                tracing::info!(
+                                    target: "compositor::wire",
+                                    "probe: Auto bitrate cap → {avg_cap}kbps                                      (measured {measured}kbps delivered, ceiling {ceiling}kbps)",
+                                );
+                            }
+                        }
                     }
                 }
             }

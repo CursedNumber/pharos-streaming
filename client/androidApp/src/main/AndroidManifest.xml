@@ -2,6 +2,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Issue #40: read the link transport (WiFi vs Ethernet) so the host can
+         bound its connect-time bandwidth probe. Normal permission, no prompt. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- Hold a low-latency WiFi lock during USB export so power-save doesn't
          park the radio and spike the input round-trip. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />

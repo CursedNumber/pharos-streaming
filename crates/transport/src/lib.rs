@@ -757,15 +757,21 @@ pub struct QuicStreamer {
     /// the compositor reads it via [`Self::client_fps_pref`] as the encode-pace
     /// ceiling + adaptation floor. Cleared on disconnect.
     client_fps_pref: Arc<std::sync::atomic::AtomicU64>,
+    /// Connect-time bandwidth-probe state (issue #40): request/result
+    /// generations, the client's transport hint, and the measured goodput.
+    /// See [`ProbeShared`]; driven by [`Self::start_probe`] / [`Self::probe_result`].
+    probe: Arc<ProbeShared>,
     /// Taken out once via [`Self::take_input_rx`].
     input_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<core_proto::InputEvent>>>,
     /// Decoded [`core_proto::WireLatencyReport`]s sent back by the client at the
     /// end of a bench window. Taken out once via [`Self::take_latency_rx`].
     latency_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<core_proto::WireLatencyReport>>>,
-    /// Continuous [`core_proto::ClientQos`] reports (delivered fps + decode ms)
-    /// the client emits ~1×/s. Taken out once via [`Self::take_qos_rx`]; the
-    /// compositor drains it to make pacing network-aware.
-    qos_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<core_proto::ClientQos>>>,
+    /// Continuous client QoS reports (delivered fps + decode ms + measured
+    /// goodput/transport, [`core_proto::ClientQosV2`]) the client emits ~1×/s.
+    /// Old clients' v1 reports are widened with inert probe fields. Taken out
+    /// once via [`Self::take_qos_rx`]; the compositor drains it to make pacing
+    /// network-aware.
+    qos_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<core_proto::ClientQosV2>>>,
     /// Latest app catalog to push to clients on the app relay stream. `watch` so
     /// a late-joining client gets the current value and each change re-sends.
     app_catalog_tx: tokio::sync::watch::Sender<Vec<core_proto::AppInfo>>,
@@ -915,7 +921,9 @@ impl QuicStreamer {
         let (gyro_tx, gyro_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (input_tx, input_rx) = mpsc::unbounded_channel::<core_proto::InputEvent>();
         let (latency_tx, latency_rx) = mpsc::unbounded_channel::<core_proto::WireLatencyReport>();
-        let (qos_tx, qos_rx) = mpsc::unbounded_channel::<core_proto::ClientQos>();
+        let (qos_tx, qos_rx) = mpsc::unbounded_channel::<core_proto::ClientQosV2>();
+        let probe = Arc::new(ProbeShared::default());
+        let probe_thread = probe.clone();
         let (app_catalog_tx, app_catalog_rx) =
             tokio::sync::watch::channel::<Vec<core_proto::AppInfo>>(Vec::new());
         let (app_launch_tx, app_launch_rx) = mpsc::unbounded_channel::<core_proto::AppMsg>();
@@ -1023,6 +1031,7 @@ impl QuicStreamer {
                     input_tx,
                     latency_tx,
                     qos_tx,
+                    probe_thread.clone(),
                     app_catalog_rx,
                     app_launch_tx,
                     clipboard_out_rx,
@@ -1063,6 +1072,7 @@ impl QuicStreamer {
             input_rx: std::sync::Mutex::new(Some(input_rx)),
             latency_rx: std::sync::Mutex::new(Some(latency_rx)),
             qos_rx: std::sync::Mutex::new(Some(qos_rx)),
+            probe,
             app_catalog_tx,
             app_launch_rx: std::sync::Mutex::new(Some(app_launch_rx)),
             clipboard_out_tx,
@@ -1402,6 +1412,48 @@ impl QuicStreamer {
         ((v >> 32) as u32, v as u32)
     }
 
+    /// Kick a connect-time bandwidth probe (issue #40): the per-connection pad
+    /// task ramps content-free `DG_PROBE_PAD` datagrams toward `ceiling_kbps`
+    /// of OFFERED load for `duration_ms`, then holds a ~1.5s tail so the
+    /// client's next QoS windows report the delivered goodput. The wire never
+    /// carries more than BBR allows (QUIC datagrams are congestion-controlled;
+    /// excess padding is dropped in the send buffer), so the ceiling bounds
+    /// waste, not safety. Poll [`Self::probe_result`] for the measurement.
+    pub fn start_probe(&self, ceiling_kbps: u32, duration_ms: u32) {
+        self.probe
+            .ceiling_kbps
+            .store(ceiling_kbps, Ordering::Relaxed);
+        self.probe.duration_ms.store(duration_ms, Ordering::Relaxed);
+        self.probe.req_gen.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The finished probe's peak delivered goodput (kbps), once the latest
+    /// [`Self::start_probe`] request has completed and measured anything.
+    /// `None` while in flight, when no probe ran, or when the client never
+    /// reported goodput (old client → the caller keeps today's behavior).
+    pub fn probe_result(&self) -> Option<u32> {
+        let done = self.probe.done_gen.load(Ordering::Relaxed);
+        if done != self.probe.req_gen.load(Ordering::Relaxed) {
+            return None; // in flight (or cancelled by a reconnect)
+        }
+        match self.probe.measured_kbps.load(Ordering::Relaxed) {
+            0 => None,
+            kbps => Some(kbps),
+        }
+    }
+
+    /// The connected client's link-transport hint (`core_proto::TRANSPORT_*`),
+    /// from its v2 QoS reports. `TRANSPORT_UNKNOWN` for old clients.
+    pub fn client_transport(&self) -> u8 {
+        self.probe.transport.load(Ordering::Relaxed)
+    }
+
+    /// Whether this client has ever reported measured goodput (v2 QoS with a
+    /// non-zero `recv_kbps`) — the gate for bothering to probe at all.
+    pub fn client_reports_goodput(&self) -> bool {
+        self.probe.goodput_seen.load(Ordering::Relaxed)
+    }
+
     /// Take the InputEvent receiver — call exactly once. Subsequent calls
     /// return `None`. The compositor pulls events from this and dispatches
     /// them to the smithay seat.
@@ -1421,7 +1473,7 @@ impl QuicStreamer {
 
     /// Take the client-QoS receiver — call exactly once. The compositor drains it
     /// to feed delivered-fps into the pacer (network-aware quality).
-    pub fn take_qos_rx(&self) -> Option<mpsc::UnboundedReceiver<core_proto::ClientQos>> {
+    pub fn take_qos_rx(&self) -> Option<mpsc::UnboundedReceiver<core_proto::ClientQosV2>> {
         self.qos_rx.lock().ok().and_then(|mut g| g.take())
     }
 
@@ -1775,6 +1827,62 @@ const DG_STREAM_HDR: u8 = 0x0d;
 // manual toggle. Modeled on DG_STREAM_HDR; 1 byte. A lost datagram self-heals on the
 // ~1×/s resend; an older host never sends it, so the client stays on manual grab.
 const DG_CURSOR_MODE: u8 = 0x0e;
+// Host→client, additive: bandwidth-probe PADDING (issue #40). Content-free
+// filler the host ramps for ~2s at session start so the client's delivered-
+// goodput measurement (ClientQosV2.recv_kbps) reads the path's real capacity
+// instead of the app-limited video rate. Congestion-controlled like every QUIC
+// datagram, so the wire never carries more than BBR allows — excess offered
+// load dies in the host's datagram send buffer, not on the network. Clients
+// need no explicit handling: the byte counter sees the datagram before the tag
+// dispatch, and older clients ignore the unknown tag entirely (they just also
+// don't report recv_kbps, so a host never probes them — see ClientQosV2).
+const DG_PROBE_PAD: u8 = 0x0f;
+
+/// Per-connection state for the connect-time bandwidth probe (issue #40),
+/// shared between the compositor-facing [`QuicStreamer`] API, the per-connection
+/// pad-sender task, and the datagram task that folds client QoS into the
+/// measurement. Generations make the API race-free: `start_probe` bumps
+/// `req_gen`; the pad task runs one ramp per generation and publishes into
+/// `measured_kbps`/`done_gen`; `probe_result` is `Some` only when the done
+/// generation has caught up.
+#[derive(Default)]
+struct ProbeShared {
+    /// Bumped by [`QuicStreamer::start_probe`]; each bump requests one ramp.
+    req_gen: std::sync::atomic::AtomicU32,
+    /// Offered-load ceiling (kbps) for the pending ramp.
+    ceiling_kbps: std::sync::atomic::AtomicU32,
+    /// Ramp duration (ms) for the pending ramp.
+    duration_ms: std::sync::atomic::AtomicU32,
+    /// Generation whose result is published in `measured_kbps`.
+    done_gen: std::sync::atomic::AtomicU32,
+    /// Peak client-reported delivered goodput (kbps) over the finished probe
+    /// window; 0 = no measurement (old client / no samples).
+    measured_kbps: std::sync::atomic::AtomicU32,
+    /// Measurement-window end (unix ms): QoS samples arriving before this
+    /// fold into `pending_max_kbps`.
+    window_until_ms: std::sync::atomic::AtomicU64,
+    /// Running max of recv_kbps samples inside the current window.
+    pending_max_kbps: std::sync::atomic::AtomicU32,
+    /// Latest client transport hint (core_proto TRANSPORT_*).
+    transport: std::sync::atomic::AtomicU8,
+    /// True once any v2 QoS with a non-zero recv_kbps arrived — i.e. this
+    /// client can measure goodput, so a probe is worth running.
+    goodput_seen: AtomicBool,
+}
+
+impl ProbeShared {
+    /// Reset per connection so a reconnecting client starts with a clean slate
+    /// (any in-flight ramp is cancelled by aligning the generations).
+    fn reset(&self) {
+        let g = self.req_gen.load(Ordering::Relaxed);
+        self.done_gen.store(g, Ordering::Relaxed);
+        self.measured_kbps.store(0, Ordering::Relaxed);
+        self.window_until_ms.store(0, Ordering::Relaxed);
+        self.pending_max_kbps.store(0, Ordering::Relaxed);
+        self.transport.store(0, Ordering::Relaxed);
+        self.goodput_seen.store(false, Ordering::Relaxed);
+    }
+}
 
 /// UNIX-epoch nanoseconds from the wall clock. Used for every timestamp that
 /// crosses the link (ClockPing/Pong t0..t3, FrameStageMeta stamps): a monotonic
@@ -2701,7 +2809,8 @@ async fn serve_stream(
     identity: Arc<core_crypto::Identity>,
     input_tx: mpsc::UnboundedSender<core_proto::InputEvent>,
     latency_tx: mpsc::UnboundedSender<core_proto::WireLatencyReport>,
-    qos_tx: mpsc::UnboundedSender<core_proto::ClientQos>,
+    qos_tx: mpsc::UnboundedSender<core_proto::ClientQosV2>,
+    probe: Arc<ProbeShared>,
     app_catalog_rx: tokio::sync::watch::Receiver<Vec<core_proto::AppInfo>>,
     app_launch_tx: mpsc::UnboundedSender<core_proto::AppMsg>,
     clipboard_out_rx: tokio::sync::watch::Receiver<core_proto::ClipboardMsg>,
@@ -3108,6 +3217,7 @@ async fn serve_stream(
         let client_res_pref_dg = client_res_pref.clone();
         let client_bitrate_pref_dg = client_bitrate_pref.clone();
         let client_fps_pref_dg = client_fps_pref.clone();
+        let probe_dg = probe.clone();
         tokio::spawn(async move {
             loop {
                 let dg = match conn_dg.read_datagram().await {
@@ -3149,12 +3259,28 @@ async fn serve_stream(
                             Err(e) => tracing::debug!("decode latency report: {e}"),
                         }
                     }
-                    Some(DG_CLIENT_QOS) => match core_proto::latency::decode_client_qos(&dg[1..]) {
-                        Ok(qos) => {
-                            let _ = qos_tx_conn.send(qos);
+                    Some(DG_CLIENT_QOS) => {
+                        // v2 adds measured goodput + transport hint (issue #40);
+                        // a v1 report (older client) widens with inert fields.
+                        match core_proto::latency::decode_client_qos_any(&dg[1..]) {
+                            Ok(qos) => {
+                                probe_dg.transport.store(qos.transport, Ordering::Relaxed);
+                                if qos.recv_kbps > 0 {
+                                    probe_dg.goodput_seen.store(true, Ordering::Relaxed);
+                                    // Inside an open probe window: fold this sample
+                                    // into the running max (the measurement).
+                                    let until = probe_dg.window_until_ms.load(Ordering::Relaxed);
+                                    if unix_nanos() / 1_000_000 <= until {
+                                        probe_dg
+                                            .pending_max_kbps
+                                            .fetch_max(qos.recv_kbps, Ordering::Relaxed);
+                                    }
+                                }
+                                let _ = qos_tx_conn.send(qos);
+                            }
+                            Err(e) => tracing::debug!("decode client qos: {e}"),
                         }
-                        Err(e) => tracing::debug!("decode client qos: {e}"),
-                    },
+                    }
                     Some(DG_REQUEST_IDR) => {
                         // Client saw corruption / a lost reference — force the next
                         // encode to be an IDR (the compositor rate-limits it).
@@ -3198,6 +3324,82 @@ async fn serve_stream(
                     }
                     _ => {}
                 }
+            }
+        });
+
+        // Bandwidth-probe pad sender (issue #40): one task per connection. Runs
+        // one padded ramp per `start_probe` generation; the QoS arm above folds
+        // the client's delivered-goodput samples into the measurement, and this
+        // task publishes the result when the window closes. Idles on a coarse
+        // tick while no probe is pending; ends with the connection.
+        let probe_pad = probe.clone();
+        let conn_pad = conn.clone();
+        tokio::spawn(async move {
+            let mut last_gen = probe_pad.done_gen.load(Ordering::Relaxed);
+            loop {
+                tokio::select! {
+                    _ = conn_pad.closed() => return,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                }
+                let gen = probe_pad.req_gen.load(Ordering::Relaxed);
+                if gen == last_gen {
+                    continue;
+                }
+                last_gen = gen;
+                let ceiling_kbps =
+                    u64::from(probe_pad.ceiling_kbps.load(Ordering::Relaxed)).max(1_000);
+                let duration_ms =
+                    u64::from(probe_pad.duration_ms.load(Ordering::Relaxed)).clamp(500, 10_000);
+                probe_pad.pending_max_kbps.store(0, Ordering::Relaxed);
+                probe_pad.window_until_ms.store(
+                    unix_nanos() / 1_000_000 + duration_ms + 1_500,
+                    Ordering::Relaxed,
+                );
+                // One reusable tagged pad datagram, sized to the path MTU
+                // (`Bytes` clones are refcounted — no per-send allocation).
+                let pad_len = conn_pad
+                    .max_datagram_size()
+                    .unwrap_or(1_000)
+                    .min(1_200)
+                    .saturating_sub(1)
+                    .max(256);
+                let pad = tagged_datagram(DG_PROBE_PAD, &vec![0u8; pad_len]);
+                tracing::info!(
+                    target: "compositor::wire",
+                    "probe[{gen}]: ramping to {ceiling_kbps}kbps offered load over {duration_ms}ms (pad={pad_len}B)"
+                );
+                const SLOT_MS: u64 = 25;
+                let slots = (duration_ms / SLOT_MS).max(1);
+                let ramp_slots = (slots / 4).max(1); // 25% ramp, then hold at ceiling
+                'ramp: for i in 0..slots {
+                    let frac = ((i + 1) as f64 / ramp_slots as f64).min(1.0);
+                    let rate_kbps = ceiling_kbps as f64 * frac;
+                    let mut budget = (rate_kbps * 1000.0 / 8.0 * SLOT_MS as f64 / 1000.0) as u64;
+                    while budget > 0 {
+                        // Keep headroom in quinn's datagram send buffer so real
+                        // datagrams (audio, geometry announces) are never evicted
+                        // by padding. Padding that doesn't fit simply isn't
+                        // offered — BBR is already sending as fast as the path
+                        // allows, which is the very thing being measured.
+                        if conn_pad.datagram_send_buffer_space() < 64 * 1024 {
+                            break;
+                        }
+                        if conn_pad.send_datagram(pad.clone()).is_err() {
+                            break 'ramp; // connection gone / datagrams unsupported
+                        }
+                        budget = budget.saturating_sub(pad.len() as u64);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(SLOT_MS)).await;
+                }
+                // Tail: let the client QoS window covering the hold phase land.
+                tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+                let measured = probe_pad.pending_max_kbps.load(Ordering::Relaxed);
+                probe_pad.measured_kbps.store(measured, Ordering::Relaxed);
+                probe_pad.done_gen.store(gen, Ordering::Relaxed);
+                tracing::info!(
+                    target: "compositor::wire",
+                    "probe[{gen}]: done — peak delivered goodput {measured}kbps"
+                );
             }
         });
 
@@ -3592,6 +3794,7 @@ async fn serve_stream(
         client_bitrate_pref.store(0, Ordering::Release);
         // And the framerate preference, so the next client starts at Auto/panel.
         client_fps_pref.store(0, Ordering::Release);
+        probe.reset();
         match end_reason {
             LoopEnd::CompositorClosed => {
                 send.finish().ok();
@@ -3830,6 +4033,11 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
     // (max=0 = Auto/panel). Mutated from the settings UI; re-sent each QoS tick as
     // `DG_CLIENT_FPSPREF`. `None` = never send.
     fps_pref: Option<Arc<std::sync::atomic::AtomicU64>>,
+    // The client's link-transport hint (core_proto TRANSPORT_*), reported in each
+    // v2 QoS tick so the host can bound its bandwidth-probe ceiling (issue #40).
+    // Live (an Android network callback may flip WiFi↔Ethernet mid-session);
+    // `None` = always TRANSPORT_UNKNOWN.
+    transport_hint: Option<Arc<std::sync::atomic::AtomicU8>>,
     // Host→client clipboard: invoked with the text a host app just copied so the
     // client mirrors it into its OS clipboard (empty string = the host cleared its
     // clipboard). `None` = the client doesn't sync host→client.
@@ -4182,6 +4390,12 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
         // Largest AU seen this QoS window — the window must always be able to
         // swallow a whole keyframe (see `adaptive_window_target`).
         let recv_max_au = std::sync::atomic::AtomicU64::new(0);
+        // ALL bytes received this QoS window — video stream AND datagrams
+        // (audio, probe padding…). Reported as ClientQosV2.recv_kbps: the
+        // delivered-goodput measurement the host's bandwidth probe reads
+        // (issue #40). Separate from `recv_bytes` so probe padding never
+        // inflates the adaptive receive-window sizing.
+        let qos_recv_bytes = std::sync::atomic::AtomicU64::new(0);
 
         // Video on the uni stream; audio as unreliable datagrams. Both run
         // concurrently on this one task (no spawn → no Send/'static bound on the
@@ -4211,6 +4425,7 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
                 recv_count.fetch_add(1, Ordering::Relaxed);
                 recv_bytes.fetch_add(4 + len as u64, Ordering::Relaxed);
                 recv_max_au.fetch_max(len as u64, Ordering::Relaxed);
+                qos_recv_bytes.fetch_add(4 + len as u64, Ordering::Relaxed);
             }
             // The stream ended. If the host CLOSED us with one of its deliberate
             // application codes (preempt / reserved-by-primary / unpaired),
@@ -4264,11 +4479,19 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
             // keyframe size just because the last second happened to hold none.
             let mut au_maxes = [0u64; 5];
             let mut au_ix = 0usize;
+            // Wall-clock of the previous QoS tick, so recv_kbps is normalized by
+            // the REAL elapsed window (interval ticks can stretch under load —
+            // a probe measurement mustn't inflate from a short window).
+            let mut last_qos_at = std::time::Instant::now();
             loop {
                 tokio::select! {
                     biased;
                     dg = conn.read_datagram() => {
                         let Ok(dg) = dg else { break };
+                        // Goodput accounting BEFORE tag dispatch: probe padding
+                        // (DG_PROBE_PAD) and every other datagram count toward
+                        // the delivered rate the host's bandwidth probe measures.
+                        qos_recv_bytes.fetch_add(dg.len() as u64, Ordering::Relaxed);
                         match dg.first().copied() {
                             Some(DG_AUDIO) => {
                                 if let Some(cb) = on_audio.as_mut() {
@@ -4415,8 +4638,26 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
                         let recv_fps = recv_count.swap(0, Ordering::Relaxed) as f32;
                         let decode_ms =
                             geom_taps.as_ref().map(|t| t.decode_mean_ms()).unwrap_or(0.0);
-                        let qos = core_proto::ClientQos { recv_fps, decode_ms };
-                        if let Ok(b) = core_proto::latency::encode_client_qos(&qos) {
+                        // Delivered goodput over the REAL elapsed window (v2 —
+                        // the host bandwidth probe's measurement, issue #40).
+                        let elapsed = last_qos_at.elapsed().as_secs_f64().max(0.25);
+                        last_qos_at = std::time::Instant::now();
+                        let recv_kbps = ((qos_recv_bytes.swap(0, Ordering::Relaxed) as f64
+                            * 8.0
+                            / 1000.0
+                            / elapsed) as u64)
+                            .min(u64::from(u32::MAX)) as u32;
+                        let transport = transport_hint
+                            .as_ref()
+                            .map(|t| t.load(Ordering::Relaxed))
+                            .unwrap_or(core_proto::latency::TRANSPORT_UNKNOWN);
+                        let qos = core_proto::ClientQosV2 {
+                            recv_fps,
+                            decode_ms,
+                            recv_kbps,
+                            transport,
+                        };
+                        if let Ok(b) = core_proto::latency::encode_client_qos_v2(&qos) {
                             let _ = conn.send_datagram(tagged_datagram(DG_CLIENT_QOS, &b));
                         }
                         // Phase 2: re-send the client's resolution range each tick
@@ -6263,6 +6504,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None, // transport_hint
                     None, // on_clipboard
                     None, // clipboard_rx
                 );
@@ -6354,6 +6596,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // transport_hint
                 None, // on_clipboard
                 None, // clipboard_rx
             );
@@ -6469,6 +6712,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // transport_hint
                 on_clipboard,
                 Some(clip_rx),
             );
@@ -6599,6 +6843,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // transport_hint
                 None, // on_clipboard: intentionally none
                 Some(clip_rx),
             );
@@ -6774,6 +7019,7 @@ mod tests {
                     None,  // res_pref
                     None,  // bitrate_pref
                     None,  // fps_pref
+                    None,  // transport_hint
                     None,  // on_clipboard
                     None,  // clipboard_rx
                 );

@@ -6,6 +6,9 @@ package no.aasle.trireme.stream
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -269,12 +272,52 @@ object StreamHub {
     // ============================================================
 
     /** Idempotent; stores the app context + identity path. Call from [TriremeApp]. */
+    /// The device's current link transport, in the host's probe-hint vocabulary
+    /// (0 unknown, 1 ethernet, 2 wifi — core_proto TRANSPORT_*). Issue #40.
+    private fun currentTransportHint(): UByte {
+        val cm = runCatching {
+            appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        }.getOrNull() ?: return 0.toUByte()
+        val caps = runCatching { cm.getNetworkCapabilities(cm.activeNetwork) }.getOrNull()
+            ?: return 0.toUByte()
+        return when {
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> 1.toUByte()
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> 2.toUByte()
+            else -> 0.toUByte()
+        }
+    }
+
+    /// Push the current transport hint to every connected session's FFI handle —
+    /// called from the default-network callback so a WiFi↔Ethernet flip reaches
+    /// the host within ~1s (which re-probes the path, issue #40).
+    private fun pushTransportHint() {
+        val hint = currentTransportHint()
+        synchronized(lock) {
+            for (s in sessions.values) {
+                s.gamepad?.let { runCatching { it.setTransportHint(hint) } }
+            }
+        }
+    }
+
     fun init(appContext: Context) {
         if (initialized) return
         synchronized(lock) {
             if (initialized) return
             this.appContext = appContext.applicationContext
             this.identityPath = this.appContext.filesDir.resolve("identity.toml").absolutePath
+            // Issue #40: keep the host's probe transport hint fresh across
+            // WiFi↔Ethernet flips. Best-effort — needs ACCESS_NETWORK_STATE.
+            runCatching {
+                val cm = this.appContext.getSystemService(Context.CONNECTIVITY_SERVICE)
+                    as? ConnectivityManager
+                cm?.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+                    override fun onAvailable(network: Network) = pushTransportHint()
+                    override fun onCapabilitiesChanged(
+                        network: Network,
+                        networkCapabilities: NetworkCapabilities,
+                    ) = pushTransportHint()
+                })
+            }
             paceOverride = readPacePref(this.appContext)
             gyroEnabled = readGyroEnabledPref(this.appContext)
             touchAbsolute = readTouchAbsolutePref(this.appContext)
@@ -905,6 +948,12 @@ object StreamHub {
         if (bitrateMinKbps != 0 || bitrateMaxKbps != 0) {
             runCatching { gp.setBitratePref(bitrateMinKbps.toUInt(), bitrateMaxKbps.toUInt()) }
         }
+        // Report the link transport (issue #40) so the host can BOUND its
+        // connect-time bandwidth-probe ceiling — Ethernet probes higher than
+        // WiFi. It never sets a bitrate directly; Android can't read real link
+        // speed, but the transport is reliable. Re-pushed live by the network
+        // callback registered in init() when connectivity changes.
+        runCatching { gp.setTransportHint(currentTransportHint()) }
         // And the framerate range (Phase 3). No-op at the default (0, 0).
         if (fpsMin != 0 || fpsMax != 0) {
             runCatching { gp.setFpsPref(fpsMin.toUInt(), fpsMax.toUInt()) }

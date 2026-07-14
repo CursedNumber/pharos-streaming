@@ -207,6 +207,11 @@ pub struct GamepadInput {
     /// [`GamepadInput::set_fps_pref`]; the QUIC loop re-sends it ~1×/s as
     /// `DG_CLIENT_FPSPREF` — caps the host encode pace + adaptation floor.
     fps_pref: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The client's link-transport hint (issue #40): 0 unknown, 1 ethernet,
+    /// 2 wifi. Set by [`GamepadInput::set_transport_hint`] from the platform's
+    /// connectivity API; the QUIC loop reports it in each v2 QoS tick so the
+    /// host can bound its bandwidth-probe ceiling.
+    transport_hint: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
 
 #[uniffi::export]
@@ -402,6 +407,17 @@ impl GamepadInput {
         let packed = (u64::from(min_fps) << 32) | u64::from(max_fps);
         self.fps_pref
             .store(packed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Report the client's link transport (issue #40): `0` unknown, `1`
+    /// ethernet, `2` wifi. The host uses it only to BOUND its bandwidth-probe
+    /// ceiling — it never sets a bitrate directly (Android can't read real
+    /// link speed, but it CAN detect the transport). Call once when the
+    /// session starts and again whenever connectivity changes. Cheap,
+    /// non-blocking; reported to the host within ~1s.
+    pub fn set_transport_hint(&self, transport: u8) {
+        self.transport_hint
+            .store(transport, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -622,6 +638,9 @@ pub fn start_video_stream(
     // Client→host framerate range (Phase 3): set_fps_pref() packs it here.
     let fps_pref = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let fps_pref_thread = fps_pref.clone();
+    // Client link-transport hint (issue #40): set_transport_hint() stores it here.
+    let transport_hint = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let transport_hint_thread = transport_hint.clone();
     std::thread::spawn(move || {
         // LAN first, then any fallbacks (e.g. a WAN/DDNS address). IDNA-aware so
         // Unicode domains like `bücher.example` resolve; unresolvable candidates drop.
@@ -725,6 +744,7 @@ pub fn start_video_stream(
             Some(res_pref_thread),
             Some(bitrate_pref_thread),
             Some(fps_pref_thread),
+            Some(transport_hint_thread),
             on_clipboard,
             Some(clipboard_rx),
         );
@@ -739,6 +759,7 @@ pub fn start_video_stream(
         res_pref,
         bitrate_pref,
         fps_pref,
+        transport_hint,
     })
 }
 

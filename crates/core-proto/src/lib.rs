@@ -23,7 +23,7 @@ pub use clipboard::{
     decode_clipboard, encode_clipboard, ClipboardMsg, MAX_CLIPBOARD_BYTES, MAX_CLIPBOARD_FRAME,
 };
 pub use latency::{
-    ClientBitratePref, ClientFpsPref, ClientQos, ClientResPref, ClockPing, ClockPong,
+    ClientBitratePref, ClientFpsPref, ClientQos, ClientQosV2, ClientResPref, ClockPing, ClockPong,
     FrameStageMeta, WireLatencyReport,
 };
 pub use profile::{ControllerProfile, GyroTuning};

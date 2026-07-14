@@ -3432,6 +3432,7 @@ fn spawn_decode(
                 None, // res_pref: desktop player has no resolution selector yet
                 None, // bitrate_pref: ditto
                 None, // fps_pref: ditto
+                None, // transport_hint: desktop transport detection is a follow-up
                 None, // on_clipboard: desktop player clipboard sync is a follow-up
                 None, // clipboard_rx: ditto
             );

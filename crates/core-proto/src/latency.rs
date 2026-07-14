@@ -121,6 +121,56 @@ pub fn decode_client_qos(bytes: &[u8]) -> std::result::Result<ClientQos, WireErr
     postcard::from_bytes(bytes).map_err(|e| WireError::Decode(e.to_string()))
 }
 
+/// Client link-transport hint values for [`ClientQosV2::transport`]. The hint
+/// BOUNDS the host's bandwidth-probe ceiling (issue #40); it never sets the cap
+/// directly — Android cannot read its real link speed (AOSP hardcodes Ethernet
+/// to 100 Mbps and sysfs is SELinux-walled), but it CAN detect the transport.
+pub const TRANSPORT_UNKNOWN: u8 = 0;
+pub const TRANSPORT_ETHERNET: u8 = 1;
+pub const TRANSPORT_WIFI: u8 = 2;
+
+/// v2 of [`ClientQos`] (issue #40): same leading fields, plus the client's
+/// measured **delivered goodput** and its link-transport hint. Postcard encodes
+/// v1 as an exact prefix of v2, so the host tries v2 first and falls back to v1
+/// (older clients), and `decode_client_qos` on a v2 payload still yields the v1
+/// fields (postcard tolerates trailing bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ClientQosV2 {
+    /// Frames received over the last reporting window, per second.
+    pub recv_fps: f32,
+    /// Recent mean client-side decode time (ms); `0.0` when unknown.
+    pub decode_ms: f32,
+    /// Total bytes the client received over the window — video stream AND
+    /// datagrams (audio, probe padding…) — as kbit/s. This is the bandwidth
+    /// probe's measurement: during a padded ramp it reads the path's delivered
+    /// goodput, which no link-speed API can. `0` = not measured.
+    pub recv_kbps: u32,
+    /// The client's link transport ([`TRANSPORT_UNKNOWN`] / [`TRANSPORT_ETHERNET`]
+    /// / [`TRANSPORT_WIFI`]) — bounds the probe ceiling only.
+    pub transport: u8,
+}
+
+/// Encode a [`ClientQosV2`] to bytes (postcard).
+pub fn encode_client_qos_v2(q: &ClientQosV2) -> std::result::Result<Vec<u8>, WireError> {
+    postcard::to_stdvec(q).map_err(|e| WireError::Encode(e.to_string()))
+}
+
+/// Decode a client QoS report at the highest version the payload carries:
+/// v2 when the goodput/transport fields are present, else v1 widened with
+/// `recv_kbps = 0, transport = TRANSPORT_UNKNOWN` (an older client — the probe
+/// then never fires and the host keeps today's behavior).
+pub fn decode_client_qos_any(bytes: &[u8]) -> std::result::Result<ClientQosV2, WireError> {
+    if let Ok(v2) = postcard::from_bytes::<ClientQosV2>(bytes) {
+        return Ok(v2);
+    }
+    decode_client_qos(bytes).map(|v1| ClientQosV2 {
+        recv_fps: v1.recv_fps,
+        decode_ms: v1.decode_ms,
+        recv_kbps: 0,
+        transport: TRANSPORT_UNKNOWN,
+    })
+}
+
 /// Client → host: the client's desired resolution range for the adaptive ladder
 /// (Phase 2). `target_h` is the ceiling coded height it wants the host to uphold
 /// (`0` = Auto / native); `floor_h` is the minimum it may auto-downscale to
@@ -245,6 +295,34 @@ pub fn decode_wire_latency(bytes: &[u8]) -> std::result::Result<WireLatencyRepor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_qos_v2_roundtrip_and_version_fallback() {
+        let v2 = ClientQosV2 {
+            recv_fps: 59.9,
+            decode_ms: 4.2,
+            recv_kbps: 93_500,
+            transport: TRANSPORT_ETHERNET,
+        };
+        let bytes = encode_client_qos_v2(&v2).unwrap();
+        assert_eq!(decode_client_qos_any(&bytes).unwrap(), v2);
+        // An old host reading a v2 payload still gets the v1 prefix fields
+        // (postcard tolerates the trailing v2 bytes).
+        let v1 = decode_client_qos(&bytes).unwrap();
+        assert_eq!(v1.recv_fps, v2.recv_fps);
+        assert_eq!(v1.decode_ms, v2.decode_ms);
+        // A v1 payload (old client) widens with inert probe fields, so the
+        // probe never fires against a client that can't report goodput.
+        let old = encode_client_qos(&ClientQos {
+            recv_fps: 60.0,
+            decode_ms: 3.0,
+        })
+        .unwrap();
+        let widened = decode_client_qos_any(&old).unwrap();
+        assert_eq!(widened.recv_fps, 60.0);
+        assert_eq!(widened.recv_kbps, 0);
+        assert_eq!(widened.transport, TRANSPORT_UNKNOWN);
+    }
 
     #[test]
     fn clock_ping_roundtrip() {
