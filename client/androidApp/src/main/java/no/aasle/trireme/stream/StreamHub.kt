@@ -835,7 +835,9 @@ object StreamHub {
             }
         }
 
-        val addr = s.entry.addressLabel()
+        // Dial the pinned NIC first (multi-homed host); the other addresses ride
+        // streamAltAddrs() as ordered fallbacks — "pin one, auto-fallback".
+        val addr = s.entry.primaryAddressLabel()
         val expectedPubkey = s.entry.hostPubkey
         Log.i(TAG, "dialing ${s.name} ($addr, pace=${s.pace}, pinned=${expectedPubkey != null})")
         // Gyro samples relayed from the host's IMU reader land here on the QUIC

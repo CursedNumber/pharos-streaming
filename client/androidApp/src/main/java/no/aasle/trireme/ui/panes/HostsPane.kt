@@ -95,9 +95,15 @@ fun HostsPane(store: ServerStore) {
     val scope = rememberCoroutineScope()
 
     // Registry is the persisted host list; StreamHub holds the live session status.
-    var registry by remember { mutableStateOf(store.load()) }
+    // Collapse multi-NIC duplicates (same host identity) into one row up front so
+    // a machine on wifi + fiber shows once with both addresses selectable.
+    var registry by remember { mutableStateOf(store.load().mergeByIdentity()) }
     val connections by StreamHub.connections.collectAsState()
     val activeHostId by StreamHub.activeHostId.collectAsState()
+
+    // Persist the identity-merge once (it's idempotent, so a no-op after the first
+    // run just rewrites the same bytes).
+    androidx.compose.runtime.LaunchedEffect(Unit) { store.save(registry) }
 
     // LAN auto-discovery (mDNS via NsdManager). Scoped to this pane: browse while
     // the host picker is on-screen, stop when it leaves so we don't keep the
@@ -114,17 +120,35 @@ fun HostsPane(store: ServerStore) {
         store.save(reg)
     }
 
+    // Fold a freshly-discovered NIC of an ALREADY-KNOWN host (matched by the
+    // pubkey it advertises over mDNS) into that host's alternate addresses, so a
+    // second interface coming online just becomes another selectable connection
+    // rather than a separate "Unpaired" entry. Idempotent: once the address is in
+    // altHosts (or is the primary), the discovery is a no-op.
+    androidx.compose.runtime.LaunchedEffect(discovered, registry) {
+        var reg = registry
+        for (d in discovered) {
+            val pk = d.pubkeyHex ?: continue
+            val match = reg.servers.firstOrNull { it.hostPubkey == pk } ?: continue
+            if (d.host == match.host || d.host in match.altHosts) continue
+            reg = reg.upsert(match.copy(altHosts = (match.altHosts + d.host).distinct()))
+        }
+        if (reg != registry) commit(reg)
+    }
+
     // Dialog targets.
     var addOpen by rememberSaveable { mutableStateOf(false) }
     var editTarget by remember { mutableStateOf<ServerEntry?>(null) }
     var deleteTarget by remember { mutableStateOf<String?>(null) }
     var pairTarget by remember { mutableStateOf<ServerEntry?>(null) }
 
-    // Discovered hosts not already saved (dedup by the stream-port id we'd
-    // persist). These render below the saved list; tapping one auto-configures
-    // the entry from what the host advertised, then opens the Pair dialog.
+    // Discovered hosts not already known. Excluded: the exact saved address, AND
+    // any host whose advertised pubkey matches a saved entry (a known identity on
+    // a new NIC — the fold effect above adds it as an alternate address instead of
+    // listing it as a stranger). What remains is genuinely new hosts to add + pair.
     val newDiscoveries = discovered.filter { d ->
-        registry.find(ServerEntry.makeId(d.host, d.streamPort)) == null
+        registry.find(ServerEntry.makeId(d.host, d.streamPort)) == null &&
+            registry.servers.none { s -> d.pubkeyHex != null && s.hostPubkey == d.pubkeyHex }
     }
 
     fun addAndPair(d: DiscoveredHost) {
@@ -194,6 +218,9 @@ fun HostsPane(store: ServerStore) {
                         onSetActive = { StreamHub.setActive(server.id) },
                         onDisconnect = { StreamHub.disconnect(server.id) },
                         onPair = { pairTarget = server },
+                        onSetPreferred = { h ->
+                            commit(registry.upsert(server.copy(preferredHost = h)))
+                        },
                         onEdit = { editTarget = server },
                         onDelete = { deleteTarget = server.id },
                     )
@@ -350,6 +377,7 @@ private fun HostRow(
     onSetActive: () -> Unit,
     onDisconnect: () -> Unit,
     onPair: () -> Unit,
+    onSetPreferred: (String) -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
 ) {
@@ -399,9 +427,15 @@ private fun HostRow(
             }
             Spacer(Modifier.height(2.dp))
             // Overt card hides the port (it's a single deliberate value, shown in
-            // Edit) — host only. WAN fallback host shown when configured.
+            // Edit) — host only. Shows the EFFECTIVE address (the pinned NIC when
+            // set); a multi-NIC host appends a count so the picker is discoverable.
+            val nicCount = server.lanHosts().size
             Text(
-                server.host,
+                if (nicCount > 1) {
+                    stringResource(R.string.hosts_addr_multi, server.effectiveHost(), nicCount)
+                } else {
+                    server.effectiveHost()
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -477,6 +511,35 @@ private fun HostRow(
                         text = { Text(stringResource(R.string.hosts_disconnect)) },
                         onClick = { menuOpen = false; onDisconnect() },
                     )
+                }
+                // NIC picker (multi-homed host only): pick which address to dial
+                // FIRST. The rest stay ordered fallbacks, so a pinned NIC dropping
+                // never strands the host. Takes effect on the next connect.
+                val addrs = server.lanHosts()
+                if (addrs.size > 1) {
+                    val effective = server.effectiveHost()
+                    Text(
+                        stringResource(R.string.hosts_connect_via),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                    )
+                    addrs.forEach { addr ->
+                        val isPinned = addr == effective
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    if (isPinned) {
+                                        stringResource(R.string.hosts_connect_via_pinned, addr)
+                                    } else {
+                                        addr
+                                    },
+                                    fontWeight = if (isPinned) FontWeight.SemiBold else FontWeight.Normal,
+                                )
+                            },
+                            onClick = { menuOpen = false; onSetPreferred(addr) },
+                        )
+                    }
                 }
                 DropdownMenuItem(
                     text = {

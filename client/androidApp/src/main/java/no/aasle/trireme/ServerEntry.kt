@@ -25,6 +25,22 @@ data class ServerEntry(
     val paired: Boolean = false,
     /** Hex 32-byte Ed25519 pubkey pinned at pairing time. */
     val hostPubkey: String? = null,
+    /**
+     * Additional LAN addresses this SAME host (same [hostPubkey]) is reachable
+     * on — a multi-homed host advertises one identity across every NIC (e.g.
+     * devbox on wifi .100 + fiber .200). Folded here by [Registry.mergeByIdentity]
+     * so one row represents the machine; each address is a selectable connection.
+     * Same [port] as [host]; pairing is identity-scoped, so all of them inherit
+     * the single paired trust.
+     */
+    val altHosts: List<String> = emptyList(),
+    /**
+     * The address the user pinned to dial FIRST ("pin one, auto-fallback"). Must
+     * be [host] or one of [altHosts]; `null` = no pin (dial [host] first). The
+     * transport tries the rest as ordered fallbacks, so a pinned NIC going down
+     * never strands the host.
+     */
+    val preferredHost: String? = null,
     /** Pair listener port; defaults to 4432 on the host side. */
     val pairPort: Int? = null,
     /**
@@ -48,6 +64,26 @@ data class ServerEntry(
 
     fun addressLabel(): String = "$host:$port"
 
+    /** Every known LAN address for this host (primary + alternate NICs), deduped. */
+    fun lanHosts(): List<String> = (listOf(host) + altHosts).distinct()
+
+    /**
+     * LAN addresses in DIAL order: the pinned [preferredHost] first (when it's
+     * still a known address), then the rest as fallbacks — the "pin one,
+     * auto-fallback" model the transport's ordered [connect_first] implements.
+     */
+    fun orderedLanHosts(): List<String> {
+        val all = lanHosts()
+        val pref = preferredHost?.takeIf { it in all } ?: return all
+        return listOf(pref) + all.filter { it != pref }
+    }
+
+    /** The address actually dialed first (the pinned NIC when set), for display. */
+    fun effectiveHost(): String = orderedLanHosts().first()
+
+    /** Primary stream address (pinned NIC first); the rest ride [streamAltAddrs]. */
+    fun primaryAddressLabel(): String = "${effectiveHost()}:$port"
+
     fun pairPortOrDefault(): Int = pairPort ?: 4432
 
     /** WAN stream address ("extHost:extPort"), or null if no external host set. */
@@ -58,11 +94,18 @@ data class ServerEntry(
     fun externalPairLabel(): String? =
         externalHost?.takeIf { it.isNotBlank() }?.let { "$it:${pairPortOrDefault()}" }
 
-    /** Stream fallbacks tried after the LAN address (WAN, etc.) — passed to FFI. */
-    fun streamAltAddrs(): List<String> = listOfNotNull(externalAddressLabel())
+    /**
+     * Stream fallbacks tried after [primaryAddressLabel], in order: the host's
+     * OTHER LAN NICs (so a pinned fiber that drops falls back to wifi), then the
+     * WAN/DDNS address. Passed to the FFI as the ordered candidate list.
+     */
+    fun streamAltAddrs(): List<String> =
+        orderedLanHosts().drop(1).map { "$it:$port" } + listOfNotNull(externalAddressLabel())
 
-    /** Pair fallbacks tried after the LAN address — passed to FFI. */
-    fun pairAltAddrs(): List<String> = listOfNotNull(externalPairLabel())
+    /** Pair fallbacks tried after the LAN address — the other NICs, then WAN. */
+    fun pairAltAddrs(): List<String> =
+        orderedLanHosts().drop(1).map { "$it:${pairPortOrDefault()}" } +
+            listOfNotNull(externalPairLabel())
 
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id)
@@ -73,6 +116,8 @@ data class ServerEntry(
         pace?.let { put("pace", it) }
         put("paired", paired)
         hostPubkey?.let { put("host_pubkey", it) }
+        if (altHosts.isNotEmpty()) put("alt_hosts", JSONArray(altHosts))
+        preferredHost?.let { put("preferred_host", it) }
         pairPort?.let { put("pair_port", it) }
         externalHost?.let { put("external_host", it) }
         externalPort?.let { put("external_port", it) }
@@ -89,6 +134,10 @@ data class ServerEntry(
             pace = o.optString("pace", "").ifEmpty { null },
             paired = o.optBoolean("paired", false),
             hostPubkey = o.optString("host_pubkey", "").ifEmpty { null },
+            altHosts = o.optJSONArray("alt_hosts")?.let { a ->
+                (0 until a.length()).map { a.getString(it) }
+            } ?: emptyList(),
+            preferredHost = o.optString("preferred_host", "").ifEmpty { null },
             pairPort = if (o.has("pair_port")) o.getInt("pair_port") else null,
             externalHost = o.optString("external_host", "").ifEmpty { null },
             externalPort = if (o.has("external_port")) o.getInt("external_port") else null,
@@ -112,6 +161,49 @@ data class Registry(val servers: List<ServerEntry> = emptyList()) {
     }
 
     fun remove(id: String): Registry = Registry(servers.filter { it.id != id })
+
+    /**
+     * Collapse entries that share a [ServerEntry.hostPubkey] into ONE host: the
+     * same machine advertised on multiple NICs (wifi + fiber) is one identity,
+     * so it should be one row with its extra addresses folded into
+     * [ServerEntry.altHosts] and selectable as connections. Trust is
+     * identity-scoped, so the merged entry is paired if ANY member was — this is
+     * what makes a freshly-discovered second NIC stop showing as "Unpaired" once
+     * its twin is paired. Entries with no pubkey can't be identified, so they're
+     * left untouched. Stable (LinkedHashMap preserves first-seen order) and
+     * idempotent, so it's safe to run on every load.
+     */
+    fun mergeByIdentity(): Registry {
+        val groups = LinkedHashMap<String, MutableList<ServerEntry>>()
+        servers.forEachIndexed { i, e ->
+            // Un-keyed entries each get a unique bucket so they never merge.
+            val key = e.hostPubkey?.takeIf { it.isNotBlank() } ?: " solo:$i"
+            groups.getOrPut(key) { mutableListOf() }.add(e)
+        }
+        val merged = groups.values.map { group ->
+            if (group.size == 1) return@map group[0]
+            // Canonical = the paired member (keeps its id/alias/pace), else the first.
+            val canonical = group.firstOrNull { it.paired } ?: group[0]
+            val addrs = group.flatMap { it.lanHosts() }.distinct()
+            val pref = (canonical.preferredHost
+                ?: group.firstNotNullOfOrNull { it.preferredHost })
+                ?.takeIf { it in addrs }
+            canonical.copy(
+                paired = group.any { it.paired },
+                hostPubkey = group.firstNotNullOfOrNull { it.hostPubkey },
+                altHosts = addrs.filter { it != canonical.host },
+                preferredHost = pref,
+                alias = canonical.alias ?: group.firstNotNullOfOrNull { it.alias },
+                pace = canonical.pace ?: group.firstNotNullOfOrNull { it.pace },
+                externalHost = canonical.externalHost
+                    ?: group.firstNotNullOfOrNull { it.externalHost },
+                externalPort = canonical.externalPort
+                    ?: group.firstNotNullOfOrNull { it.externalPort },
+                lastConnected = group.mapNotNull { it.lastConnected }.maxOrNull(),
+            )
+        }
+        return Registry(merged)
+    }
 
     fun toJson(): JSONArray = JSONArray().also { arr ->
         servers.forEach { arr.put(it.toJson()) }

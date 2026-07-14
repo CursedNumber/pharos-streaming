@@ -29,6 +29,11 @@
     <string name="hosts_paired">Paired</string>
     <string name="hosts_unpaired">Unpaired</string>
 
+    <!-- Multi-NIC host: address line + the connection (NIC) picker in the menu. -->
+    <string name="hosts_addr_multi">%1$s · %2$d addresses</string>
+    <string name="hosts_connect_via">Connect via</string>
+    <string name="hosts_connect_via_pinned">%1$s · pinned</string>
+
     <!-- Live connection-status badges (spoken via a polite live region). -->
     <string name="hosts_status_connecting">Connecting…</string>
     <string name="hosts_status_live">Live</string>
