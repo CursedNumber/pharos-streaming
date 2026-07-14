@@ -3399,6 +3399,7 @@ fn spawn_decode(
                 None,            // no external cancel; ends with the player
                 Some(taps_quic), // feed the host-triggered live latency benchmark
                 None,            // desktop player: no app-catalog relay yet
+                None,            // desktop player: no app-notice toast relay yet
                 None,            // desktop player: no app-launch relay yet
                 false, // desktop player: no controller gyro (no IMU on the desktop client)
                 // wants_hdr: the CAPABILITY opt-in (TRIREME_HDR). It asks the host for

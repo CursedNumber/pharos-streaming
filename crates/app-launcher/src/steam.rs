@@ -64,6 +64,51 @@ pub fn wait_ready(timeout: Duration) -> bool {
     }
 }
 
+/// Ask a running desktop Steam to exit cleanly (`steam -shutdown` and friends).
+/// Non-blocking — pair with [`wait_gone`], or use [`shutdown_and_wait`].
+pub fn shutdown() {
+    #[cfg(target_os = "linux")]
+    {
+        linux::shutdown();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::shutdown();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::shutdown();
+    }
+}
+
+/// Block until no Steam client process remains (the inverse of [`is_ready`]), or
+/// `timeout` elapses. Returns `true` once Steam is gone.
+pub fn wait_gone(timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    let poll = Duration::from_millis(250);
+    loop {
+        if !is_ready() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// Shut a running desktop Steam down and block until it's actually gone (or
+/// `timeout`). A no-op returning `true` when Steam isn't running. BLOCKS for up
+/// to `timeout` — call it OFF the render thread (lesson-render-loop-no-block);
+/// the compositor auto-relaunch does so on a detached worker.
+pub fn shutdown_and_wait(timeout: Duration) -> bool {
+    if !is_ready() {
+        return true;
+    }
+    shutdown();
+    wait_gone(timeout)
+}
+
 /// Move a spawned `Child` onto a tiny reaper thread that wait()s on it once.
 /// Without this, a pre-warm spawn that exits quickly (Linux `setsid -f`, macOS
 /// `open`) becomes a zombie until the host exits; on Windows the reaper just
@@ -129,6 +174,22 @@ mod linux {
         match spawn {
             Ok(child) => super::reap_in_background(child),
             Err(e) => tracing::warn!("steam::prewarm: failed to spawn setsid steam: {e}"),
+        }
+    }
+
+    pub(super) fn shutdown() {
+        // `steam -shutdown` signs out + exits a running client cleanly (the same
+        // as Steam → Exit), so games and the client tear down in order rather
+        // than being SIGKILLed. Best-effort + reaped like prewarm.
+        let spawn = Command::new("steam")
+            .arg("-shutdown")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        match spawn {
+            Ok(child) => super::reap_in_background(child),
+            Err(e) => tracing::warn!("steam::shutdown: failed to spawn `steam -shutdown`: {e}"),
         }
     }
 }
@@ -205,6 +266,21 @@ mod windows {
             Err(e) => tracing::warn!("steam::prewarm: failed to spawn {exe}: {e}"),
         }
     }
+
+    pub(super) fn shutdown() {
+        let (exe, source) = resolve_steam_exe();
+        tracing::debug!("steam::shutdown: resolved Steam.exe via {source}: {exe}");
+        let spawn = Command::new(&exe)
+            .arg("-shutdown")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        match spawn {
+            Ok(child) => super::reap_in_background(child),
+            Err(e) => tracing::warn!("steam::shutdown: failed to spawn {exe} -shutdown: {e}"),
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -250,6 +326,21 @@ mod macos {
         match spawn {
             Ok(child) => super::reap_in_background(child),
             Err(e) => tracing::warn!("steam::prewarm: failed to open Steam: {e}"),
+        }
+    }
+
+    pub(super) fn shutdown() {
+        // AppleScript quit is the reliable "close Steam cleanly" on macOS; the
+        // `-shutdown` arg is a no-op unless routed through the app bundle.
+        let spawn = Command::new("osascript")
+            .args(["-e", "quit app \"Steam\""])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        match spawn {
+            Ok(child) => super::reap_in_background(child),
+            Err(e) => tracing::warn!("steam::shutdown: failed to quit Steam: {e}"),
         }
     }
 }

@@ -31,7 +31,9 @@ pub mod env;
 pub mod launch;
 pub mod redirect;
 pub mod scan;
-mod steam;
+/// Steam readiness + lifecycle (prewarm / shutdown), used by the compositor's
+/// Steam Big Picture auto close+relaunch handling.
+pub mod steam;
 
 pub use config::{AppEntry, AppKind, Catalog, FpsCap, GyroMode, LaunchKind, LaunchTarget};
 pub use launch::{launch, session_audio_sink, set_session_audio_sink, LaunchContext};

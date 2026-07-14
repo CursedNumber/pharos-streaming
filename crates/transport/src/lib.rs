@@ -775,6 +775,11 @@ pub struct QuicStreamer {
     /// Latest app catalog to push to clients on the app relay stream. `watch` so
     /// a late-joining client gets the current value and each change re-sends.
     app_catalog_tx: tokio::sync::watch::Sender<Vec<core_proto::AppInfo>>,
+    /// One-shot host→client status notices (toasts) on the app relay stream —
+    /// e.g. "Steam was running — restarted it in-stream". Unlike the catalog
+    /// (retained state) these are transient events, so an mpsc, not a watch:
+    /// each notice is sent once to whoever is connected at that moment.
+    app_notice_tx: tokio::sync::broadcast::Sender<String>,
     /// App-launch requests (`apps.toml` slugs) the client sent on the app relay
     /// stream. Taken out once via [`Self::take_app_launch_rx`]; the compositor
     /// drains it and launches into the virtual display.
@@ -927,6 +932,10 @@ impl QuicStreamer {
         let (app_catalog_tx, app_catalog_rx) =
             tokio::sync::watch::channel::<Vec<core_proto::AppInfo>>(Vec::new());
         let (app_launch_tx, app_launch_rx) = mpsc::unbounded_channel::<core_proto::AppMsg>();
+        // Broadcast so each per-connection app-relay writer gets its own receiver
+        // (a late reconnect re-subscribes); capacity is small — notices are rare.
+        let (app_notice_tx, _app_notice_rx0) = tokio::sync::broadcast::channel::<String>(16);
+        let app_notice_tx_thread = app_notice_tx.clone();
         // Clipboard relay channels (host↔client). `clipboard_out` is a watch (latest
         // host clipboard wins; a reconnecting client resyncs); `clipboard_in` is an
         // mpsc of client→host copies the compositor drains. Empty initial value is
@@ -1033,6 +1042,7 @@ impl QuicStreamer {
                     qos_tx,
                     probe_thread.clone(),
                     app_catalog_rx,
+                    app_notice_tx_thread.clone(),
                     app_launch_tx,
                     clipboard_out_rx,
                     clipboard_in_tx,
@@ -1074,6 +1084,7 @@ impl QuicStreamer {
             qos_rx: std::sync::Mutex::new(Some(qos_rx)),
             probe,
             app_catalog_tx,
+            app_notice_tx,
             app_launch_rx: std::sync::Mutex::new(Some(app_launch_rx)),
             clipboard_out_tx,
             clipboard_in_rx: std::sync::Mutex::new(Some(clipboard_in_rx)),
@@ -1482,6 +1493,13 @@ impl QuicStreamer {
     /// future client. Non-blocking — safe to call even with no client connected.
     pub fn send_app_catalog(&self, apps: Vec<core_proto::AppInfo>) {
         let _ = self.app_catalog_tx.send(apps);
+    }
+
+    /// Push a transient host→client status notice (toast) on the app relay — e.g.
+    /// the auto Steam close+relaunch note. Non-blocking; dropped harmlessly if no
+    /// client is connected (nobody is subscribed).
+    pub fn send_app_notice(&self, message: String) {
+        let _ = self.app_notice_tx.send(message);
     }
 
     /// Take the app-launch receiver — call exactly once. Subsequent calls return
@@ -2812,6 +2830,7 @@ async fn serve_stream(
     qos_tx: mpsc::UnboundedSender<core_proto::ClientQosV2>,
     probe: Arc<ProbeShared>,
     app_catalog_rx: tokio::sync::watch::Receiver<Vec<core_proto::AppInfo>>,
+    app_notice_tx: tokio::sync::broadcast::Sender<String>,
     app_launch_tx: mpsc::UnboundedSender<core_proto::AppMsg>,
     clipboard_out_rx: tokio::sync::watch::Receiver<core_proto::ClipboardMsg>,
     clipboard_in_tx: mpsc::UnboundedSender<core_proto::ClipboardMsg>,
@@ -3112,6 +3131,7 @@ async fn serve_stream(
         // the app protocol simply never accept the stream — harmless.
         let conn_app = conn.clone();
         let mut cat_rx = app_catalog_rx.clone();
+        let mut app_notice_rx = app_notice_tx.subscribe();
         let launch_tx_conn = app_launch_tx.clone();
         let clip_out_rx = clipboard_out_rx.clone();
         let clip_in_tx = clipboard_in_tx.clone();
@@ -3173,25 +3193,60 @@ async fn serve_stream(
                     }
                 }
             };
-            // Writer: host → client catalog, current value first then on change.
+            // Writer: host → client catalog (retained state, sent first + on
+            // change) AND one-shot notices (toasts), multiplexed on the one app
+            // stream. A small framing helper keeps both paths identical.
             let write = async move {
-                loop {
-                    let apps = cat_rx.borrow_and_update().clone();
-                    if !apps.is_empty() {
-                        match core_proto::encode_app(&core_proto::AppMsg::Catalog { apps }) {
-                            Ok(buf) => {
-                                let len_be = (buf.len() as u32).to_be_bytes();
-                                if send.write_all(&len_be).await.is_err()
-                                    || send.write_all(&buf).await.is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            Err(e) => tracing::warn!("encode catalog: {e}"),
+                async fn frame(send: &mut quinn::SendStream, msg: &core_proto::AppMsg) -> bool {
+                    match core_proto::encode_app(msg) {
+                        Ok(buf) => {
+                            let len_be = (buf.len() as u32).to_be_bytes();
+                            send.write_all(&len_be).await.is_ok()
+                                && send.write_all(&buf).await.is_ok()
+                        }
+                        Err(e) => {
+                            tracing::warn!("encode app msg: {e}");
+                            true // an encode slip isn't a stream error
                         }
                     }
-                    if cat_rx.changed().await.is_err() {
-                        break;
+                }
+                // Send the current catalog up front (skip an empty seed).
+                {
+                    let apps = cat_rx.borrow_and_update().clone();
+                    if !apps.is_empty()
+                        && !frame(&mut send, &core_proto::AppMsg::Catalog { apps }).await
+                    {
+                        return;
+                    }
+                }
+                loop {
+                    tokio::select! {
+                        changed = cat_rx.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                            let apps = cat_rx.borrow_and_update().clone();
+                            if !apps.is_empty()
+                                && !frame(&mut send, &core_proto::AppMsg::Catalog { apps }).await
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                        notice = app_notice_rx.recv() => {
+                            match notice {
+                                Ok(message) => {
+                                    if !frame(&mut send, &core_proto::AppMsg::Notice { message }).await {
+                                        break;
+                                    }
+                                }
+                                // Lagged (dropped some notices) — keep going; a
+                                // missed toast is harmless. Closed → sender gone.
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            }
+                            continue;
+                        }
                     }
                 }
                 // Signal EOF to the client's catalog reader on teardown.
@@ -4002,6 +4057,9 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
     cancel: Option<Arc<AtomicBool>>,
     latency_taps: Option<Arc<LatencyTaps>>,
     on_catalog: Option<Box<dyn FnMut(Vec<core_proto::AppInfo>) + Send>>,
+    // Host→client transient status notices (toasts) on the app relay — e.g. the
+    // auto Steam close+relaunch note. `None` = the client ignores notices.
+    on_app_notice: Option<Box<dyn FnMut(String) + Send>>,
     app_launch_rx: Option<mpsc::UnboundedReceiver<core_proto::AppMsg>>,
     wants_gyro: bool,
     // Whether the client wants a 10-bit HDR (Main10) stream — sent in the v4 auth
@@ -4238,7 +4296,11 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
         // no catalog/launch is wired. An old host never opens idx1, so the clipboard
         // accept simply parks (harmless).
         let want_clipboard = on_clipboard.is_some() || clipboard_rx.is_some();
-        if on_catalog.is_some() || app_launch_rx.is_some() || want_clipboard {
+        if on_catalog.is_some()
+            || on_app_notice.is_some()
+            || app_launch_rx.is_some()
+            || want_clipboard
+        {
             let conn_app = conn.clone();
             tokio::spawn(async move {
                 let (send, recv) = match conn_app.accept_bi().await {
@@ -4341,6 +4403,7 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
                 let read = async move {
                     let mut recv = recv;
                     let mut on_catalog = on_catalog;
+                    let mut on_app_notice = on_app_notice;
                     let mut len_buf = [0u8; 4];
                     loop {
                         if recv.read_exact(&mut len_buf).await.is_err() {
@@ -4356,12 +4419,18 @@ pub fn run_video_client_with_input<F: FnMut(Vec<u8>)>(
                         if recv.read_exact(&mut buf).await.is_err() {
                             return;
                         }
-                        if let Ok(core_proto::AppMsg::Catalog { apps }) =
-                            core_proto::decode_app(&buf)
-                        {
-                            if let Some(cb) = on_catalog.as_mut() {
-                                cb(apps);
+                        match core_proto::decode_app(&buf) {
+                            Ok(core_proto::AppMsg::Catalog { apps }) => {
+                                if let Some(cb) = on_catalog.as_mut() {
+                                    cb(apps);
+                                }
                             }
+                            Ok(core_proto::AppMsg::Notice { message }) => {
+                                if let Some(cb) = on_app_notice.as_mut() {
+                                    cb(message);
+                                }
+                            }
+                            _ => {} // client→host variants never arrive here
                         }
                     }
                 };
@@ -6494,8 +6563,9 @@ mod tests {
                     None,
                     None,
                     None,
-                    None,
-                    None,
+                    None, // on_catalog
+                    None, // on_app_notice
+                    None, // app_launch_rx
                     false,
                     false, // wants_hdr
                     None,
@@ -6587,6 +6657,7 @@ mod tests {
                 None,
                 None,
                 on_catalog,
+                None, // on_app_notice: tests don't assert toasts
                 Some(app_rx),
                 false,
                 false, // wants_hdr
@@ -6703,6 +6774,7 @@ mod tests {
                 None,
                 None,
                 on_catalog,
+                None, // on_app_notice: tests don't assert toasts
                 None,
                 false,
                 false, // wants_hdr
@@ -6834,6 +6906,7 @@ mod tests {
                 None,
                 None,
                 on_catalog,
+                None, // on_app_notice: tests don't assert toasts
                 None,
                 false,
                 false,
@@ -7010,6 +7083,7 @@ mod tests {
                     None,
                     None,  // latency_taps None → decode/present stay 0.0
                     None,  // on_catalog
+                    None,  // on_app_notice
                     None,  // app_launch_rx
                     false, // bench client: no gyro
                     false, // bench client: no HDR

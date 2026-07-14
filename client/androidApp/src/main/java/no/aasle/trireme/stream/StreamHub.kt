@@ -837,6 +837,12 @@ object StreamHub {
             override fun onCatalog(apps: List<AppInfo>) {
                 main.post { onCatalog(s, apps) }
             }
+            // Host status note (e.g. the auto Steam close+relaunch) → a transient
+            // toast, only for the ACTIVE session (a backgrounded one must not
+            // interrupt), on the main thread (the sink fires on a QUIC thread).
+            override fun onNotice(message: String) {
+                if (s.active) main.post { showHostNotice(message) }
+            }
         }
         // Host clipboard → our OS clipboard, but only for the ACTIVE session (like
         // audio/frames): a backgrounded/mirror session must not hijack the clipboard.
@@ -1056,6 +1062,17 @@ object StreamHub {
             dialLocked(s)
             publishLocked()
         }
+    }
+
+    /// Surface a transient host status note (issue: graceful SBP). A Toast is the
+    /// simplest reliable overlay from this non-Activity context on Android TV; it
+    /// rides above the stream Surface and self-dismisses. Main-thread only.
+    private fun showHostNotice(message: String) {
+        runCatching {
+            android.widget.Toast
+                .makeText(appContext, message, android.widget.Toast.LENGTH_LONG)
+                .show()
+        }.onFailure { Log.w(TAG, "host notice toast failed: ${it.message}") }
     }
 
     private fun onCatalog(s: Session, apps: List<AppInfo>) {

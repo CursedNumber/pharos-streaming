@@ -151,6 +151,9 @@ pub struct AppInfo {
 pub trait AppCatalogSink: Send + Sync {
     /// The full catalog (replaces any previous). Never block (QUIC loop).
     fn on_catalog(&self, apps: Vec<AppInfo>);
+    /// A transient host status note to surface as a toast/snackbar (e.g. the
+    /// auto Steam close+relaunch note). Fired off the QUIC loop — never block.
+    fn on_notice(&self, message: String);
 }
 
 /// Sink for the host's clipboard: fires when a host app copied text, so the client
@@ -684,10 +687,14 @@ pub fn start_video_stream(
             let cb: transport::GyroSink = Box::new(move |gx, gy, gz| g.on_sample(gx, gy, gz));
             cb
         });
-        // Host app catalog → tile grid (when a sink is provided). Map the wire
-        // record to the FFI record across the boundary.
-        let on_catalog: Option<Box<dyn FnMut(Vec<core_proto::AppInfo>) + Send>> = app_catalog_sink
-            .map(|s| {
+        // Host app catalog → tile grid, and host notices → toasts (when a sink is
+        // provided). Both closures need the sink, so share it via an Arc. Map the
+        // wire records to the FFI records across the boundary.
+        let app_catalog_sink: Option<std::sync::Arc<dyn AppCatalogSink>> =
+            app_catalog_sink.map(std::sync::Arc::from);
+        let on_catalog: Option<Box<dyn FnMut(Vec<core_proto::AppInfo>) + Send>> =
+            app_catalog_sink.as_ref().map(|s| {
+                let s = s.clone();
                 let cb: Box<dyn FnMut(Vec<core_proto::AppInfo>) + Send> = Box::new(move |apps| {
                     let mapped = apps
                         .into_iter()
@@ -701,6 +708,12 @@ pub fn start_video_stream(
                         .collect();
                     s.on_catalog(mapped);
                 });
+                cb
+            });
+        let on_app_notice: Option<Box<dyn FnMut(String) + Send>> =
+            app_catalog_sink.as_ref().map(|s| {
+                let s = s.clone();
+                let cb: Box<dyn FnMut(String) + Send> = Box::new(move |msg| s.on_notice(msg));
                 cb
             });
         // Host clipboard → the platform OS clipboard (when a sink is provided).
@@ -726,6 +739,7 @@ pub fn start_video_stream(
             Some(cancel_thread),
             None, // latency taps: no on-device decode/present wiring yet
             on_catalog,
+            on_app_notice,
             Some(app_rx),
             wants_gyro,
             // wants_hdr: false for now — the wire is v4 and always carries the

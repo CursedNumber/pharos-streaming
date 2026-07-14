@@ -80,8 +80,9 @@ fn audio_end_to_end_carries_tone() {
                 None,
                 None,
                 None,
-                None,
-                None,
+                None, // on_catalog
+                None, // on_app_notice
+                None, // app_launch_rx
                 false,
                 false, // wants_hdr
                 None,

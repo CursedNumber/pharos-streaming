@@ -60,6 +60,12 @@ pub enum AppMsg {
     /// Client → host: end the running app with this id — kill its whole process
     /// tree, including stragglers like a crash reporter.
     EndProcess { id: String },
+    /// Host → client: a transient, non-blocking status note to surface as a
+    /// toast/snackbar (e.g. "Steam was running on the desktop — restarted it
+    /// in-stream"). Additive variant: postcard tags enum variants by index, so
+    /// this is safe to APPEND (never reorder), and old clients that don't match
+    /// it just ignore the frame. Host and Trireme still ship in lockstep.
+    Notice { message: String },
 }
 
 /// Encode an [`AppMsg`] (postcard).
@@ -97,6 +103,18 @@ mod tests {
             ],
         };
         assert_eq!(decode_app(&encode_app(&msg).unwrap()).unwrap(), msg);
+    }
+
+    #[test]
+    fn notice_roundtrip() {
+        let msg = AppMsg::Notice {
+            message: "Steam was running — restarted it in-stream".into(),
+        };
+        assert_eq!(decode_app(&encode_app(&msg).unwrap()).unwrap(), msg);
+        // Appended last, so the older variants keep their tag indices — a v1
+        // Launch still decodes byte-for-byte identically.
+        let launch = AppMsg::Launch { id: "x".into() };
+        assert_eq!(decode_app(&encode_app(&launch).unwrap()).unwrap(), launch);
     }
 
     #[test]

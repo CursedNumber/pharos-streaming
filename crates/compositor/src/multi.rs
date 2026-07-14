@@ -2941,6 +2941,13 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
         .flatten()
         .filter_map(|p| p.streamer.as_ref())
         .find_map(|s| s.take_app_launch_rx());
+    // Steam Big Picture auto close+relaunch: a worker thread that shuts down a
+    // running desktop Steam (blocking, off the render loop) hands its result back
+    // here. `Ok(slug)` = Steam is down, force-launch the session now; `Err(msg)` =
+    // couldn't close it, show the client a failure toast. Drained next to the
+    // client app-relay requests each tick.
+    let (deferred_launch_tx, deferred_launch_rx) =
+        std::sync::mpsc::channel::<Result<String, String>>();
     // Clipboard sync (host ⇄ client). Client→host copies arrive on each streamer's
     // receiver; a host app's copy is read on a DETACHED thread (never the render
     // loop) which posts the text back via `clip_read_rx`; the render loop echo-gates
@@ -3583,10 +3590,81 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
         // a Trireme tile launch must give the user the same gyro reset on
         // app exit, otherwise a gyro→mouse-mode game leaves the cursor
         // jittering on the desktop afterwards.
-        if let Some(rx) = app_launch_rx.as_mut() {
-            while let Ok(msg) = rx.try_recv() {
+        {
+            // Merge this tick's app actions: deferred Steam relaunches first (their
+            // desktop-Steam shutdown already completed, so they're force-launches
+            // that skip the intercept below), then live client relay requests.
+            let mut app_msgs: Vec<(core_proto::AppMsg, bool)> = Vec::new();
+            while let Ok(res) = deferred_launch_rx.try_recv() {
+                match res {
+                    Ok(slug) => app_msgs.push((core_proto::AppMsg::Launch { id: slug }, true)),
+                    Err(message) => {
+                        for s in pipelines
+                            .iter()
+                            .flatten()
+                            .filter_map(|p| p.streamer.as_ref())
+                        {
+                            s.send_app_notice(message.clone());
+                        }
+                    }
+                }
+            }
+            if let Some(rx) = app_launch_rx.as_mut() {
+                while let Ok(msg) = rx.try_recv() {
+                    app_msgs.push((msg, false));
+                }
+            }
+            for (msg, force) in app_msgs {
                 match msg {
                     core_proto::AppMsg::Launch { id } => {
+                        // Steam Big Picture graceful handling: if this is the
+                        // steam-session and a desktop Steam is already running, a
+                        // second launch would attach THERE instead of in-stream. So
+                        // instead of failing, tell the client, and shut Steam down +
+                        // relaunch on a worker (steam::shutdown_and_wait BLOCKS —
+                        // never on the render loop; lesson-render-loop-no-block).
+                        // `force` deferred relaunches (Steam already down) skip this.
+                        if !force {
+                            let is_steam_session = app_launcher::config::load_with_builtins()
+                                .find(&id)
+                                .is_some_and(|e| {
+                                    matches!(
+                                        e.resolved_kind(),
+                                        app_launcher::config::LaunchKind::SteamSession
+                                    )
+                                });
+                            if is_steam_session && app_launcher::steam::is_ready() {
+                                for s in pipelines
+                                    .iter()
+                                    .flatten()
+                                    .filter_map(|p| p.streamer.as_ref())
+                                {
+                                    s.send_app_notice(
+                                        "Steam was running on the desktop — closing it and \
+                                         starting the session in-stream…"
+                                            .to_string(),
+                                    );
+                                }
+                                let tx = deferred_launch_tx.clone();
+                                let slug = id.clone();
+                                let _ = std::thread::Builder::new()
+                                    .name("pharos-steam-relaunch".into())
+                                    .spawn(move || {
+                                        if app_launcher::steam::shutdown_and_wait(
+                                            std::time::Duration::from_secs(15),
+                                        ) {
+                                            let _ = tx.send(Ok(slug));
+                                        } else {
+                                            let _ = tx.send(Err(
+                                                "Couldn't close desktop Steam within 15s — \
+                                                 quit it on the host, then launch again."
+                                                    .to_string(),
+                                            ));
+                                        }
+                                    });
+                                continue; // the worker re-injects once Steam is down
+                            }
+                        }
                         let launch_fps = (fps_cap.round() as u32).max(1);
                         // Tag the launch (slug + now) so toplevels mapping within the
                         // claim window associate with this slug → Switch-To can raise
@@ -3645,7 +3723,7 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                                 Err(e) => tracing::warn!("end app '{slug}' failed: {e}"),
                             });
                     }
-                    core_proto::AppMsg::Catalog { .. } => {} // host→client only
+                    core_proto::AppMsg::Catalog { .. } | core_proto::AppMsg::Notice { .. } => {} // host→client only
                 }
             }
         }
