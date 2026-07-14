@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Pharos/Trireme authors
 
-//! Annex-B HEVC access-unit splitter.
+//! Annex-B access-unit splitter (HEVC / H.264 / VVC).
 //!
-//! ffmpeg emits a raw Annex-B HEVC elementary stream on its stdout pipe with no
+//! ffmpeg emits a raw Annex-B elementary stream on its stdout pipe with no
 //! framing. To carry one frame per `QuicStreamer::send` we cut the stream at
-//! each access-unit-delimiter NAL (type 35), which `hevc_metadata=aud=insert`
-//! guarantees precedes every access unit. An AUD's NAL header byte is `0x46`
-//! (`(35 << 1)`), so we scan for start codes (`00 00 01`, with an optional
-//! leading `00` for a 4-byte start code) followed by that header byte.
+//! each access-unit-delimiter NAL, which the codec's `*_metadata=aud=insert`
+//! bitstream filter guarantees precedes every access unit. The AUD's shape is
+//! per-codec:
+//!
+//! * HEVC — type 35 in bits 6..1 of the header byte: `0x46`.
+//! * H.264 — type 9 in the low 5 bits of the header byte: `0x09`.
+//! * VVC — two-byte header; base layer `0x00`, then type 20 in the top 5 bits
+//!   of the second byte: `0x00 0xA1`.
 //!
 //! The client concatenates the units back into a continuous stream before
 //! decoding, so byte-exact alignment is not required for correctness — only for
@@ -16,19 +20,31 @@
 //!
 //! Pure byte logic, so it builds and tests on the Linux dev box too.
 
+/// Which codec's AUD the splitter cuts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuCodec {
+    Hevc,
+    H264,
+    Vvc,
+}
+
 pub struct AnnexBSplitter {
+    codec: AuCodec,
     buf: Vec<u8>,
 }
 
 impl AnnexBSplitter {
-    pub fn new() -> Self {
-        Self { buf: Vec::new() }
+    pub fn new(codec: AuCodec) -> Self {
+        Self {
+            codec,
+            buf: Vec::new(),
+        }
     }
 
     /// Append freshly-read bytes and return any now-complete access units.
     pub fn push(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
         self.buf.extend_from_slice(data);
-        let starts = aud_starts(&self.buf);
+        let starts = aud_starts(self.codec, &self.buf);
         let mut out = Vec::new();
         if starts.len() < 2 {
             // 0 or 1 AUD seen → nothing is provably complete yet.
@@ -57,16 +73,23 @@ impl AnnexBSplitter {
     }
 }
 
-impl Default for AnnexBSplitter {
-    fn default() -> Self {
-        Self::new()
+/// Whether the bytes at `hdr..` (just past a start code) are `codec`'s AUD NAL.
+fn is_aud(codec: AuCodec, buf: &[u8], hdr: usize) -> bool {
+    match codec {
+        AuCodec::Hevc => buf.get(hdr).is_some_and(|&b| (b >> 1) & 0x3f == 35),
+        AuCodec::H264 => buf
+            .get(hdr)
+            .is_some_and(|&b| (b & 0x80) == 0 && (b & 0x1f) == 9),
+        AuCodec::Vvc => {
+            buf.get(hdr) == Some(&0x00) && buf.get(hdr + 1).is_some_and(|&b| (b >> 3) == 20)
+        }
     }
 }
 
 /// Byte offsets at which an access-unit-delimiter NAL begins (pointing at the
 /// first byte of its `00 00 01` start code, including a leading `00` of a 4-byte
 /// start code when present).
-fn aud_starts(buf: &[u8]) -> Vec<usize> {
+fn aud_starts(codec: AuCodec, buf: &[u8]) -> Vec<usize> {
     let mut starts = Vec::new();
     let n = buf.len();
     if n < 4 {
@@ -75,8 +98,7 @@ fn aud_starts(buf: &[u8]) -> Vec<usize> {
     let mut i = 0usize;
     while i + 3 < n {
         if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 {
-            let nal_type = (buf[i + 3] >> 1) & 0x3f;
-            if nal_type == 35 {
+            if is_aud(codec, buf, i + 3) {
                 let start = if i > 0 && buf[i - 1] == 0 { i - 1 } else { i };
                 starts.push(start);
             }
@@ -92,14 +114,14 @@ fn aud_starts(buf: &[u8]) -> Vec<usize> {
 mod tests {
     use super::*;
 
-    // A fake access unit: 4-byte AUD start code + AUD header + one payload byte.
+    // A fake HEVC access unit: 4-byte AUD start code + AUD header + one payload byte.
     fn au(payload: u8) -> Vec<u8> {
         vec![0x00, 0x00, 0x00, 0x01, 0x46, 0x00, payload]
     }
 
     #[test]
     fn splits_complete_aus_and_keeps_tail() {
-        let mut s = AnnexBSplitter::new();
+        let mut s = AnnexBSplitter::new(AuCodec::Hevc);
         let mut stream = Vec::new();
         stream.extend(au(0xaa));
         stream.extend(au(0xbb));
@@ -116,9 +138,38 @@ mod tests {
 
     #[test]
     fn no_aud_yields_nothing() {
-        let mut s = AnnexBSplitter::new();
+        let mut s = AnnexBSplitter::new(AuCodec::Hevc);
         // A non-AUD NAL (type 0x13 = IDR slice) alone is not a cut point.
         assert!(s.push(&[0, 0, 0, 1, 0x26, 1, 2, 3]).is_empty());
         assert!(s.flush().is_some());
+    }
+
+    #[test]
+    fn splits_h264_on_its_aud() {
+        // H.264 AUD header byte is 0x09; the HEVC AUD byte 0x46 must NOT cut.
+        let mut s = AnnexBSplitter::new(AuCodec::H264);
+        let one = vec![0x00, 0x00, 0x00, 0x01, 0x09, 0xF0, 0xaa];
+        let mut stream = one.clone();
+        stream.extend([0x00, 0x00, 0x01, 0x46, 0x00]); // HEVC AUD lookalike inside
+        stream.extend(one.clone());
+        let got = s.push(&stream);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].starts_with(&[0, 0, 0, 1, 0x09]));
+        assert!(got[0].len() > one.len(), "lookalike stayed inside the AU");
+    }
+
+    #[test]
+    fn splits_vvc_on_its_two_byte_aud() {
+        let mut s = AnnexBSplitter::new(AuCodec::Vvc);
+        let one = vec![0x00, 0x00, 0x00, 0x01, 0x00, 0xA1, 0x50, 0xaa];
+        let mut stream = one.clone();
+        stream.extend(one.clone());
+        let got = s.push(&stream);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0], one);
+        // Non-base-layer or wrong-type second byte is not a cut point.
+        let mut s2 = AnnexBSplitter::new(AuCodec::Vvc);
+        assert!(s2.push(&[0, 0, 0, 1, 0x00, 0x79, 0x02]).is_empty()); // SPS
+        assert!(s2.push(&[0, 0, 0, 1, 0x01, 0xA1, 0x50]).is_empty()); // layer 1
     }
 }

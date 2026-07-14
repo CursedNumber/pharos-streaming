@@ -1,16 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Pharos/Trireme authors
 
-//! Capture + HEVC encode via an ffmpeg subprocess.
+//! Capture + video encode via an ffmpeg subprocess.
 //!
 //! Bring-up uses ffmpeg's `ddagrab` (DXGI Desktop Duplication, D3D11) to capture
-//! a monitor by index and `hevc_qsv` / `hevc_nvenc` to encode it — the same
-//! "ffmpeg owns the codec" idiom as the original Linux `capture.rs` and the
-//! Trireme client's decoder. The exact filter/encoder flags are the most likely
-//! thing to need tuning on real hardware, so `PHAROS_FFMPEG_CMD` can override
-//! the whole argument list at runtime (`%IDX%` / `%FPS%` placeholders). Output
-//! is a raw Annex-B HEVC stream on stdout, split into access units by
+//! a monitor by index and `hevc_qsv` / `hevc_nvenc` (or their `h264_*` siblings,
+//! or software `libvvenc` for H.266) to encode it — the same "ffmpeg owns the
+//! codec" idiom as the original Linux `capture.rs` and the Trireme client's
+//! decoder. The exact filter/encoder flags are the most likely thing to need
+//! tuning on real hardware, so `PHAROS_FFMPEG_CMD` can override the whole
+//! argument list at runtime (`%IDX%` / `%FPS%` placeholders). Output is a raw
+//! Annex-B stream on stdout, split into access units by
 //! [`crate::au::AnnexBSplitter`].
+//!
+//! Codec selection is `PHAROS_CODEC` (`hevc` default | `h264`/`avc` | `vvc`) —
+//! see [`WinCodec::from_env`]. AV1 is not offered here: the AU splitter cuts on
+//! Annex-B AUDs, which AV1's OBU stream doesn't have.
 
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 
@@ -22,6 +27,81 @@ pub enum Encoder {
     Nvenc,
     /// AMD AMF (`hevc_amf`) — the RX 570 `.201` rig (Polaris/VCE 3.4: I/P only, no AV1).
     Amf,
+}
+
+/// The codec this Windows host encodes. HEVC is the default (unchanged
+/// behavior); H.264/AVC is the universal-compatibility option (~+40% bitrate
+/// for equal quality; encoder engine flags are shared with HEVC); VVC/H.266 is
+/// experimental SOFTWARE encode via ffmpeg's libvvenc — no GPU encodes it, so
+/// the engine selection is ignored and the CPU does the work (realtime only at
+/// modest resolutions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WinCodec {
+    Hevc,
+    H264,
+    Vvc,
+}
+
+impl WinCodec {
+    /// Parse `PHAROS_CODEC` (`hevc`/`h265` | `h264`/`avc` | `vvc`/`h266`).
+    /// Unset → HEVC. An unrecognised value (incl. `av1` — the AU splitter can't
+    /// cut OBU streams) is an error so a typo doesn't silently stream HEVC.
+    pub fn from_env() -> anyhow::Result<Self> {
+        let Ok(raw) = std::env::var("PHAROS_CODEC") else {
+            return Ok(WinCodec::Hevc);
+        };
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "hevc" | "h265" => Ok(WinCodec::Hevc),
+            "h264" | "avc" => Ok(WinCodec::H264),
+            "vvc" | "h266" => Ok(WinCodec::Vvc),
+            other => anyhow::bail!(
+                "PHAROS_CODEC={other} not supported on the Windows host \
+                 (hevc | h264/avc | vvc/h266)"
+            ),
+        }
+    }
+
+    /// The ffmpeg encoder token for this codec on `enc` (`hevc_qsv`,
+    /// `h264_nvenc`, …). VVC is engine-independent (software libvvenc).
+    pub fn token(self, enc: Encoder) -> String {
+        let engine = match enc {
+            Encoder::Qsv => "qsv",
+            Encoder::Nvenc => "nvenc",
+            Encoder::Amf => "amf",
+        };
+        match self {
+            WinCodec::Hevc => format!("hevc_{engine}"),
+            WinCodec::H264 => format!("h264_{engine}"),
+            WinCodec::Vvc => "libvvenc".to_string(),
+        }
+    }
+
+    /// The `crate::au` splitter flavour for this codec's Annex-B output.
+    pub fn au_codec(self) -> crate::au::AuCodec {
+        match self {
+            WinCodec::Hevc => crate::au::AuCodec::Hevc,
+            WinCodec::H264 => crate::au::AuCodec::H264,
+            WinCodec::Vvc => crate::au::AuCodec::Vvc,
+        }
+    }
+
+    /// Short uppercase codec abbreviation for status/display.
+    pub fn label(self) -> &'static str {
+        match self {
+            WinCodec::Hevc => "HEVC",
+            WinCodec::H264 => "AVC",
+            WinCodec::Vvc => "VVC",
+        }
+    }
+
+    /// The encoder pixel format. The HW encoders take NV12; libvvenc consumes
+    /// 10-bit planar (ffmpeg does the CSC either way).
+    fn pix_fmt(self) -> &'static str {
+        match self {
+            WinCodec::Hevc | WinCodec::H264 => "nv12",
+            WinCodec::Vvc => "yuv420p10le",
+        }
+    }
 }
 
 /// Resolve the ffmpeg executable, checking the WinGet "Links" shim dir that
@@ -50,8 +130,8 @@ pub struct CaptureEncoder {
 impl CaptureEncoder {
     /// ddagrab path: ffmpeg both captures (DXGI Desktop Duplication) and encodes.
     /// No stdin — the capture source lives inside ffmpeg.
-    pub fn spawn(output_idx: u32, fps: u32, enc: Encoder) -> anyhow::Result<Self> {
-        let args = build_args(output_idx, fps, enc);
+    pub fn spawn(output_idx: u32, fps: u32, enc: Encoder, codec: WinCodec) -> anyhow::Result<Self> {
+        let args = build_args(output_idx, fps, enc, codec);
         let prog = ffmpeg_program();
         tracing::info!("spawning {} {}", prog.to_string_lossy(), args.join(" "));
         let mut child = Command::new(&prog)
@@ -78,8 +158,14 @@ impl CaptureEncoder {
     /// (the host captures via Windows.Graphics.Capture and paces the frames). The
     /// `width`/`height` must match the BGRA frames written, or the encoder
     /// desyncs. Returns the encoder with both stdin (feed) and stdout (AUs) piped.
-    pub fn spawn_wgc(width: u32, height: u32, fps: u32, enc: Encoder) -> anyhow::Result<Self> {
-        let args = build_rawvideo_args(width, height, fps, enc);
+    pub fn spawn_wgc(
+        width: u32,
+        height: u32,
+        fps: u32,
+        enc: Encoder,
+        codec: WinCodec,
+    ) -> anyhow::Result<Self> {
+        let args = build_rawvideo_args(width, height, fps, enc, codec);
         let prog = ffmpeg_program();
         tracing::info!("spawning {} {}", prog.to_string_lossy(), args.join(" "));
         let mut child = Command::new(&prog)
@@ -132,7 +218,7 @@ impl Drop for CaptureEncoder {
     }
 }
 
-fn build_args(output_idx: u32, fps: u32, enc: Encoder) -> Vec<String> {
+fn build_args(output_idx: u32, fps: u32, enc: Encoder, codec: WinCodec) -> Vec<String> {
     // Live-tuning hook: a full override so the ffmpeg incantation can be iterated
     // on the test rig without a rebuild. Tokens are whitespace-split.
     if let Ok(tmpl) = std::env::var("PHAROS_FFMPEG_CMD") {
@@ -173,17 +259,23 @@ fn build_args(output_idx: u32, fps: u32, enc: Encoder) -> Vec<String> {
         format!("{grab},hwdownload,format=bgra"),
         "-an".into(),
         "-pix_fmt".into(),
-        "nv12".into(),
+        codec.pix_fmt().into(),
     ];
-    a.extend(encoder_flags(enc, &gop));
-    a.extend(annexb_output());
+    a.extend(encoder_flags(enc, codec, &gop, fps));
+    a.extend(annexb_output(codec));
     a
 }
 
 /// ffmpeg args for the **WGC** path: encode a raw BGRA stream arriving on stdin
 /// (the host captures via Windows.Graphics.Capture and paces frames at `fps`).
 /// `PHAROS_FFMPEG_CMD` overrides everything, with `%W%`/`%H%`/`%FPS%` tokens.
-fn build_rawvideo_args(width: u32, height: u32, fps: u32, enc: Encoder) -> Vec<String> {
+fn build_rawvideo_args(
+    width: u32,
+    height: u32,
+    fps: u32,
+    enc: Encoder,
+    codec: WinCodec,
+) -> Vec<String> {
     if let Ok(tmpl) = std::env::var("PHAROS_FFMPEG_CMD") {
         return tmpl
             .split_whitespace()
@@ -218,19 +310,43 @@ fn build_rawvideo_args(width: u32, height: u32, fps: u32, enc: Encoder) -> Vec<S
         "pipe:0".into(),
         "-an".into(),
         "-pix_fmt".into(),
-        "nv12".into(),
+        codec.pix_fmt().into(),
     ];
-    a.extend(encoder_flags(enc, &gop));
-    a.extend(annexb_output());
+    a.extend(encoder_flags(enc, codec, &gop, fps));
+    a.extend(annexb_output(codec));
     a
 }
 
 /// Encoder selection + low-latency tuning, shared by the ddagrab and WGC paths.
-fn encoder_flags(enc: Encoder, gop: &str) -> Vec<String> {
+/// The HEVC and H.264 engine flags are identical (the `-c:v` token differs);
+/// VVC ignores the engine and software-encodes on libvvenc.
+fn encoder_flags(enc: Encoder, codec: WinCodec, gop: &str, fps: u32) -> Vec<String> {
+    if codec == WinCodec::Vvc {
+        // vvenc rejects an intra period that isn't a multiple of its GOP size
+        // (32 for every current preset), so round the 1s cadence up.
+        let idr = fps.max(1).div_ceil(32) * 32;
+        let preset = std::env::var("PHAROS_VVENC_PRESET").unwrap_or_else(|_| "faster".to_string());
+        let mut a = vec![
+            "-c:v".into(),
+            "libvvenc".into(),
+            "-preset".into(),
+            preset,
+            "-g".into(),
+            idr.to_string(),
+        ];
+        // Expert lever, passed verbatim (e.g. `gopsize=1:decodingrefreshtype=idr`).
+        if let Ok(params) = std::env::var("PHAROS_VVENC_PARAMS") {
+            if !params.trim().is_empty() {
+                a.extend(["-vvenc-params".into(), params]);
+            }
+        }
+        return a;
+    }
+    let token = codec.token(enc);
     match enc {
         Encoder::Qsv => vec![
             "-c:v".into(),
-            "hevc_qsv".into(),
+            token,
             "-preset".into(),
             "veryfast".into(),
             "-bf".into(),
@@ -242,7 +358,7 @@ fn encoder_flags(enc: Encoder, gop: &str) -> Vec<String> {
         ],
         Encoder::Nvenc => vec![
             "-c:v".into(),
-            "hevc_nvenc".into(),
+            token,
             "-preset".into(),
             "p4".into(),
             "-tune".into(),
@@ -259,7 +375,7 @@ fn encoder_flags(enc: Encoder, gop: &str) -> Vec<String> {
         // is I/P only (no B-frames), so no `-bf`.
         Encoder::Amf => vec![
             "-c:v".into(),
-            "hevc_amf".into(),
+            token,
             "-usage".into(),
             "ultralowlatency".into(),
             "-quality".into(),
@@ -271,13 +387,18 @@ fn encoder_flags(enc: Encoder, gop: &str) -> Vec<String> {
 }
 
 /// Insert access-unit delimiters so the splitter can cut one AU per frame, then
-/// emit a raw Annex-B HEVC elementary stream on stdout.
-fn annexb_output() -> Vec<String> {
+/// emit a raw Annex-B elementary stream on stdout.
+fn annexb_output(codec: WinCodec) -> Vec<String> {
+    let (bsf, fmt) = match codec {
+        WinCodec::Hevc => ("hevc_metadata=aud=insert", "hevc"),
+        WinCodec::H264 => ("h264_metadata=aud=insert", "h264"),
+        WinCodec::Vvc => ("vvc_metadata=aud=insert", "vvc"),
+    };
     vec![
         "-bsf:v".into(),
-        "hevc_metadata=aud=insert".into(),
+        bsf.into(),
         "-f".into(),
-        "hevc".into(),
+        fmt.into(),
         "pipe:1".into(),
     ]
 }

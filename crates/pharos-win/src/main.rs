@@ -163,7 +163,18 @@ fn run_stream_args(args: &[String]) -> anyhow::Result<()> {
     if matches!(capture, CaptureBackend::WgcZc) && !matches!(encoder, encode::Encoder::Nvenc) {
         anyhow::bail!("wgc-zc requires the nvenc encoder");
     }
-    run_stream(bind, output_idx, fps, encoder, capture)
+    // Codec: PHAROS_CODEC env (hevc default | h264/avc | vvc/h266). The ffmpeg
+    // paths carry all three; the in-process zero-copy NVENC pipeline is
+    // HEVC-only today.
+    let codec = encode::WinCodec::from_env()?;
+    if matches!(capture, CaptureBackend::WgcZc) && codec != encode::WinCodec::Hevc {
+        anyhow::bail!(
+            "wgc-zc is HEVC-only (in-process NVENC HEVC pipeline); unset PHAROS_CODEC or \
+             use the ddagrab/wgc capture backends for {}",
+            codec.label()
+        );
+    }
+    run_stream(bind, output_idx, fps, encoder, capture, codec)
 }
 
 /// Which capture source feeds the encoder.
@@ -217,6 +228,7 @@ fn start_mqtt(
     encoder: encode::Encoder,
     capture: CaptureBackend,
     fps: u32,
+    codec: encode::WinCodec,
 ) -> Option<integration_mqtt::Mqtt> {
     use integration_mqtt::{host, Config, Device, EntitySpec, Mqtt};
 
@@ -253,11 +265,8 @@ fn start_mqtt(
         }
     };
 
-    let enc_s = match encoder {
-        encode::Encoder::Qsv => "hevc_qsv",
-        encode::Encoder::Nvenc => "hevc_nvenc",
-        encode::Encoder::Amf => "hevc_amf",
-    };
+    let enc_s = codec.token(encoder);
+    let enc_s = enc_s.as_str();
     let cap_s = match capture {
         CaptureBackend::Dda => "ddagrab",
         CaptureBackend::Wgc => "wgc",
@@ -476,14 +485,22 @@ fn build_status(
 }
 
 /// `(encoder label, codec label)` for the published status. pharos-win streams
-/// HEVC on all three encoders.
+/// HEVC (default), AVC/H.264, or software VVC/H.266 on any of the three engines.
 #[cfg(windows)]
-fn encoder_labels(e: encode::Encoder) -> (&'static str, &'static str) {
-    match e {
-        encode::Encoder::Qsv => ("Quick Sync HEVC", "HEVC"),
-        encode::Encoder::Nvenc => ("NVENC HEVC", "HEVC"),
-        encode::Encoder::Amf => ("AMF HEVC", "HEVC"),
-    }
+fn encoder_labels(e: encode::Encoder, codec: encode::WinCodec) -> (String, &'static str) {
+    let codec_label = codec.label();
+    let engine = match e {
+        encode::Encoder::Qsv => "Quick Sync",
+        encode::Encoder::Nvenc => "NVENC",
+        encode::Encoder::Amf => "AMF",
+    };
+    let encoder_label = if codec == encode::WinCodec::Vvc {
+        // No GPU encodes VVC — the engine choice is moot on this path.
+        "vvenc VVC (software)".to_string()
+    } else {
+        format!("{engine} {codec_label}")
+    };
+    (encoder_label, codec_label)
 }
 
 #[cfg(windows)]
@@ -493,6 +510,7 @@ fn run_stream(
     fps: u32,
     encoder: encode::Encoder,
     capture: CaptureBackend,
+    codec: encode::WinCodec,
 ) -> anyhow::Result<()> {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -611,7 +629,7 @@ fn run_stream(
     }
 
     // Optional MQTT / Home-Assistant telemetry — off unless enabled in config.toml.
-    let mqtt = start_mqtt(encoder, capture, fps);
+    let mqtt = start_mqtt(encoder, capture, fps, codec);
 
     // Input back-channel → SendInput, on its own thread. `try_recv` works
     // outside a tokio runtime; sleep briefly when the queue is empty.
@@ -735,7 +753,7 @@ fn run_stream(
     // connect-wait so an idle host is already panel-visible. Non-fatal: a bind
     // failure logs and streaming continues.
     let hostname = host_info::hostname();
-    let (encoder_label, codec_label) = encoder_labels(encoder);
+    let (encoder_label, codec_label) = encoder_labels(encoder, codec);
     let frames = Arc::new(AtomicU64::new(0));
     // Encoded bytes actually handed to the transport — the encoder's GROUND-TRUTH
     // output rate. The adaptive-bitrate loop logs it per window: at very low
@@ -757,7 +775,7 @@ fn run_stream(
     }
     let status = Arc::new(Mutex::new(build_status(
         &hostname,
-        encoder_label,
+        &encoder_label,
         codec_label,
         fps,
         streamer.is_connected(),
@@ -785,7 +803,7 @@ fn run_stream(
             .spawn(move || loop {
                 let mut s = build_status(
                     &hostname_r,
-                    encoder_label,
+                    &encoder_label,
                     codec_label,
                     fps,
                     streamer_r.is_connected(),
@@ -1399,7 +1417,7 @@ fn run_stream(
 
         let pacer_stop = Arc::new(AtomicBool::new(false));
         let (enc, stdout, stderr, pacer, size) =
-            match build_pipeline(capture, output_idx, fps, encoder, &pacer_stop) {
+            match build_pipeline(capture, output_idx, fps, encoder, codec, &pacer_stop) {
                 Ok(t) => t,
                 Err(e) => {
                     // The FIRST build error feeds the breaker too — a transient
@@ -1449,7 +1467,7 @@ fn run_stream(
         let sig = FaultSignal::new(generation);
         let scanner = spawn_stderr_scanner(stderr, sig.clone());
         let (stdout_rx, reader) = spawn_stdout_reader(stdout);
-        let mut splitter = au::AnnexBSplitter::new();
+        let mut splitter = au::AnnexBSplitter::new(codec.au_codec());
         let gen_start = Instant::now();
         set_health(&gpu_health, control_ipc::GpuHealth::Healthy);
         if let Some(m) = &mqtt {
@@ -1772,6 +1790,7 @@ fn build_pipeline(
     output_idx: u32,
     fps: u32,
     encoder: encode::Encoder,
+    codec: encode::WinCodec,
     pacer_stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<(
     encode::CaptureEncoder,
@@ -1785,7 +1804,7 @@ fn build_pipeline(
             // Resolve BEFORE spawning ffmpeg so each respawn re-reads the
             // (possibly changed) mode the fresh ddagrab will capture.
             let size = capture_size(capture, output_idx);
-            let mut e = encode::CaptureEncoder::spawn(output_idx, fps, encoder)?;
+            let mut e = encode::CaptureEncoder::spawn(output_idx, fps, encoder, codec)?;
             let stdout = e
                 .take_stdout()
                 .ok_or_else(|| anyhow::anyhow!("ffmpeg produced no stdout pipe"))?;
@@ -1802,7 +1821,7 @@ fn build_pipeline(
             // a fresh D3D11 device (a TDR likely killed the old one).
             let (w, h, cap) = wgc::WgcCapturer::start(output_idx as usize)?;
             tracing::info!("WGC capturing monitor {output_idx} at {w}x{h}; pacing to {fps}fps");
-            let mut e = encode::CaptureEncoder::spawn_wgc(w, h, fps, encoder)?;
+            let mut e = encode::CaptureEncoder::spawn_wgc(w, h, fps, encoder, codec)?;
             let stdin = e
                 .take_stdin()
                 .ok_or_else(|| anyhow::anyhow!("ffmpeg produced no stdin pipe"))?;
