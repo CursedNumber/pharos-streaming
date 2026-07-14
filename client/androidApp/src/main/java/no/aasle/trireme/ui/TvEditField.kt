@@ -195,20 +195,43 @@ private fun DpadEditField(
             // Preview so we intercept OK / RIGHT *before* the field can swallow them.
             .onPreviewKeyEvent { ev ->
                 if (ev.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                // Soft-keyboard-originated keys (the on-screen keyboard's own ◀ ▶ cursor
+                // keys, Backspace, Enter…) arrive as key events WHILE the keyboard is up and
+                // carry FLAG_SOFT_KEYBOARD / FLAG_KEEP_TOUCH_MODE. They must reach the field
+                // to move the text cursor / edit, and must NEVER trip the readOnly teardown
+                // below: flipping editing=false ends the input session SYNCHRONOUSLY inside
+                // this key-down, out from under the IME mid-keystroke. The IME (a separate
+                // system process) is then stranded with the key still "down" and auto-repeats
+                // it SYSTEM-WIDE — the live 2026-07-14 X90J wedge where pressing the on-screen
+                // ◀ cursor key closed the keyboard and then jammed DPAD_LEFT into the launcher
+                // long after Trireme had exited. A physical remote's D-pad never sets these
+                // flags, so navigation/Back-recovery below is unaffected.
+                val nativeFlags = ev.nativeKeyEvent.flags
+                val softMask = android.view.KeyEvent.FLAG_SOFT_KEYBOARD or
+                    android.view.KeyEvent.FLAG_KEEP_TOUCH_MODE
+                if (nativeFlags and softMask != 0) {
+                    return@onPreviewKeyEvent false
+                }
                 // Backspace/Delete are EDITING keys the soft keyboard forwards as key events
                 // even while it's up — they must delete a character, NOT be read as "navigating
                 // away". Without this exception, pressing Backspace on the on-screen keyboard
                 // flips editing=false → readOnly=true → the keyboard slams shut mid-edit (so you
                 // can never correct a typo on a TV). Let them through to the field, which deletes
-                // a char while editing and harmlessly ignores them while readOnly.
+                // a char while editing and harmlessly ignores them while readOnly. (Kept as a
+                // belt-and-braces backstop for any IME that omits the soft-keyboard flags above.)
                 if (ev.key == Key.Backspace || ev.key == Key.Delete) {
                     return@onPreviewKeyEvent false
                 }
-                // Any OTHER key reaching the field means the keyboard is DOWN (the IME owns the
-                // D-pad while up), i.e. we're navigating — so normalize out of any stale edit
-                // state. This is how a keyboard dismissed by Back (which the IME swallows) gets
-                // observed.
-                if (editing) editing = false
+                // Any OTHER key reaching the field is a PHYSICAL remote press (soft-keyboard
+                // events returned above): the keyboard is DOWN (the IME owns the D-pad while
+                // up), i.e. we're navigating — so normalize out of any stale edit state and
+                // hide the keyboard through the IME framework (graceful, so no stranded
+                // repeat) rather than by yanking readOnly alone. This is how a keyboard
+                // dismissed by Back (which the IME swallows) gets observed.
+                if (editing) {
+                    editing = false
+                    kb?.hide()
+                }
                 when {
                     ev.key == Key.DirectionCenter || ev.key == Key.Enter ||
                         ev.key == Key.NumPadEnter -> {
