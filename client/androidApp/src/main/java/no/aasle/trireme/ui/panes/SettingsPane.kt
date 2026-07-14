@@ -324,8 +324,8 @@ fun SettingsPane(onOpenControllers: () -> Unit = {}) {
         )
         SettingRow(
             title = "Hold Start for cursor",
-            summary = "While held, Start turns the controller into a cursor momentarily " +
-                "(released on let-go). Turn off to keep Start as a normal pad button.",
+            summary = "Hold Start ~4.5s to toggle controller-as-cursor on/off (a quick " +
+                "Start tap still works as a normal pad button). Off by default.",
             trailing = if (holdStartCursor) "On" else "Off",
             state = if (holdStartCursor) "On" else "Off",
             onClick = {

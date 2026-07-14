@@ -1224,7 +1224,12 @@ fn dispatch_input(
                 return;
             };
             let loc = Point::from((x as f64 * width as f64, y as f64 * height as f64));
-            let focus = focus_surface.map(|s| (s.clone(), Point::from((0.0, 0.0))));
+            // Focus the surface ACTUALLY under the cursor (with its real map
+            // location), not the keyboard-focused surface assumed at (0,0): a
+            // centered dialog (e.g. Cyberpunk's REDprelauncher) sits at an offset,
+            // so a (0,0) assumption maps the click outside its bounds and it misses
+            // the button. A fullscreen app fills the output → same result as before.
+            let focus = data.state.surface_under(loc);
             pointer.motion(
                 &mut data.state,
                 focus,
@@ -1252,7 +1257,10 @@ fn dispatch_input(
                 (cur.x + dx as f64).clamp(0.0, f64::from(width)),
                 (cur.y + dy as f64).clamp(0.0, f64::from(height)),
             ));
-            let focus = focus_surface.map(|s| (s.clone(), Point::from((0.0, 0.0))));
+            // Same as PointerAbs: target the surface under the new location (real
+            // map offset), so a relative cursor (gamepad/gyro) lands on a centered
+            // dialog too, not just a fullscreen app at (0,0).
+            let focus = data.state.surface_under(loc);
             pointer.motion(
                 &mut data.state,
                 focus.clone(),

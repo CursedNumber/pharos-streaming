@@ -179,7 +179,7 @@ object StreamHub {
     // because nothing on the wire asks for it. Flipped live via [setGyroEnabled];
     // takes effect on the NEXT dial (the v2 auth handshake sends the flag once).
     @Volatile private var gyroEnabled: Boolean = false
-    @Volatile private var holdStartForCursor: Boolean = true
+    @Volatile private var holdStartForCursor: Boolean = false
     // Touch-pointer mode. true = absolute (tap-to-position), false = trackpad
     // (relative drag → PointerRel). Seeded in [init]; flipped live via
     // [setTouchAbsolute] (takes effect immediately, no re-dial).
@@ -779,7 +779,7 @@ object StreamHub {
 
     private fun readHoldStartForCursorPref(ctx: Context): Boolean =
         ctx.getSharedPreferences("trireme.settings", Context.MODE_PRIVATE)
-            .getBoolean("hold_start_cursor", true)
+            .getBoolean("hold_start_cursor", false)
 
     /**
      * Live slot index of the controller with this VID:PID on the active session,

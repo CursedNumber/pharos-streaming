@@ -168,20 +168,30 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     private var tScrollLastY = 0f
     private var tPressed = false // a left button is held down (absolute drag)
     // --- Controller-as-cursor state ---
-    // When active (the Settings toggle OR Start held with the option on), the right
+    // Cursor mode is a persistent TOGGLE (StreamHub.cursorMode): while on, the right
     // stick drives the host cursor via a ~60Hz ticker (a held stick fires only one
-    // motion event, so a poll loop is needed) and A/B become left/right click. The
-    // ticker runs only while active, so it's zero-cost otherwise.
-    private var startHeldForCursor = false // Start currently held with the option on
+    // motion event, so a poll loop is needed) and A/B become left/right click.
+    // The gamepad way to flip it: HOLD Start ~4.5s (Artemis-style), gated by the
+    // "Hold Start for cursor" Settings option; a normal Start tap still passes to
+    // the pad. The ticker runs only while on, so it's zero-cost otherwise.
     @Volatile private var rStickX = 0f
     @Volatile private var rStickY = 0f
     private val cursorHandler by lazy { Handler(Looper.getMainLooper()) }
     private var cursorTickerRunning = false
+    private var cursorToggleRunnable: Runnable? = null // the pending 4.5s Start-hold
     // Host cursor pixels per tick at full stick deflection (~60Hz → ~840 px/s).
     private val cursorSpeed = 14f
     private val cursorDeadzone = 0.12f
+    private val cursorHoldMs = 4500L // Start-hold duration to toggle the cursor
 
-    private fun cursorActive(): Boolean = StreamHub.isCursorMode() || startHeldForCursor
+    private fun cursorActive(): Boolean = StreamHub.isCursorMode()
+
+    /** Cancel a pending Start-hold toggle (Start released early, or Select joined
+     *  to form the navbar combo). */
+    private fun cancelCursorToggleHold() {
+        cursorToggleRunnable?.let { cursorHandler.removeCallbacks(it) }
+        cursorToggleRunnable = null
+    }
 
     private fun ensureCursorTicker() {
         if (cursorTickerRunning || !cursorActive()) return
@@ -377,26 +387,43 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         val comboOpen = down &&
             (kc == KeyEvent.KEYCODE_BUTTON_START || kc == KeyEvent.KEYCODE_BUTTON_SELECT) &&
             startDown && selectDown
-        // Always release the hold-Start cursor trigger on Start-up, whatever the
-        // navbar state, so it can never latch on after a combo raised the navbar.
-        if (kc == KeyEvent.KEYCODE_BUTTON_START && up) startHeldForCursor = false
+        // The Start-hold cursor toggle: cancel the pending timer if Start is
+        // released early, or if Select joins Start (that's the navbar combo, not a
+        // cursor toggle). Whatever the navbar state, so it can't fire stale.
+        if ((kc == KeyEvent.KEYCODE_BUTTON_START && up) ||
+            (kc == KeyEvent.KEYCODE_BUTTON_SELECT && down)
+        ) {
+            cancelCursorToggleHold()
+        }
 
         if (navMode.value == NavMode.Hidden) {
             // --- Stream (navbar HIDDEN) ---
-            // Controller-as-cursor input runs BEFORE the pad forwarding below, so A/B/
-            // Start drive the host cursor instead of the game pad while it's active.
-            //   • Hold Start (Artemis-style, gated by the Settings option) activates
-            //     the cursor while held; consumed so it never reaches the pad. The
-            //     Start+Select navbar combo still works (it fires on the Select event),
-            //     so Start is skipped here when Select is already down.
-            if (kc == KeyEvent.KEYCODE_BUTTON_START && StreamHub.isHoldStartForCursor() && !selectDown) {
-                if (down && event.repeatCount == 0) {
-                    startHeldForCursor = true
-                    ensureCursorTicker()
+            // Controller-as-cursor input.
+            //   • HOLD Start ~4.5s (Artemis-style, gated by the Settings option) to
+            //     TOGGLE cursor mode on/off. Start is NOT consumed — a normal tap
+            //     still reaches the game pad, and the Start+Select navbar combo still
+            //     works (the timer is cancelled when Select joins). Only the long
+            //     hold flips the mode; a toast confirms it.
+            if (kc == KeyEvent.KEYCODE_BUTTON_START && down && event.repeatCount == 0 &&
+                StreamHub.isHoldStartForCursor() && !selectDown
+            ) {
+                cancelCursorToggleHold()
+                val r = Runnable {
+                    cursorToggleRunnable = null
+                    val next = !StreamHub.isCursorMode()
+                    StreamHub.setCursorMode(next)
+                    if (next) ensureCursorTicker()
+                    android.widget.Toast.makeText(
+                        this,
+                        if (next) "Controller cursor ON" else "Controller cursor OFF",
+                        android.widget.Toast.LENGTH_SHORT,
+                    ).show()
                 }
-                return true
+                cursorToggleRunnable = r
+                cursorHandler.postDelayed(r, cursorHoldMs)
+                // fall through: Start still reaches the pad as normal.
             }
-            //   • While cursor mode is active, A = left click, B = right click.
+            //   • While cursor mode is on, A = left click, B = right click.
             //     Consume ALL A/B events (incl. held repeats) so they never leak to
             //     the pad; the button edge fires on the first down and the up.
             if (cursorActive()) {
