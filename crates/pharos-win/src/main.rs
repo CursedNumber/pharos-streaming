@@ -3,9 +3,10 @@
 
 //! `pharos-host` — the Pharos streaming host for Windows (BATTLE_PLAN.md M3).
 //!
-//! Pipeline: capture a display → HEVC (Quick Sync / NVENC via an ffmpeg
-//! subprocess) → `transport::QuicStreamer` (the same QUIC server the Linux
-//! `compositor` uses) → Trireme. The input back-channel (`take_input_rx`) is
+//! Pipeline: capture a display → encode (HEVC/H.264/VVC via Quick Sync /
+//! NVENC / AMF through an ffmpeg subprocess, or the in-process nvenc wgc-zc
+//! backend with no ffmpeg subprocess) → `transport::QuicStreamer` (the same
+//! QUIC server the Linux `compositor` uses) → Trireme. The input back-channel (`take_input_rx`) is
 //! drained into Win32 `SendInput`. Pairing + identity are the shared
 //! `host_core::pair` code, so an unmodified Trireme connects to either host OS.
 //!
@@ -326,14 +327,6 @@ fn start_mqtt(
     Some(mqtt)
 }
 
-/// The host streaming loop: start the QUIC server, gate on a connected client,
-/// then pump ffmpeg's HEVC output (split into access units) onto the stream
-/// while a side thread injects the input back-channel.
-/// Build the [`control_ipc::HostStatus`] this Windows host publishes to the
-/// panel. Pure (no I/O) so the field mapping type-checks and unit-tests on the
-/// Linux dev box even though [`run_stream`] is Windows-only — only the thin
-/// wiring that feeds it needs Windows. The single-streamer Windows model fills
-/// `clients` with at most one entry and leaves the multi-output `outputs` empty.
 /// Pack/unpack a `(w, h)` pixel size into one `u64`, `(w<<32)|h`; the same
 /// packing `transport::QuicStreamer` uses for its latched geometry. Lets the
 /// ~4 Hz status thread share the capture size with the supervisor loop through
@@ -408,6 +401,11 @@ fn adapt_bitrate_step(
     }
 }
 
+/// Build the [`control_ipc::HostStatus`] this Windows host publishes to the
+/// panel. Pure (no I/O) so the field mapping type-checks and unit-tests on the
+/// Linux dev box even though [`run_stream`] is Windows-only — only the thin
+/// wiring that feeds it needs Windows. The single-streamer Windows model fills
+/// `clients` with at most one entry and leaves the multi-output `outputs` empty.
 #[cfg(any(windows, test))]
 #[allow(clippy::too_many_arguments)]
 fn build_status(
@@ -503,6 +501,9 @@ fn encoder_labels(e: encode::Encoder, codec: encode::WinCodec) -> (String, &'sta
     (encoder_label, codec_label)
 }
 
+/// The host streaming loop: start the QUIC server, gate on a connected client,
+/// then pump ffmpeg's HEVC output (split into access units) onto the stream
+/// while a side thread injects the input back-channel.
 #[cfg(windows)]
 fn run_stream(
     bind: std::net::SocketAddr,
@@ -749,7 +750,7 @@ fn run_stream(
     // ── Control plane ──────────────────────────────────────────────────────
     // Publish a HostStatus over TCP so the panel (on the Linux box) can see this
     // Windows host's live state — connected client, encoder, fps, frames sent.
-    // Render-loop-free (control_ipc::serve_status); brought up BEFORE the
+    // Render-loop-free (control_ipc::serve_control); brought up BEFORE the
     // connect-wait so an idle host is already panel-visible. Non-fatal: a bind
     // failure logs and streaming continues.
     let hostname = host_info::hostname();

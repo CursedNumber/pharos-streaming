@@ -15,7 +15,7 @@ license.workspace = true
 # (mirrors the `host-info` / `control-ipc` "lean leaf" rule). Steam/desktop
 # scanning is hand-rolled (a tolerant KeyValues reader) rather than pulling an
 # external, version-fragile crate, so this builds clean on Linux, Windows, and
-# ARM with the same five deps.
+# ARM with the same six deps.
 
 [dependencies]
 serde = { workspace = true }

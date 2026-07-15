@@ -2,7 +2,7 @@
 # Pharos host launcher — REAP + BUNDLE.
 #
 # One click does the whole thing:
-#   1. Kills every running pharos-{compositor,usbimport,tray,panel} process,
+#   1. Kills every running pharos-{compositor,usbimport} process,
 #      no matter how it was started — systemd unit, manual `cargo run`, an
 #      old debug build still lingering, anything. (The previous version of
 #      this script tried to be "idempotent: skip if active" — that's how we

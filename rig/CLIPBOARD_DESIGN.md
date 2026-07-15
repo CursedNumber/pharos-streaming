@@ -182,9 +182,9 @@ when SETTING; request the first offered text flavor when READING.
 
 **Gating + scope (v1 policy):** clipboard binds to the SAME streamer input/app use
 (first streamer via find_map) — consistent with input's existing single-primary
-binding; mirror is dead-by-default. A global `[clipboard] enabled` config toggle
-(default true) gates both directions; per-device/per-direction gates are a
-follow-up. `new_selection` only fires for the keyboard-FOCUSED client, so host->client
+binding; mirror is dead-by-default. The `PHAROS_CLIPBOARD` env var gates both
+directions (`PHAROS_CLIPBOARD=0` disables clipboard sync; default on); per-device/
+per-direction gates are a follow-up. `new_selection` only fires for the keyboard-FOCUSED client, so host->client
 sync works while an app is focused (not on the idle screen) — acceptable.
 
 **Compat note:** no `PROTOCOL_VERSION` bump (own stream, additive). Adding

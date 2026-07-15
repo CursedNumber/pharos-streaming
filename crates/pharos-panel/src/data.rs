@@ -726,9 +726,6 @@ fn merge_multi_toml(existing: &str, l: &CompositorLayout) -> Result<String> {
 // Decode capabilities  (media-decode probe)
 // ---------------------------------------------------------------------------
 
-/// Map the `media-decode` probe into Decode-stage rows. The first call runs the
-/// (cached) test-decode probe, which can take up to ~2 s; callers should treat
-/// it as lazy/slow-once. `available = usable || software`.
 /// Probe whether the host can actually inject input right now, beyond the
 /// compile-time backend identity. On Linux the panel runs on the host, so we test
 /// `/dev/uinput` writability directly — the most accurate check, since it honours
@@ -768,6 +765,9 @@ pub fn injector_health() -> crate::model::InjectorHealth {
     }
 }
 
+/// Map the `media-decode` probe into Decode-stage rows. The first call runs the
+/// (cached) test-decode probe, which can take up to ~2 s; callers should treat
+/// it as lazy/slow-once. `available = usable || software`.
 pub fn decode_capabilities() -> Vec<CapabilityUi> {
     map_decode_caps(media_decode::capabilities())
 }
@@ -921,8 +921,8 @@ type EncoderRow = (
     u8,
 );
 
-/// Probe `ffmpeg -encoders` for the HEVC encoders the host can use, plus
-/// software. `available` = the encoder is listed by the local ffmpeg. Validated
+/// Probe `ffmpeg -encoders` for the HEVC / AV1 / AVC / VVC encoders the host can
+/// use, plus software. `available` = the encoder is listed by the local ffmpeg. Validated
 /// flags reflect the rigs we've confirmed each on (NVENC=RTX4070, qsv=T14,
 /// amf=RX570). Never panics: if ffmpeg can't be run, everything but software is
 /// marked unavailable.

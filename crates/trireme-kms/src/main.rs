@@ -4,9 +4,11 @@
 //! `trireme-kms` — headless atomic DRM/KMS scanout client.
 //!
 //! Runs on a display-less box that owns an HDMI output (e.g. a headless GPU box
-//! with the GTX 1080 driving the Bravia). Receives the Pharos HEVC stream over QUIC,
-//! decodes it with ffmpeg (HW decoder probed at runtime — NVDEC `hevc_cuvid` on
-//! the GTX 1080 rig, `hevc_rkmpp`/V4L2 on ARM SBCs), and presents each frame to the
+//! with the GTX 1080 driving the Bravia). Receives the Pharos video stream over QUIC
+//! and auto-detects the codec (HEVC/AV1/AVC/VVC by NAL/OBU sniff), decoding it with
+//! ffmpeg (HW decoder probed at runtime and retargeted to the sniffed codec — e.g.
+//! NVDEC `hevc_cuvid` on the GTX 1080 rig, `hevc_rkmpp`/V4L2 on ARM SBCs), and
+//! presents each frame to the
 //! connector via the **atomic** DRM API — vblank-locked page-flips. There is no
 //! Wayland/X display server here, so `trireme play` (winit/wgpu) is the wrong
 //! tool; this binary talks to KMS directly.

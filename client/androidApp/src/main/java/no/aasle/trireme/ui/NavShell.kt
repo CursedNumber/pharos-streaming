@@ -107,7 +107,7 @@ private val LOGO_STRIP = 48.dp
 /**
  * The left-edge navbar overlay + the active pane, floating over the (still-playing) live stream.
  *
- * Layout: a [TriremeTokens.navWidth]-wide surface pinned to the left edge, backed by [navScrim]
+ * Layout: a responsive band ([RAIL_WIDTH] in Peek, [navBandWidth] in Full) pinned to the left edge, backed by [navScrim]
  * (a near-opaque, mode-tuned wash so panel text stays legible over an arbitrary video frame —
  * we never assume the video is dark). Inside, a narrow icon+label RAIL of the four [NavDest]s,
  * and the active pane to its right; the Trireme logo sits in the TOP-RIGHT of the surface
@@ -116,7 +116,7 @@ private val LOGO_STRIP = 48.dp
  *
  * Selecting **Stream** (or otherwise leaving the navbar) calls [onCloseToStream]; selecting any
  * other dest calls [onSelect]. The shell (integration) owns the reveal state machine
- * (UP-at-top / RIGHT-at-edge / Back) and drives [visible]/[current].
+ * (UP-at-top / LEFT-at-edge / Back) and drives [visible]/[current].
  *
  * TV-focus rule (lesson-compose-tv-focus): each rail item is its OWN focusable click target with
  * [triremeFocus]; we never wrap the rail in a single clickable that would trap the D-pad.

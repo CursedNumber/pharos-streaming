@@ -413,7 +413,6 @@ unsafe extern "C" fn on_channel_new(_session: *mut GObject, channel: *mut GObjec
             // Seed the initial mode (the agent may already be in client mode).
             st.mouse_mode = get_int_prop(channel, c"mouse-mode");
         }
-        // The library auto-connects each channel; we never call spice_channel_connect.
     }));
 }
 

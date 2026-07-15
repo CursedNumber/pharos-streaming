@@ -560,7 +560,18 @@ pub fn classify_controller(vendor: u16, product: u16, name: String) -> Controlle
     }
 }
 
-/// Connect to a Pharos QUIC streamer at `addr` (e.g. `192.168.1.100:4433`) and
+/// Client-requested stream mode passed to [`start_video_stream`]. `width`/`height`
+/// of 0 = **Auto** (the host keeps its native canvas resolution). `refresh_mhz` =
+/// the panel's refresh in millihertz (60 Hz = 60_000). The host caps its encode
+/// fps to the refresh and (Tier-3) targets width×height.
+#[derive(uniffi::Record)]
+pub struct StreamMode {
+    pub width: u32,
+    pub height: u32,
+    pub refresh_mhz: u32,
+}
+
+/// Connect to a Pharos QUIC streamer at `addr` (e.g. `192.168.1.100:15777`) and
 /// deliver HEVC access units to `sink` until the stream ends. Returns
 /// immediately; the QUIC client runs on its own thread.
 ///
@@ -582,17 +593,6 @@ pub fn classify_controller(vendor: u16, product: u16, name: String) -> Controlle
 /// user controls in Settings; an opt-in design so old/light clients never pay
 /// the IMU cost. The flag is sent once at connect; toggling it on the client
 /// takes effect on the NEXT dial.
-/// Client-requested stream mode passed to [`start_video_stream`]. `width`/`height`
-/// of 0 = **Auto** (the host keeps its native canvas resolution). `refresh_mhz` =
-/// the panel's refresh in millihertz (60 Hz = 60_000). The host caps its encode
-/// fps to the refresh and (Tier-3) targets width×height.
-#[derive(uniffi::Record)]
-pub struct StreamMode {
-    pub width: u32,
-    pub height: u32,
-    pub refresh_mhz: u32,
-}
-
 #[uniffi::export]
 #[allow(clippy::too_many_arguments)]
 pub fn start_video_stream(

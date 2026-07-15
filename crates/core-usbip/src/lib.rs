@@ -30,7 +30,7 @@ pub enum UsbClass {
 }
 
 impl UsbClass {
-    /// v1 ships HID + audio + mass storage; isochronous/webcams deferred.
+    /// v1 ships HID + mass storage; isochronous (USB audio) / webcams deferred.
     pub fn supported_v1(self) -> bool {
         matches!(
             self,

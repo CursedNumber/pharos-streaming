@@ -73,9 +73,9 @@ import no.aasle.trireme.ui.triremeFocus
 import kotlin.math.roundToInt
 
 /**
- * The four pace presets surfaced by the pace row. Mirrors `MainActivity.PaceMode`; kept as a
- * UI-local enum so this pane doesn't depend on the player internals. The integration agent maps
- * the persisted choice onto the live decoder via StreamHub.
+ * The four pace presets surfaced by the pace row. Mirrors `no.aasle.trireme.stream.PaceMode`; kept
+ * as a UI-local enum so the pane's option set stays decoupled from the decoder's pace enum. The
+ * integration agent maps the persisted choice onto the live decoder via StreamHub.
  */
 private enum class PaceChoice { LowLatency, Balanced, Smooth, Vrr }
 

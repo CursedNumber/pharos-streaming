@@ -12,9 +12,9 @@
 //! Friendly-name resolution (per the user's spec):
 //!   custom alias > cached hostname > IP/host string
 //!
-//! `hostname_cache` is in the schema but not auto-populated yet — std lib
-//! has no portable PTR lookup. When we add a resolver (hickory-resolver),
-//! the schema doesn't need to change. See the note above `tests` below.
+//! `hostname_cache` is auto-populated best-effort by [`reverse_lookup`], a PTR
+//! lookup via the `dns_lookup` crate, kicked off from the menu's
+//! `kick_reverse_lookup`. The cache stays whatever it was if the lookup fails.
 
 use std::fs;
 use std::net::SocketAddr;

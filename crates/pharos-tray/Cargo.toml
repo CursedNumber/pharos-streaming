@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# A small system-tray daemon for the Pharos host. Shows a three-state lighthouse
+# A small system-tray daemon for the Pharos host. Shows a five-state lighthouse
 # icon + a right-click menu (open the panel / stop the host). Cross-platform: the
 # state source, icon rasterization, and actions are shared; only the tray DISPLAY
 # backend is per-OS — freedesktop StatusNotifierItem (ksni/D-Bus) on Linux, the

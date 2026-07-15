@@ -7,8 +7,8 @@ pkgbase = pharos-streaming-bin
 	license = GPL-3.0-or-later
 	source = https://github.com/CursedNumber/pharos-streaming/releases/download/v0.1.0/pharos-0.1.0-linux-x86_64.tar.gz
 	source = https://github.com/CursedNumber/pharos-streaming/releases/download/v0.1.0/trireme-0.1.0-linux-x86_64.tar.gz
-	sha256sums = SKIP
-	sha256sums = SKIP
+	sha256sums = 80faa5d2c0cdd93838d5e7b4092b5c431e8e006947bbb9e24d32c2c71cc32119
+	sha256sums = 06e21c599f0fa41b8ffcdeaa2f36d3c47007f628ab6c49fd75b87850f23957c0
 
 pkgname = pharos-bin
 	pkgdesc = Pharos game-streaming host (headless Wayland compositor + NVENC, prebuilt)
@@ -22,7 +22,9 @@ pkgname = pharos-bin
 	depends = expat
 	depends = opus
 	depends = libpulse
+	depends = pipewire
 	optdepends = vulkan-driver: GPU-accelerated pharos-panel UI
+	optdepends = xdg-desktop-portal: desktop-mirror mode (issue #6) — also needs a portal backend for your desktop (e.g. xdg-desktop-portal-kde/-gnome/-wlr)
 	provides = pharos
 	conflicts = pharos
 

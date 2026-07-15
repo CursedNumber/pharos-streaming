@@ -414,7 +414,7 @@ class HevcDecoder(
             runCatching { codec.stop() }
             runCatching { codec.release() }
             // One key=value line per decoder instance ending — pairs with the
-            // 'HEVC decoder started' line so the lifecycle is greppable. The
+            // 'video decoder started' line so the lifecycle is greppable. The
             // StreamHub call site decides whether to spin a fresh decoder up;
             // this surfaces *how this one died* (clean vs codec error vs etc).
             val depth = queue.size

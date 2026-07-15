@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Pharos/Trireme authors
 
-//! `pharos-tray` — a three-state lighthouse system-tray daemon for the Pharos
+//! `pharos-tray` — a five-state lighthouse system-tray daemon for the Pharos
 //! host:
 //!
-//! - **Idle** — the host's control plane isn't reachable. Plain silhouette.
-//! - **Connected** — host is up but no client is pulling frames. Amber.
-//! - **Streaming** — at least one client is actively reading frames. Green.
+//! - **Offline** — the host isn't running. Grey, unlit.
+//! - **Idle** — host is up but no client is pulling frames. Green lantern, grey beams.
+//! - **Streaming** — at least one client is actively reading frames. Green beams.
+//! - **Degraded** — still serving, but the GPU is strained. Red beams.
+//! - **Faulted** — the host faulted or is restarting. Sticky red.
 //!
 //! Right-click → "Open Panel" (only when a `pharos-panel` binary is resolvable)
 //! and "Exit Pharos" (stops the host).
@@ -124,12 +126,12 @@ impl State {
     }
 }
 
-/// The host state, read from the shared control client's cached link — `Idle`
-/// when the control plane isn't reachable, `Faulted`/`Degraded` when the latest
-/// `HostStatus.gpu_health` says so, `Streaming` when it's streaming, else
-/// `Connected`. The client maintains the connection + ~1 Hz poll on its own
-/// thread (UDS on Linux, loopback TCP on Windows), so this is a cheap,
-/// non-blocking, cross-platform cache read.
+/// The host state, read from the shared control client's cached link — `Offline`
+/// when the control plane isn't reachable (or `Faulted` if a durable fault file
+/// is present), `Faulted`/`Degraded` when the latest `HostStatus.gpu_health` says
+/// so, `Streaming` when it's streaming, else `Idle`. The client maintains the
+/// connection + ~1 Hz poll on its own thread (UDS on Linux, loopback TCP on
+/// Windows), so this is a cheap, non-blocking, cross-platform cache read.
 fn detect_state() -> State {
     let h = control_ipc::client::handle();
     let connected = h.connected();

@@ -42,7 +42,8 @@ use windows::Win32::System::WinRT::Direct3D11::{
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 
 /// One captured frame: tightly-packed BGRA, `width * height * 4` bytes.
-// width/height feed the encoder's `-s WxH` once WGC is wired into the host loop.
+// The encoder is sized from `WgcCapturer::start`'s returned (w, h), not these
+// fields; only `bgra` is consumed downstream, so width/height stay unused.
 #[allow(dead_code)]
 pub struct Frame {
     pub width: u32,

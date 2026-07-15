@@ -11,9 +11,10 @@
 //!
 //! For the v1 demo, configure outputs to overlap at (0,0) and you'll get the
 //! same content streaming to N clients; configure them side-by-side and you'll
-//! get distinct regions per stream (windows need to be placed on each output —
-//! the M1 `XdgShellHandler` maps every new window at (0,0), so this is future
-//! work, not load-bearing for the open door).
+//! get distinct regions per stream (`XdgShellHandler::new_toplevel` places the
+//! Nth toplevel on the Nth output in extend layouts, mapping at each output's
+//! origin; only the cross-monitor window-drag remains future work, not
+//! load-bearing for the open door).
 //!
 //! ## Why a self-referential `Pipeline` (and why the transmute is sound)
 //!
@@ -306,8 +307,8 @@ struct Pipeline {
     file: Option<std::fs::File>,
 
     /// Pre-baked Pharos "no app running" idle screen, drawn ONLY when no window
-    /// is mapped (`win_count == 0`). `None` if it couldn't be built. Output-sized,
-    /// built once — zero cost while an app is on screen.
+    /// overlaps THIS output (per-output empty element list). `None` if it couldn't
+    /// be built. Output-sized, built once — zero cost while an app is on screen.
     idle: Option<crate::idle::IdleScreen>,
 
     /// Desktop-mirror (issue #6): whether this pipeline composites the usual
@@ -1202,14 +1203,14 @@ void main() {
 }
 "#;
 
+/// Lowest the network controller will throttle the average bitrate to (kbit/s).
+const NET_FLOOR_KBPS: u32 = 2000;
+
 /// W3b: resolve the opt-in encoder bitrate `(avg_kbps, max_kbps)`, or `None` when
 /// nothing is configured (leaves the NVENC preset's own heuristic RC untouched, so
 /// the working 1080p path doesn't regress). Precedence: `PHAROS_BITRATE_KBPS` env
 /// > [`MultiCfg::bitrate_kbps`]. The ceiling is `PHAROS_MAX_BITRATE_KBPS` >
 /// > [`MultiCfg::max_bitrate_kbps`] > the average (i.e. CBR when no ceiling is given).
-/// > Lowest the network controller will throttle the average bitrate to (kbit/s).
-const NET_FLOOR_KBPS: u32 = 2000;
-
 fn resolve_rc_bitrate(cfg: &MultiCfg) -> Option<(u32, u32)> {
     let env_u32 = |k: &str| {
         std::env::var(k)

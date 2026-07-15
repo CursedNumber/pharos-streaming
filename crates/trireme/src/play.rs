@@ -33,8 +33,10 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
-/// Default per-source resolution if the config doesn't specify one. The host
-/// renders fixed-size today; dynamic resolution (parse SPS) is a follow-up.
+/// Default per-source resolution if the config doesn't specify one. This is only
+/// a pre-geometry fallback: the reader re-sizes and respawns the decode chain
+/// from the host's `DG_STREAM_GEOMETRY` announce (the resolution ladder), so the
+/// host is not fixed-size.
 pub const DEFAULT_WIDTH: u32 = 1920;
 pub const DEFAULT_HEIGHT: u32 = 1080;
 
@@ -87,12 +89,12 @@ impl PaceMode {
 ///
 /// [[source]]
 /// name = "desktop"
-/// addr = "192.168.1.100:4433"
+/// addr = "192.168.1.100:15777"
 /// pace = "low-latency"
 ///
 /// [[source]]
 /// name = "console"
-/// addr = "192.168.1.101:4433"
+/// addr = "192.168.1.101:15777"
 /// pace = "vrr"
 /// width  = 1920
 /// height = 1080
@@ -111,7 +113,7 @@ pub struct PlayerCfg {
     pub input: crate::input::InputCfg,
     /// Border thickness, in pixels, drawn around the cell currently receiving
     /// input (the one the pointer is over) for clarity in a multi-cell grid.
-    /// `0` disables it. Default `2`.
+    /// `0` disables it. Default `0` (off).
     #[serde(default = "default_highlight_px")]
     pub highlight_px: u32,
     /// Colour of that border, as a hex code (`#RGB` or `#RRGGBB`, leading `#`

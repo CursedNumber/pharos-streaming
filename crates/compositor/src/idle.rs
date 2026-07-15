@@ -10,10 +10,11 @@
 //! on the empty desktop, nothing is running".
 //!
 //! Cost: the logo + text are rasterized + composited into ONE output-sized buffer
-//! ONCE at pipeline build (pure CPU, cached). The caller renders this ONLY when
-//! `win_count == 0`; while any app window is mapped the idle path is skipped
-//! entirely, so it adds nothing to the in-game render. The per-frame work when
-//! idle is just one textured quad at an animated alpha (no re-rasterization).
+//! ONCE at pipeline build (pure CPU, cached). The caller renders this only when
+//! no window overlaps that output (its per-output element list is empty); while
+//! any app window is mapped the idle path is skipped entirely, so it adds
+//! nothing to the in-game render. The per-frame work when idle is just one
+//! textured quad at an animated alpha (no re-rasterization).
 
 use anyhow::{Context, Result};
 use smithay::backend::allocator::Fourcc;

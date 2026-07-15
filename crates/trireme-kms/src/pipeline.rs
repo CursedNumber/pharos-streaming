@@ -219,10 +219,6 @@ fn spawn_reader(
         .expect("spawn nvdec-read thread")
 }
 
-/// Live play: a resident client. Holds the screen **black** while idle, streams
-/// at the connector's full refresh while Pharos is connected, and reconnects when
-/// a stream ends — so the output is never a stale decoded frame or the leftover
-/// console fb. Runs until killed.
 /// Where the client identity lives: `$TRIREME_KMS_IDENTITY`, else
 /// `~/.config/trireme-kms/identity.toml`, else a CWD-relative fallback.
 fn identity_path() -> std::path::PathBuf {
@@ -236,6 +232,10 @@ fn identity_path() -> std::path::PathBuf {
     PathBuf::from("trireme-kms-identity.toml")
 }
 
+/// Live play: a resident client. Holds the screen **black** while idle, streams
+/// at the connector's full refresh while Pharos is connected, and reconnects when
+/// a stream ends — so the output is never a stale decoded frame or the leftover
+/// console fb. Runs until killed.
 pub fn run(addr: SocketAddr, card_path: &str, pref: Option<ModePref>) -> Result<()> {
     let cfg = load_config();
     let pin = pin_from_cfg(&cfg);

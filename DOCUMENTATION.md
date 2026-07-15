@@ -172,12 +172,14 @@ USAGE: pharos-host <SUBCOMMAND> [ARGS...]
                                          6-digit PIN, writes peers.toml. addr default
                                          0.0.0.0:4432. (Rarely needed now: the host
                                          opens an always-on pairing listener itself.)
-  stream [bind] [output_idx] [fps] [qsv|nvenc|amf] [dda|wgc]
+  stream [bind] [output_idx] [fps] [qsv|nvenc|amf] [dda|wgc|wgc-zc]
                                          Start the QUIC video host. bind default
                                          0.0.0.0:15777; output_idx 0; fps 60; encoder
                                          auto (GPU-vendor detect); capture dda
                                          (default); use wgc to capture an IddCx
-                                         virtual display or across adapters.
+                                         virtual display or across adapters; wgc-zc
+                                         is the zero-copy WGC+NVENC path (in-process,
+                                         nvenc + HEVC only).
   wgc-test [monitor_idx] [frames] [out.bgra]
                                          Capture N frames via Windows.Graphics.Capture,
                                          dump the last as raw BGRA (validates WGC).
@@ -310,7 +312,7 @@ tracing `EnvFilter`) is honored by every binary.
 |---|---|---|
 | `PHAROS_BITRATE_KBPS` | unset | target average encoder bitrate (kbit/s); overrides config |
 | `PHAROS_MAX_BITRATE_KBPS` | unset (= avg → CBR) | bitrate ceiling (kbit/s); clamped ≥ average |
-| `PHAROS_STREAM_WINDOW_KB` | unset (adaptive) | pins ALL QUIC flow-control windows to a fixed size (KB) and disables the adaptive sizing. Unset, the windows auto-size: 8MB memory cap, and the client resizes its receive window each second to ~250ms of the measured video rate (512KB floor). Set on BOTH ends when pinning |
+| `PHAROS_STREAM_WINDOW_KB` | unset (adaptive) | pins ALL QUIC flow-control windows to a fixed size (KB) and disables the adaptive sizing. Unset, the windows auto-size: 8MB memory cap, and the client resizes its receive window each second to ~250ms of the measured video rate (64KB floor). Set on BOTH ends when pinning |
 | `PHAROS_QUEUE_FRAMES` | 8 | bounded video-frame channel depth (P-frames drop-newest) |
 | `PHAROS_AUDIO_QUEUE_PACKETS` | 8 | bounded audio-packet channel depth (drop-newest) |
 | `PHAROS_AUDIO_CAPTURE_MS` | 15 | `parec` fragment buffer (ms) for null-sink capture |
@@ -366,7 +368,7 @@ tracing `EnvFilter`) is honored by every binary.
 **Trireme client**
 | var | default | effect |
 |---|---|---|
-| `TRIREME_CODEC` | negotiated | decode codec override (`hevc` / `av1`) |
+| `TRIREME_CODEC` | negotiated | decode codec override (`hevc` / `av1` / `avc`/`h264` / `vvc`/`h266`) |
 | `TRIREME_DECODER` | auto | force a specific ffmpeg decoder/hwaccel |
 | `TRIREME_AV1_FORMAT` | `obu` | AV1 ffmpeg input format (`obu`/`av1`) |
 | `TRIREME_HDR` | unset (SDR) | insert an HDR10→SDR tonemap filter (set only for HDR streams) |
@@ -427,6 +429,7 @@ the codec across a panel relaunch.
 | `frames` | u32 | 0 | frame budget (0 = until killed) |
 | `video_codec` | `hevc`\|`av1`\|`h264`\|`vvc` | `hevc` | codec for every output (AV1 needs Ada+; `h264`/`avc` = universal-compatibility fallback; `vvc`/`h266` = experimental SOFTWARE encode via ffmpeg libvvenc — needs ffmpeg ≥ 7.1 with `--enable-libvvenc`, CPU-heavy) |
 | `bitrate_kbps` | u32 | none | target average bitrate (else preset RC) |
+| `client_max_bitrate_kbps` | u32 | none (500 Mbps sanity cap) | ceiling for client-requested bitrate caps (env `PHAROS_CLIENT_MAX_BITRATE_KBPS`) |
 | `max_bitrate_kbps` | u32 | none (=avg→CBR) | capped-VBR ceiling |
 | `launch` | string | none | client launched into the shared socket |
 | `mode` | string | none | round-trip tag: `mirror`/`extend`/`single` |

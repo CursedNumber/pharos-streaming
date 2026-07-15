@@ -97,7 +97,7 @@ fn run_send(dst: &str, dev_path: Option<&str>) -> Result<()> {
 }
 
 /// Open the requested device, or auto-pick the first gamepad (has BTN_SOUTH and
-/// an X axis, or a name containing "xbox"/"controller"/"gamepad").
+/// an X axis, or a name containing "xbox"/"controller"/"gamepad"/"pad").
 fn open_gamepad(path: Option<&str>) -> Result<Device> {
     if let Some(p) = path {
         return Device::open(p).with_context(|| format!("open {p}"));

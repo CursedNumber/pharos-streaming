@@ -3,13 +3,15 @@
 
 //! `trireme` — the Linux reference client for the Pharos stream.
 //!
-//! Milestone 1 (this file): prove the Linux **decode backend**. Connect to the
-//! Pharos QUIC streamer, receive the HEVC access units over the shared Rust
-//! `transport`, and decode them with ffmpeg using the best HW decoder for the
-//! box (probed at runtime by `media_decode` — NVDEC `hevc_cuvid` on the dev rig,
-//! Quick Sync / Rockchip MPP / V4L2 stateless elsewhere), saving periodic PNG
-//! snapshots so the decode is verifiable end to end. Windowed low-latency
-//! playback (winit + GPU present) and VRR build on top of this.
+//! This file is the client CLI entry point: it dispatches the `menu`, `servers`,
+//! `pair`, `decode`, `play`, `usb-list`, and `wake` subcommands. Each streaming
+//! path connects to the Pharos QUIC streamer, receives the encoded access units
+//! over the shared Rust `transport`, and decodes them with ffmpeg using the best
+//! HW decoder for the box (probed at runtime by `media_decode`: NVDEC
+//! `hevc_cuvid` on the dev rig, Quick Sync / Rockchip MPP / V4L2 stateless
+//! elsewhere). Windowed low-latency playback (winit + GPU present) and VRR are
+//! shipped via `play`; the `decode` subcommand saves periodic PNG snapshots so
+//! the decode stays verifiable end to end.
 
 use std::io::Write;
 use std::net::SocketAddr;

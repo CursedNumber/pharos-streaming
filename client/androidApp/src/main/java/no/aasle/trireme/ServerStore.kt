@@ -12,8 +12,9 @@ import org.json.JSONException
  * uses this instead of a TOML file; the storage format is JSON keyed by
  * `SERVERS_KEY` so a future migration to DataStore or Room is mechanical.
  *
- * Thread-safety: all SharedPreferences mutations go through commit() so
- * subsequent reads see the new state. Callers from the UI thread should
+ * Thread-safety: all SharedPreferences mutations go through apply(), which
+ * updates the in-memory state synchronously (so subsequent reads see the new
+ * state) and flushes to disk asynchronously. Callers from the UI thread should
  * still wrap heavy reads in a coroutine.
  */
 class ServerStore(context: Context) {

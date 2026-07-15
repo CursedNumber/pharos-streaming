@@ -970,12 +970,6 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     // Refresh / VRR configuration (needs a Window, so it lives in the shell)
     // ============================================================
 
-    /// Enumerate every display mode, request the best one for our content, and
-    /// report whether the panel can actually vary its refresh. This is what makes
-    /// VRR "capable": on a multi-mode display (120Hz phone, gaming monitor, real
-    /// VRR panel) it selects the high-refresh mode and lets the source cadence
-    /// drive it; on a single-mode panel (this Bravia) it says so plainly. The
-    /// resulting [DisplayCaps] are handed to StreamHub for the decoder.
     /** Lock the activity to the saved orientation (Settings → Orientation). Default
      *  "auto" keeps the manifest's fullUser behaviour (follow the device); the two
      *  explicit choices pin a landscape so the user can flip the phone to suit their
@@ -991,6 +985,12 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         }
     }
 
+    /// Enumerate every display mode, request the best one for our content, and
+    /// report whether the panel can actually vary its refresh. This is what makes
+    /// VRR "capable": on a multi-mode display (120Hz phone, gaming monitor, real
+    /// VRR panel) it selects the high-refresh mode and lets the source cadence
+    /// drive it; on a single-mode panel (this Bravia) it says so plainly. The
+    /// resulting [DisplayCaps] are handed to StreamHub for the decoder.
     private fun configureRefresh(): DisplayCaps {
         @Suppress("DEPRECATION")
         val disp: Display? =

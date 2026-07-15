@@ -3,10 +3,10 @@
 
 //! QUIC transport (quinn) for Pharos → Trireme.
 //!
-//! #2 step 1: prove the encoded HEVC bitstream round-trips over QUIC. The host
-//! streams NAL units over a unidirectional stream; the client reassembles them.
-//! Host↔compositor wiring (an mpsc of encoded frames) and the Android client
-//! follow.
+//! The host streams encoded video access units (codec-selectable
+//! HEVC/AV1/AVC/VVC) over a unidirectional QUIC stream; the client reassembles
+//! them. The host↔compositor wiring (an mpsc of encoded frames) and the Android
+//! UniFFI client are both in place.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1924,8 +1924,9 @@ fn tagged_datagram(tag: u8, payload: &[u8]) -> bytes::Bytes {
 }
 
 /// Run the mutual-auth handshake on a freshly-accepted connection, bounded by a
-/// 5s timeout. Returns the client's verified pubkey (`None` = anonymous) and its
-/// `wants_gyro` flag, or `Err` on any failure (the caller closes the connection
+/// 5s timeout. Returns the client's verified pubkey (`None` = anonymous), its
+/// `wants_gyro` and `wants_hdr` flags, and the requested `StreamMode`, or `Err`
+/// on any failure (the caller closes the connection
 /// and moves on). Shared verbatim by the single-client accept path and the
 /// mirror keep-N path so the wire handshake is byte-identical in both — see the
 /// inline doc at the original single-client call site for the v1/v2 wire detail.
@@ -3912,7 +3913,7 @@ pub fn fetch_stream(server_addr: SocketAddr, max: usize) -> Result<Vec<u8>> {
 }
 
 /// Connect to a Pharos QUIC streamer and deliver each access unit (a complete
-/// HEVC NAL group) to `on_frame` as it arrives, until the host finishes.
+/// encoded frame) to `on_frame` as it arrives, until the host finishes.
 /// Blocking. The Trireme client calls this (via UniFFI) to feed MediaCodec.
 ///
 /// `expected_pubkey` — Some(host_pub) pins to a previously paired key;

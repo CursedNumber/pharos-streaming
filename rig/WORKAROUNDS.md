@@ -158,9 +158,10 @@ without dropping to a terminal. Lives in the workspace as
   picks up the registration the moment `tray.spawn()` returns. The well-known
   bus name is `org.kde.StatusNotifierItem-<pid>-<n>`; the stable id is
   `pharos-tray` so Plasma remembers panel placement across restarts.
-- Icons are embedded in the binary (`include_bytes!` over the three SVGs in
-  `rig/icons/pharos-tray-{idle,connected,streaming}.svg`), rasterized at
-  startup via `usvg`+`resvg`+`tiny-skia` to ARGB32 pixmaps at 22 and 44 px.
+- Icons come from the shared `pharos-assets` crate (`include_bytes!` over the
+  five SVGs in `rig/icons/pharos-tray-{offline,idle,streaming,degraded,faulted}.svg`,
+  exposed as `pharos_assets::PHAROS_*` and selected by `State::svg()`), rasterized
+  at startup via `usvg`+`resvg`+`tiny-skia` to ARGB32 pixmaps at 22 and 44 px.
   Nothing lands in `~/.local/share/icons/hicolor/...`.
 - Started by `rig/launch-host.sh` as the transient user unit
   `pharos-tray.service` with `Restart=on-failure`. Clicking the "Exit"
@@ -169,14 +170,21 @@ without dropping to a terminal. Lives in the workspace as
   process exits cleanly (so its own service goes inactive without
   triggering the restart-on-failure policy).
 
-**State detection (every 2 s in a background tokio task):**
-1. `systemctl --user is-active --quiet pharos-host.service` → if not active,
-   icon is *idle* (dark).
-2. Else: connect to the control-ipc Unix socket
-   (`control_ipc::socket_path()` → `$XDG_RUNTIME_DIR/pharos/control.sock`),
-   send `Request::Hello { version: PROTOCOL_VERSION }` + `Request::GetStatus`,
-   read `Event::Status(HostStatus { streaming, .. })`. Streaming → green;
-   anything else (connect fail, no Status, streaming=false) → amber.
+**State detection (reads the shared `control_ipc::client` cached link):**
+The connection to the control-ipc socket
+(`control_ipc::socket_path()` → `$XDG_RUNTIME_DIR/pharos/control.sock`) and the
+~1 Hz `GetStatus` poll live in the shared `control_ipc::client` thread, not the
+tray. The tray just reads that client's cached link + latest `HostStatus` and
+maps it (`State::from_status`) to one of five icons:
+1. control plane unreachable → *Offline* (or *Faulted* if a durable fault file
+   is present).
+2. `HostStatus.gpu_health` is `Faulted`/`Degraded` → *Faulted*/*Degraded*.
+3. healthy and `streaming` → *Streaming*.
+4. healthy otherwise (host up, no client pulling frames) → *Idle*.
+
+There is no *amber* state and no `systemctl is-active` gate any more — a host
+that isn't running simply reads as *Offline*. (`systemctl` now appears only in
+the "Exit" menu action above.)
 
 **Caveats:**
 - Linux-only — SNI is freedesktop session-bus. On non-KDE/Wayland desktops

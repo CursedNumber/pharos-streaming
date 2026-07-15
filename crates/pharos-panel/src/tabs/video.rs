@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Pharos/Trireme authors
 
-//! Video tab — the encode → codec → decode → audio path matrix.
+//! Video tab — the encode → codec → decode path matrix.
 //!
 //! Modelled on the Sunshine/Moonlight "supported codecs" flowchart: three
-//! left-to-right columns (HOST ENCODE → CODEC → CLIENT DECODE) plus a
-//! small AUDIO strip and a 1..6 performance legend. Every option box shows its
+//! left-to-right columns (HOST ENCODE → CODEC → CLIENT DECODE) and a 1..6
+//! performance legend. Every option box shows its
 //! vendor, codec and a coloured performance chip; only the options that are
 //! actually *available on this box right now* are shown prominently, with the
 //! unavailable ones tucked behind a "show unavailable" toggle (off by default).
@@ -1603,14 +1603,15 @@ fn option_box(
 }
 
 // ---------------------------------------------------------------------------
-// Center codec column — selectable HEVC / AV1 / H.264 cards.
+// Center codec column — selectable HEVC / AV1 / AVC / VVC cards.
 // (Transport is always QUIC, so this column is about the codec on the wire.)
 // ---------------------------------------------------------------------------
 
-/// Render the three codec cards. HEVC + AV1 are clickable and drive a host codec
-/// switch; H.264 is display-only. The active codec (from `HostStatus`) gets the
-/// full highlight, a pending click glows. Returns the active card's screen Rect
-/// so the caller can draw the connector arrows.
+/// Render the four codec cards (HEVC / AV1 / AVC / VVC). All four are clickable
+/// and drive a host codec switch (the host preflights and may refuse VVC). The
+/// active codec (from `HostStatus`) gets the full highlight; a pending click
+/// glows. Returns the active card's screen Rect so the caller can draw the
+/// connector arrows.
 fn codec_cards(
     ui: &mut egui::Ui,
     active_key: Option<&str>,
@@ -1760,10 +1761,6 @@ fn codec_cards(
     }
     active_rect
 }
-
-// ---------------------------------------------------------------------------
-// Opus AUDIO strip
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Footer note

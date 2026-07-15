@@ -8,8 +8,9 @@
 //!
 //! This slice provides the codec + Linux capture. Transport (an audio stream
 //! alongside video) and client playback are the next slice. Android decodes
-//! Opus via `MediaCodec`, so the libopus binding here is Linux-gated for now;
-//! the Windows host's Opus path lands with M3.
+//! Opus via `MediaCodec`, so the libopus binding here is host/desktop-side:
+//! it's compiled for both Linux and Windows, and the Windows host's WASAPI
+//! Opus capture path is already in place.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioBackend {
