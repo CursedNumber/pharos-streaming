@@ -75,6 +75,13 @@ pub struct HostInput {
     /// per-app default. Reliable, decoupled from xdg-shell window lifecycle,
     /// and self-contained (no extra threads).
     pub running_apps: HashMap<String, Child>,
+    /// Children DISPLACED from `running_apps` by a re-launch under the same slug.
+    /// Dropping a `Child` does NOT reap the process, so a displaced handle would
+    /// leave a ZOMBIE on exit — which latched `steam_session_active` and
+    /// suppressed the game-redirect marker (see `lesson-zombie-pid-latches-state`,
+    /// `pid_alive`). We keep the handle here and `try_wait()` it every frame
+    /// alongside `running_apps` until it exits, so the process is always reaped.
+    orphaned_children: Vec<(String, Child)>,
 }
 
 impl HostInput {
@@ -93,6 +100,7 @@ impl HostInput {
             slot_ids: HashMap::new(),
             active_app_gyro_mode: GyroMode::default(),
             running_apps: HashMap::new(),
+            orphaned_children: Vec::new(),
         }
     }
 
@@ -102,10 +110,14 @@ impl HostInput {
     /// — `Ok(None)` (the built-in `desktop` slug's empty command) has no child
     /// to track. If a process is *already* tracked under the same slug (rare:
     /// a re-launch while the previous instance is still alive) the previous
-    /// handle is dropped, which **does not** kill the old process — it just
-    /// means we stop tracking it for the gyro-reset side effect.
+    /// handle is NOT dropped — dropping a `Child` doesn't wait on it, so the old
+    /// process would zombie on exit (which latched `steam_session_active` and
+    /// wedged the game-redirect for a gamescope session). We keep the displaced
+    /// handle in `orphaned_children` so `reap_exited_apps` still reaps it.
     pub fn track_app_child(&mut self, slug: String, child: Child) {
-        self.running_apps.insert(slug, child);
+        if let Some(old) = self.running_apps.insert(slug.clone(), child) {
+            self.orphaned_children.push((slug, old));
+        }
     }
 
     /// Per-frame: poll every tracked launched-app child non-blockingly. On
@@ -130,6 +142,17 @@ impl HostInput {
                     exited = true;
                     false
                 }
+                Ok(None) => true,
+            });
+        // Reap displaced (re-launched-over) children too, so none zombies. These
+        // don't drive the gyro-reset side effect — they're already superseded.
+        self.orphaned_children
+            .retain_mut(|(slug, child)| match child.try_wait() {
+                Ok(Some(status)) => {
+                    info!("displaced app '{slug}' reaped (status {status})");
+                    false
+                }
+                Err(_) => false,
                 Ok(None) => true,
             });
         if exited && self.running_apps.is_empty() {
