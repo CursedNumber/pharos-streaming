@@ -30,6 +30,7 @@ members = [
     "crates/transport",
     "crates/trireme",
     "crates/trireme-kms",
+    "crates/trireme-xbox-ffi",
     "crates/usbip-export",
     "crates/hostd",
 ]
