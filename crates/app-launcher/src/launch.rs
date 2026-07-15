@@ -1327,13 +1327,32 @@ fn live_registered_pid(slug: &str) -> Option<u32> {
 fn pid_alive(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
-        std::path::Path::new(&format!("/proc/{pid}")).exists()
+        // A ZOMBIE (defunct, state 'Z') process still has a /proc/<pid> entry, so a
+        // bare `.exists()` reported it "alive". That latched `steam_session_active`
+        // on a gamescope that had EXITED but whose Child was never reaped —
+        // permanently suppressing the game-redirect marker so every game silently
+        // fell through to the real desktop instead of the stream. Read the process
+        // state and count a zombie/dead process as gone. Unparseable-but-present is
+        // conservatively treated as alive (don't falsely reap a real process).
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat_state_char(&stat).is_none_or(|c| c != 'Z' && c != 'X' && c != 'x'),
+            Err(_) => false,
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = pid;
         false
     }
+}
+
+/// The process state char (field 3 of `/proc/<pid>/stat`): the first token after
+/// the `(comm)` field. `comm` can itself contain spaces AND parens, so anchor on
+/// the LAST `')'` (same trick as [`proc_starttime`]). `None` if malformed.
+/// `'Z'` = zombie, `'X'`/`'x'` = dead; `'R'`/`'S'`/`'D'`/`'T'` are live.
+fn stat_state_char(stat: &str) -> Option<char> {
+    let rparen = stat.rfind(')')?;
+    stat[rparen + 1..].split_whitespace().next()?.chars().next()
 }
 
 // ── Running-state + End-process (the Trireme app-selector feature) ──────────
@@ -1691,6 +1710,41 @@ pub fn tokenize(line: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::config::{AppKind, LaunchKind, LaunchTarget};
+
+    #[test]
+    fn stat_state_char_parses_zombie_and_tricky_comm() {
+        // Normal running process.
+        assert_eq!(stat_state_char("1234 (gamescope) R 1 1234 ..."), Some('R'));
+        // Sleeping.
+        assert_eq!(stat_state_char("42 (bash) S 1 42 ..."), Some('S'));
+        // ZOMBIE — the case that latched steam_session_active (must read as dead).
+        assert_eq!(stat_state_char("999 (gamescope) Z 1 999 ..."), Some('Z'));
+        // comm containing spaces AND parens must not fool the parser: anchor on the
+        // LAST ')'. State is still the first token after it.
+        assert_eq!(
+            stat_state_char("7 (weird )(name) Z 1 7 ..."),
+            Some('Z'),
+            "comm with embedded parens/spaces"
+        );
+        // Malformed → None (pid_alive then conservatively treats present-as-alive).
+        assert_eq!(stat_state_char("garbage-no-paren"), None);
+    }
+
+    #[test]
+    fn zombie_state_reads_as_not_alive() {
+        // The exact predicate pid_alive applies to the parsed state: a zombie/dead
+        // process is NOT alive; R/S/D/T are.
+        let alive =
+            |stat: &str| stat_state_char(stat).is_none_or(|c| c != 'Z' && c != 'X' && c != 'x');
+        assert!(!alive("1 (g) Z 0 ..."), "zombie is not alive");
+        assert!(!alive("1 (g) X 0 ..."), "dead is not alive");
+        assert!(alive("1 (g) R 0 ..."));
+        assert!(alive("1 (g) S 0 ..."));
+        assert!(
+            alive("no-parens-conservatively-alive"),
+            "unparseable present ⇒ alive"
+        );
+    }
 
     #[test]
     fn tokenize_respects_quotes() {
