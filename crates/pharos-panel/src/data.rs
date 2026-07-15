@@ -929,6 +929,7 @@ type EncoderRow = (
 pub fn encode_capabilities() -> Vec<CapabilityUi> {
     let listed = ffmpeg_encoder_set();
     let has = |tok: &str| listed.iter().any(|w| w == tok);
+    let gpus = gpu_vendors_present();
 
     // (id, label, vendor, token, codec, validated, validated_on, perf_rank)
     let rows: &[EncoderRow] = &[
@@ -1060,16 +1061,21 @@ pub fn encode_capabilities() -> Vec<CapabilityUi> {
         .map(|(id, label, vendor, token, codec, validated, on, rank)| {
             // Software encoders are "available" if their library OR a built-in
             // fallback is present; in practice one always is for HEVC.
+            // Hardware encoders need BOTH the ffmpeg encoder AND the vendor's GPU
+            // present (a distro ffmpeg lists qsv/amf even with no Intel/AMD GPU).
+            let hw_missing_gpu = has(token) && !gpus.has_vendor(vendor);
             let available = match *id {
                 "software" => has("libx265") || has("hevc"),
                 "software-av1" => has("libsvtav1") || has("libaom-av1") || has("av1"),
                 "software-h264" => has("libx264") || has("h264"),
                 // No built-in fallback exists for VVC — libvvenc or nothing.
                 "software-vvc" => has("libvvenc"),
-                _ => has(token),
+                _ => has(token) && gpus.has_vendor(vendor),
             };
             let detail = if available {
                 format!("listed by ffmpeg (-encoders): {token}")
+            } else if hw_missing_gpu {
+                format!("built into ffmpeg ({token}) but no {vendor} GPU present")
             } else {
                 format!("not built into this ffmpeg ({token})")
             };
@@ -1089,6 +1095,68 @@ pub fn encode_capabilities() -> Vec<CapabilityUi> {
             }
         })
         .collect()
+}
+
+/// GPU vendors with a render-capable device present on THIS machine. Used to gate
+/// hardware-encoder availability: `ffmpeg -encoders` lists every encoder ffmpeg
+/// was BUILT with (a distro ffmpeg advertises `hevc_qsv` and `hevc_amf` even on a
+/// box with no Intel/AMD GPU), which is a BUILD capability, not a hardware one. So
+/// a hardware encoder is "available" only if ffmpeg lists it AND its vendor's GPU
+/// is actually present.
+#[derive(Clone, Copy, Default)]
+struct GpuVendors {
+    nvidia: bool,
+    intel: bool,
+    amd: bool,
+}
+
+impl GpuVendors {
+    /// True if the given row vendor's silicon is present (non-GPU vendors —
+    /// software / Fraunhofer — are always "present": they need no device).
+    fn has_vendor(&self, vendor: &str) -> bool {
+        match vendor {
+            "NVIDIA" => self.nvidia,
+            "Intel" => self.intel,
+            "AMD" => self.amd,
+            _ => true,
+        }
+    }
+}
+
+/// Detect present GPU vendors by PCI vendor id under `/sys/class/drm/renderD*`
+/// (render nodes = GPUs that can actually encode; `card*` would double-count and
+/// include non-render outputs). Linux-only; other platforms return all-true so the
+/// pure ffmpeg-list gate is unchanged there (no cheap portable probe, and we must
+/// not regress the Windows host's detection).
+fn gpu_vendors_present() -> GpuVendors {
+    #[cfg(target_os = "linux")]
+    {
+        let mut v = GpuVendors::default();
+        if let Ok(rd) = std::fs::read_dir("/sys/class/drm") {
+            for e in rd.flatten() {
+                if !e.file_name().to_string_lossy().starts_with("renderD") {
+                    continue;
+                }
+                if let Ok(s) = std::fs::read_to_string(e.path().join("device/vendor")) {
+                    match s.trim().to_ascii_lowercase().as_str() {
+                        "0x10de" => v.nvidia = true,
+                        "0x8086" => v.intel = true,
+                        "0x1002" => v.amd = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        v
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        GpuVendors {
+            nvidia: true,
+            intel: true,
+            amd: true,
+        }
+    }
 }
 
 /// Run `ffmpeg -hide_banner -encoders` and collect its stdout words. Reuses
@@ -1194,6 +1262,39 @@ mod tests {
 
     fn table(s: &str) -> toml::Table {
         toml::from_str(s).expect("valid toml")
+    }
+
+    #[test]
+    fn gpu_vendor_gate_maps_vendors() {
+        let only_nvidia = GpuVendors {
+            nvidia: true,
+            intel: false,
+            amd: false,
+        };
+        assert!(only_nvidia.has_vendor("NVIDIA"));
+        assert!(
+            !only_nvidia.has_vendor("Intel"),
+            "no iGPU ⇒ QSV unavailable"
+        );
+        assert!(!only_nvidia.has_vendor("AMD"));
+        // Non-GPU vendors need no device and are always present.
+        assert!(only_nvidia.has_vendor("Fraunhofer"));
+        assert!(only_nvidia.has_vendor(""));
+    }
+
+    #[test]
+    fn hardware_encoders_require_their_gpu() {
+        // With ffmpeg listing qsv/amf/nvenc but only an NVIDIA GPU present, only
+        // NVENC (+ software) is available; QSV/AMF are gated off.
+        let caps = encode_capabilities();
+        let avail = |id: &str| caps.iter().find(|c| c.id == id).map(|c| c.available);
+        // This dev box has an NVIDIA render node and no Intel/AMD GPU.
+        if gpu_vendors_present().nvidia && !gpu_vendors_present().intel {
+            assert_eq!(avail("qsv"), Some(false), "no Intel GPU ⇒ QSV off");
+        }
+        if !gpu_vendors_present().amd {
+            assert_eq!(avail("amf"), Some(false), "no AMD GPU ⇒ AMF off");
+        }
     }
 
     #[test]
