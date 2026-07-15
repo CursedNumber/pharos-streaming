@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Phase-1 gate harness manifest (loose-file layout; deployed with
+  `Add-AppxPackage -Register`, unsigned, Developer Mode required).
+
+  The three network capabilities are the whole point of this file existing:
+  UWP silently blackholes sockets without them (the AppContainer analogue of a
+  missing `ufw allow 15777/udp`). Keep all three in the real shell's manifest.
+-->
+<Package
+    xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+    xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10">
+
+  <Identity Name="TriremePhase1"
+            Publisher="CN=TriremeDev"
+            Version="0.1.0.0"
+            ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>Trireme Phase1</DisplayName>
+    <PublisherDisplayName>TriremeDev</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Universal"
+                        MinVersion="10.0.17763.0"
+                        MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="App" Executable="TriremePhase1.exe" EntryPoint="TriremePhase1.App">
+      <uap:VisualElements
+          DisplayName="Trireme Phase1"
+          Description="QUIC-in-AppContainer gate harness (pair + stream, no decode)"
+          BackgroundColor="#1B2A41"
+          Square150x150Logo="Assets\Square150x150Logo.png"
+          Square44x44Logo="Assets\Square44x44Logo.png" />
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <!-- LAN peers (the Pharos host on the local network). -->
+    <Capability Name="privateNetworkClientServer" />
+    <!-- WAN failover (pharos.example.com) + anything routed (the VM's NAT). -->
+    <Capability Name="internetClient" />
+    <Capability Name="internetClientServer" />
+  </Capabilities>
+</Package>

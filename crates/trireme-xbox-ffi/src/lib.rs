@@ -177,6 +177,13 @@ fn pair_error_code(e: &PairError) -> c_int {
 /// Connect to a Pharos streamer and deliver access units to the callbacks.
 /// Returns a handle (null on bad UTF-8 in `addr`). `pubkey_hex` null/empty =
 /// TOFU; `identity_path` null = anonymous. Pass `on_audio` null to drop audio.
+///
+/// `on_audio` is spelled as an inline `Option<extern "C" fn>` rather than
+/// `Option<AudioCallback>`: cbindgen can't see through an Option-of-alias (it
+/// emits an opaque by-value `Option_AudioCallback` struct and drops the
+/// `AudioCallback` typedef, which doesn't compile), while the inline form
+/// renders as the intended nullable C function pointer. ABI-identical either
+/// way (guaranteed niche optimization for `Option<fn>`).
 #[no_mangle]
 pub unsafe extern "C" fn trireme_start(
     addr: *const c_char,
@@ -190,7 +197,7 @@ pub unsafe extern "C" fn trireme_start(
     on_end: EndCallback,
     on_link_health: LinkHealthCallback,
     audio_ctx: *mut c_void,
-    on_audio: Option<AudioCallback>,
+    on_audio: Option<extern "C" fn(ctx: *mut c_void, data: *const u8, len: usize)>,
 ) -> *mut TriremeStream {
     let addr = cstr_req(addr);
     if addr.is_empty() {
