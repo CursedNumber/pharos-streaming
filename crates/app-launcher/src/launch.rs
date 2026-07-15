@@ -1278,6 +1278,7 @@ fn register_pid(slug: &str, pid: u32) {
 /// Companion processes a launch spawned ALONGSIDE the app (today: the per-app
 /// rootful Xwayland), keyed by slug. Not the app's own tree — [`end_app`] adds
 /// live companions to its kill roots and drops the slot either way.
+#[cfg(target_os = "linux")]
 fn companion_registry() -> &'static Mutex<HashMap<String, Vec<u32>>> {
     static COMPANIONS: OnceLock<Mutex<HashMap<String, Vec<u32>>>> = OnceLock::new();
     COMPANIONS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -1350,6 +1351,7 @@ fn pid_alive(pid: u32) -> bool {
 /// the `(comm)` field. `comm` can itself contain spaces AND parens, so anchor on
 /// the LAST `')'` (same trick as [`proc_starttime`]). `None` if malformed.
 /// `'Z'` = zombie, `'X'`/`'x'` = dead; `'R'`/`'S'`/`'D'`/`'T'` are live.
+#[cfg(any(target_os = "linux", test))]
 fn stat_state_char(stat: &str) -> Option<char> {
     let rparen = stat.rfind(')')?;
     stat[rparen + 1..].split_whitespace().next()?.chars().next()
