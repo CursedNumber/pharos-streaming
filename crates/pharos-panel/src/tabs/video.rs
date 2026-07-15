@@ -339,13 +339,17 @@ fn pace_control(ui: &mut egui::Ui) {
     });
 }
 
-/// Resolution ladder (Phase 2) control: a TARGET coded-height selector and a MIN
-/// (floor) selector, sent to the host over control-ipc (`Request::SetResolution`
-/// / `Request::SetResolutionFloor`) with no relaunch. `Auto` (0) target streams
-/// native; the host preserves each output's aspect ratio and may drop BELOW the
-/// target under sustained link pressure — but never below the Min. The "now W×H"
-/// readout is the host's reported coded size; a "↓ link" note shows when the
-/// ladder has auto-dropped below the target.
+/// Resolution ladder (Phase 2) control: a TARGET coded-height selector, sent to
+/// the host over control-ipc (`Request::SetResolution`) with no relaunch. `Auto`
+/// (0) target streams native; the host preserves each output's aspect ratio and
+/// may drop BELOW the target under sustained link pressure — but never below the
+/// Min. The "now W×H" readout is the host's reported coded size; a "↓ link" note
+/// shows when the ladder has auto-dropped below the target.
+///
+/// The MIN (floor) is READ-ONLY here: the connected client owns the [min, target]
+/// range and re-asserts it continuously (a panel edit would be stomped on its next
+/// send), so we mirror the client's live floor and point the user at the app. See
+/// `crates/compositor/src/multi.rs` (DG_CLIENT_RESPREF apply loop).
 fn resolution_control(ui: &mut egui::Ui) {
     const CEIL_RUNGS: &[(u32, &str)] = &[
         (0, "Auto"),
@@ -353,13 +357,6 @@ fn resolution_control(ui: &mut egui::Ui) {
         (1080, "1080p"),
         (720, "720p"),
         (540, "540p"),
-    ];
-    const FLOOR_RUNGS: &[(u32, &str)] = &[
-        (0, "None"),
-        (1080, "1080p"),
-        (720, "720p"),
-        (540, "540p"),
-        (360, "360p"),
     ];
     let (coded, ceiling_live, floor_live) = active_coded();
     ui.horizontal(|ui| {
@@ -384,10 +381,17 @@ fn resolution_control(ui: &mut egui::Ui) {
         }
     });
     ui.horizontal(|ui| {
-        if let Some(sel) = ladder_combo(ui, "video_res_floor", "Min", FLOOR_RUNGS, floor_live) {
-            crate::control::handle().send_request(Request::SetResolutionFloor { height: sel });
-        }
-        ui.label(RichText::new("· never auto-drops below this").weak());
+        ui.label(RichText::new("Min").strong());
+        let floor_txt = if floor_live == 0 {
+            "None".to_string()
+        } else {
+            format!("{floor_live}p")
+        };
+        // Read-only: the connected client owns this. Muted so it doesn't read as
+        // an editable control.
+        ui.label(RichText::new(floor_txt).weak())
+            .on_hover_text("the connected client owns the min/target range");
+        ui.label(RichText::new("· set in the Trireme app").weak());
     });
 }
 
