@@ -64,3 +64,39 @@ sendkeys — the guest layout is assumed en-US.
 
 Guest credentials: `dev` / `trireme-dev` (RDP on 127.0.0.1:3389, noVNC on
 127.0.0.1:8006 — view only).
+
+## Deploy + stream-test on a REAL console (Dev Mode)
+
+Validated 2026-07-16: a physical Series X paired via SPAKE2 and streamed HEVC
+1080p60 from Pharos. Flow:
+
+1. In the VM: `build-phase1.ps1` (produces `C:\xbox\AppX`), then
+   `package-console.ps1` → a signed `TriremePhase1.appx` + `TriremeDev.cer`
+   staged on the share.
+2. On the host, deploy over the Device Portal (password prompted, never stored):
+   ```sh
+   WDP_ADDR=<console-ip>:11443 WDP_USER=<portal-user> \
+     ./deploy-console.sh /path/to/TriremePhase1.appx /path/to/TriremeDev.cer
+   ```
+3. Set the app to **App mode** in Dev Home (headless harness; Game mode's
+   frame-timeout hangs it). Grab a fresh pairing PIN (panel Pair, or
+   forget-device + pair — the PIN rotates and there's no re-pair button), then:
+   ```sh
+   WDP_ADDR=<console-ip>:11443 WDP_USER=<portal-user> PHAROS_HOST=<host-ip> \
+     ./stream-test-console.sh <PIN>
+   ```
+   Ends in `phase1.log` with `PHASE1 VERDICT: PASS/FAIL`.
+
+Three gotchas that cost real time (all encoded in the scripts):
+
+- **Static CRT.** A `/MD` build runs in the VM (the AppContainer borrows the
+  desktop CRT from System32) but fails activation on the locked-down console
+  with `0x8027025B`. Build with `+crt-static` (Rust) + `/MT` (cl) — now the
+  default in `build-phase1.ps1`.
+- **`Content-Length: 0`.** The `POST /api/taskmanager/app` launch has no body;
+  HTTP.sys rejects it with a hardcoded 411 page before the portal sees it.
+- **`path=%5CLocalState`.** WDP's `knownfolderid=LocalAppData&packagefullname=`
+  roots at the package dir and concatenates `path` with no separator, so the
+  LocalState subfolder needs a leading backslash (`%5C`); `path=` empty = the
+  package root. The app's `LocalState` only exists after first launch, so the
+  scripts pre-launch (with config cleared, to avoid pairing on a stale PIN).

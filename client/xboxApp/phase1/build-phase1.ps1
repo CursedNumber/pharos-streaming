@@ -29,6 +29,11 @@ Write-Host "==> MSVC: $(& cl.exe 2>&1 | Select-Object -First 1)"
 $cargo = Join-Path $env:USERPROFILE ".cargo\bin\cargo.exe"
 if (-not (Test-Path $cargo)) { throw "cargo not found at $cargo (rustup nightly + rust-src required)" }
 Set-Location $RepoRoot
+# Static CRT so the exe is self-contained. The loose /MD build ran in the VM
+# (the AppContainer borrowed the desktop CRT from System32), but failed to
+# activate on the locked-down console (0x8027025B, no loadable VC runtime).
+# +crt-static here, paired with /MT on the cl link below, fixes it.
+$env:RUSTFLAGS = "-C target-feature=+crt-static"
 & $cargo +nightly build --release -p trireme-xbox-ffi `
     --target x86_64-uwp-windows-msvc -Z build-std=std,panic_abort -Z build-std-features=
 if ($LASTEXITCODE -ne 0) { throw "rust UWP build failed ($LASTEXITCODE)" }
@@ -67,11 +72,12 @@ $ffiInc = Join-Path $RepoRoot "crates\trireme-xbox-ffi"
 $exe = Join-Path $appx "TriremePhase1.exe"
 
 # /APPCONTAINER marks the exe UWP-activatable; WINAPI_FAMILY_APP keeps us
-# honest about the allowed API surface at compile time. Desktop CRT (/MD) is
-# fine for the VM gate — AppContainer processes may load System32 DLLs — and
-# the real Xbox shell will be a proper VS project anyway. The trailing libs
+# honest about the allowed API surface at compile time. /MT (static CRT, paired
+# with +crt-static on the Rust lib above) makes the exe self-contained; a /MD
+# build runs in the VM but fails activation on the real console (0x8027025B),
+# which has no loadable VC runtime for the AppContainer. The trailing libs
 # cover the Rust core's imports (sockets, RNG, IOCP, dirs).
-& cl.exe /nologo /std:c++17 /permissive- /EHsc /O2 /MD /bigobj `
+& cl.exe /nologo /std:c++17 /permissive- /EHsc /O2 /MT /bigobj `
     /DWINAPI_FAMILY=WINAPI_FAMILY_APP /DWIN32_LEAN_AND_MEAN /DNOMINMAX `
     /I $gen /I $ffiInc `
     $mainCpp `
