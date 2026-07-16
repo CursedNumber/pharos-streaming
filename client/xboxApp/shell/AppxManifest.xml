@@ -10,7 +10,7 @@
 
   <Identity Name="Trireme"
             Publisher="CN=TriremeDev"
-            Version="0.2.0.4"
+            Version="0.2.0.7"
             ProcessorArchitecture="x64" />
 
   <Properties>
@@ -23,6 +23,10 @@
     <TargetDeviceFamily Name="Windows.Universal"
                         MinVersion="10.0.17763.0"
                         MaxVersionTested="10.0.26100.0" />
+    <!-- Provides VCRUNTIME140_APP.dll for the dynamic FFmpeg DLLs (console has it). -->
+    <PackageDependency Name="Microsoft.VCLibs.140.00"
+                       MinVersion="14.0.30704.0"
+                       Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />
   </Dependencies>
 
   <Resources>
