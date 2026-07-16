@@ -41,18 +41,28 @@ $ffiInc = Join-Path $RepoRoot "crates\trireme-xbox-ffi"
 $exe = Join-Path $appx "Trireme.exe"
 $srcs = Get-ChildItem (Join-Path $srcDir "*.cpp") | ForEach-Object { $_.FullName }
 
-& cl.exe /nologo /std:c++17 /permissive- /EHsc /O2 /MT /bigobj `
-    /DWINAPI_FAMILY=WINAPI_FAMILY_APP /DWIN32_LEAN_AND_MEAN /DNOMINMAX `
-    /I $gen /I $ffiInc `
-    $srcs `
-    /Fo"$bld\" /Fe"$exe" `
-    /link /SUBSYSTEM:WINDOWS /APPCONTAINER `
-    "$lib" `
-    WindowsApp.lib d3d11.lib dxgi.lib d2d1.lib dwrite.lib `
-    mfplat.lib mfuuid.lib mfreadwrite.lib xaudio2.lib `
-    ws2_32.lib bcrypt.lib ntdll.lib userenv.lib advapi32.lib iphlpapi.lib synchronization.lib
+# FFmpeg (vcpkg x64-uwp) for D3D11VA hardware decode, when built. Present ->
+# compile video_ffmpeg.cpp (TRIREME_FFMPEG) and link the av* libs; absent ->
+# fall back to the Media Foundation software path in video.cpp.
+$ffRoot = "C:\vcpkg\installed\x64-uwp"
+$useFF = Test-Path (Join-Path $ffRoot "include\libavcodec\avcodec.h")
+
+$clArgs = @("/nologo", "/std:c++17", "/permissive-", "/EHsc", "/O2", "/MT", "/bigobj",
+            "/DWINAPI_FAMILY=WINAPI_FAMILY_APP", "/DWIN32_LEAN_AND_MEAN", "/DNOMINMAX",
+            "/I", $gen, "/I", $ffiInc)
+if ($useFF) { Write-Host "==> linking FFmpeg (D3D11VA)"; $clArgs += @("/DTRIREME_FFMPEG", "/I", (Join-Path $ffRoot "include")) }
+$clArgs += $srcs
+$clArgs += @("/Fo$bld\", "/Fe$exe", "/link", "/SUBSYSTEM:WINDOWS", "/APPCONTAINER", $lib,
+             "WindowsApp.lib", "d3d11.lib", "dxgi.lib", "d2d1.lib", "dwrite.lib",
+             "mfplat.lib", "mfuuid.lib", "mfreadwrite.lib", "xaudio2.lib",
+             "ws2_32.lib", "bcrypt.lib", "ntdll.lib", "userenv.lib", "advapi32.lib",
+             "iphlpapi.lib", "synchronization.lib")
+if ($useFF) { $clArgs += @("/LIBPATH:$ffRoot\lib", "avcodec.lib", "avutil.lib", "avformat.lib", "swscale.lib", "swresample.lib") }
+
+& cl.exe @clArgs
 if ($LASTEXITCODE -ne 0) { throw "cl failed ($LASTEXITCODE)" }
 
 Copy-Item (Join-Path $srcDir "AppxManifest.xml") $appx -Force
 Copy-Item (Join-Path $srcDir "Assets\*") (Join-Path $appx "Assets") -Force
+if ($useFF) { Copy-Item (Join-Path $ffRoot "bin\*.dll") $appx -Force; Write-Host "==> bundled FFmpeg DLLs" }
 Write-Host "==> shell AppX layout ready: $appx"

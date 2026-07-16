@@ -7,6 +7,10 @@
 // ProcessOutput) and uploads the decoded NV12 to a D3D texture, which
 // ID3D11VideoProcessor blits (NV12->RGB + scale) to the swapchain backbuffer.
 
+// This is the Media Foundation software-decoder path; video_ffmpeg.cpp replaces
+// it (same VideoPipeline surface) when build-shell.ps1 defines TRIREME_FFMPEG.
+#ifndef TRIREME_FFMPEG
+
 #include "video.h"
 
 #include <windows.h>
@@ -376,3 +380,5 @@ uint64_t VideoPipeline::submitted() const { return p_ ? p_->nSub.load() : 0; }
 uint64_t VideoPipeline::decoded() const { return p_ ? p_->nDec.load() : 0; }
 uint32_t VideoPipeline::frameWidth() const { return p_ ? p_->fw : 0; }
 uint32_t VideoPipeline::frameHeight() const { return p_ ? p_->fh : 0; }
+
+#endif  // !TRIREME_FFMPEG
