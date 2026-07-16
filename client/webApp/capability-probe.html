@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<!--
+  Trireme browser-client Phase-0 gate probe.
+
+  Open this in the console's Microsoft Edge and read the report. It only inspects
+  API presence/config support; it opens no sockets and needs no host. It is the
+  cheapest possible GO/NO-GO for the whole browser-fallback path (see README.md).
+
+  IMPORTANT: WebTransport and WebCodecs are SECURE-CONTEXT ONLY. Over plain
+  http:// (not localhost) the browser hides them and this page will (correctly)
+  report them missing. To probe for real, serve over HTTPS:
+    - quick self-signed on the host, then browse https://<host>:<port>/... on the
+      Xbox and click through the cert warning, OR
+    - host it on a real HTTPS origin (e.g. pharos.example.com).
+  The page flags its own secure-context status up top so a false "missing" from
+  an insecure origin is obvious.
+
+  This file is standalone (no host, no build step). Copy it anywhere and serve.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trireme browser-client capability probe</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.5 system-ui, sans-serif; margin: 0; padding: 1.2rem 1.4rem;
+         background: #0d1b2a; color: #e0e6ef; }
+  h1 { font-size: 1.3rem; margin: 0 0 .2rem; }
+  .sub { opacity: .7; margin: 0 0 1rem; font-size: .9rem; }
+  .verdict { font-size: 1.15rem; font-weight: 700; padding: .6rem .9rem;
+             border-radius: .5rem; margin: 0 0 1rem; }
+  .go { background: #16351f; color: #7ee787; }
+  .degrade { background: #3a2f10; color: #f2cc60; }
+  .no { background: #3a1518; color: #ff7b72; }
+  table { border-collapse: collapse; width: 100%; max-width: 960px; }
+  td, th { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid #24374d;
+           vertical-align: top; }
+  th { opacity: .7; font-weight: 600; }
+  .ok { color: #7ee787; } .bad { color: #ff7b72; } .warn { color: #f2cc60; }
+  code { background: #12263a; padding: .05rem .3rem; border-radius: .25rem; }
+  .detail { opacity: .75; font-size: .85rem; }
+  #ua { max-width: 960px; word-break: break-all; opacity: .6; font-size: .8rem;
+        margin-top: 1rem; }
+</style>
+</head>
+<body>
+<h1>Trireme browser-client capability probe</h1>
+<p class="sub">Phase-0 gate. Read the verdict, then the table. Serve over HTTPS or secure-context APIs will read as missing.</p>
+<div id="verdict" class="verdict">running…</div>
+<table id="report"><thead>
+  <tr><th>Capability</th><th>Result</th><th>Detail</th></tr>
+</thead><tbody></tbody></table>
+<div id="ua"></div>
+
+<script>
+(async () => {
+  const rows = [];
+  const add = (name, state, detail) => rows.push({ name, state, detail });
+  // state: "ok" | "bad" | "warn"
+
+  const secure = window.isSecureContext;
+  add("Secure context", secure ? "ok" : "bad",
+      secure ? "https/localhost — secure-context APIs exposed"
+             : "INSECURE ORIGIN — WebTransport/WebCodecs are hidden here; re-serve over HTTPS");
+
+  // --- Transport -----------------------------------------------------------
+  const hasWT = typeof WebTransport !== "undefined";
+  add("WebTransport", hasWT ? "ok" : "bad",
+      hasWT ? "primary transport available"
+            : "fall back to WebSocket or WebRTC");
+  add("WebSocket (fallback transport)", typeof WebSocket !== "undefined" ? "ok" : "bad", "");
+  add("WebRTC (fallback transport)", typeof RTCPeerConnection !== "undefined" ? "ok" : "warn", "");
+
+  // --- Video decode --------------------------------------------------------
+  const hasVD = typeof VideoDecoder !== "undefined";
+  add("WebCodecs VideoDecoder", hasVD ? "ok" : "bad", hasVD ? "" : "no hardware decode path");
+
+  async function vcfg(label, config) {
+    if (!hasVD) { add(label, "bad", "VideoDecoder missing"); return false; }
+    try {
+      const r = await VideoDecoder.isConfigSupported(config);
+      const hw = r.supported && r.config && r.config.hardwareAcceleration;
+      add(label, r.supported ? "ok" : "bad",
+          r.supported ? ("accel=" + (hw || "unspecified")) : "not supported");
+      return r.supported;
+    } catch (e) { add(label, "bad", String(e)); return false; }
+  }
+  // hev1/av01/avc1 = in-band parameter sets (what the host emits).
+  const hevc = await vcfg("HEVC decode (hev1.1.6.L120.90)",
+    { codec: "hev1.1.6.L120.90", hardwareAcceleration: "prefer-hardware", optimizeForLatency: true });
+  const av1  = await vcfg("AV1 decode (av01.0.08M.10)",
+    { codec: "av01.0.08M.10", hardwareAcceleration: "prefer-hardware", optimizeForLatency: true });
+  const avc  = await vcfg("AVC/H.264 decode (avc1.640028)",
+    { codec: "avc1.640028", hardwareAcceleration: "prefer-hardware", optimizeForLatency: true });
+
+  // --- Audio ---------------------------------------------------------------
+  const hasAD = typeof AudioDecoder !== "undefined";
+  if (hasAD) {
+    try {
+      const r = await AudioDecoder.isConfigSupported(
+        { codec: "opus", sampleRate: 48000, numberOfChannels: 2 });
+      add("WebCodecs AudioDecoder (opus)", r.supported ? "ok" : "warn",
+          r.supported ? "" : "fall back to WebAudio/decodeAudioData");
+    } catch (e) { add("WebCodecs AudioDecoder (opus)", "warn", String(e)); }
+  } else {
+    add("WebCodecs AudioDecoder (opus)", "warn", "missing; fall back to WebAudio");
+  }
+  add("Web Audio (AudioContext)", typeof AudioContext !== "undefined" ? "ok" : "bad", "");
+  add("AudioWorklet", (typeof AudioContext !== "undefined" &&
+      AudioContext.prototype && "audioWorklet" in AudioContext.prototype) ? "ok" : "warn",
+      "low-latency PCM playback");
+
+  // --- Input & present -----------------------------------------------------
+  add("Gamepad API", "getGamepads" in navigator ? "ok" : "bad", "controller input");
+  add("Canvas 2D", (() => { try { return !!document.createElement("canvas").getContext("2d"); }
+      catch { return false; } })() ? "ok" : "bad", "");
+  add("WebGL2 (tonemap/present)", (() => { try {
+      return !!document.createElement("canvas").getContext("webgl2"); } catch { return false; } })()
+      ? "ok" : "warn", "");
+  add("requestVideoFrameCallback", "requestVideoFrameCallback" in HTMLVideoElement.prototype
+      ? "ok" : "warn", "frame-accurate pacing");
+
+  // --- Render --------------------------------------------------------------
+  const tb = document.querySelector("#report tbody");
+  const cls = { ok: "ok", bad: "bad", warn: "warn" };
+  const mark = { ok: "✓", bad: "✗", warn: "!" };
+  for (const r of rows) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${r.name}</td>`
+      + `<td class="${cls[r.state]}">${mark[r.state]} ${r.state.toUpperCase()}</td>`
+      + `<td class="detail">${r.detail || ""}</td>`;
+    tb.appendChild(tr);
+  }
+
+  // --- Verdict -------------------------------------------------------------
+  const v = document.getElementById("verdict");
+  const anyVideo = hevc || av1 || avc;
+  if (!secure) {
+    v.className = "verdict no";
+    v.textContent = "INCONCLUSIVE — insecure origin hides the key APIs. Re-serve this page over HTTPS and reload.";
+  } else if (hasWT && hevc && ("getGamepads" in navigator)) {
+    v.className = "verdict go";
+    v.textContent = "GO — WebTransport + hardware HEVC + Gamepad all present. Build the full path.";
+  } else if (anyVideo && ("getGamepads" in navigator) &&
+             (hasWT || typeof WebSocket !== "undefined")) {
+    const codec = hevc ? "HEVC" : (av1 ? "AV1" : "AVC");
+    const wire = hasWT ? "WebTransport" : "WebSocket";
+    v.className = "verdict degrade";
+    v.textContent = `DEGRADED-GO — build with ${wire} + ${codec}. Some preferred APIs are missing; see table.`;
+  } else {
+    v.className = "verdict no";
+    v.textContent = "NO-GO — a hard requirement (video decode, input, or any transport) is missing. Stay native.";
+  }
+
+  document.getElementById("ua").textContent = "UA: " + navigator.userAgent;
+})();
+</script>
+</body>
+</html>
