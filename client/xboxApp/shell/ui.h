@@ -18,12 +18,32 @@
 struct UiHostRow {
     std::wstring name;
     std::wstring detail;  // address / hint line under the name
-    std::wstring tag;     // right-aligned badge: "paired", "new", ""
+    std::wstring tag;     // right-aligned badge: "paired", "new", "running", ""
 };
 
-struct UiHostsModel {
-    std::vector<UiHostRow> rows;  // last row is Exit
-    int focus = 0;
+struct UiSettingsRow {
+    std::wstring label;
+    std::wstring value;  // shown as "< value >" on the focused row
+};
+
+// The Android-style single-screen shell: persistent left nav rail
+// (Stream / Hosts / Apps / Settings / Exit) + a content pane per section.
+struct UiShellModel {
+    int rail = 0;          // focused rail item
+    bool inPane = false;   // focus is in the content pane
+    // Stream pane
+    std::wstring streamHeadline, streamDetail, streamHint;
+    // Hosts pane
+    std::vector<UiHostRow> hostRows;
+    int hostFocus = 0;
+    // Apps pane
+    std::vector<UiHostRow> appRows;
+    int appFocus = 0;
+    std::wstring appsEmpty;  // shown when appRows is empty
+    // Settings pane
+    std::vector<UiSettingsRow> settingRows;
+    int settingsFocus = 0;
+
     std::wstring status;  // bottom status line
 };
 
@@ -41,13 +61,10 @@ struct UiOverlayModel {
 };
 
 struct UiMenuModel {
+    std::wstring title = L"TRIREME";
     std::vector<std::wstring> items;
     int focus = 0;
-};
-
-struct UiSettingsRow {
-    std::wstring label;
-    std::wstring value;  // shown as "< value >" on the focused row
+    std::wstring hint = L"A Select   B Resume";
 };
 
 struct UiSettingsModel {
@@ -59,7 +76,7 @@ struct UiSettingsModel {
 class UiRenderer {
 public:
     bool init(ID3D11Device* device, IDXGISwapChain1* swap, uint32_t w, uint32_t h);
-    void drawHosts(const UiHostsModel& m);
+    void drawShell(const UiShellModel& m);
     void drawPin(const UiPinModel& m);
     void drawOverlay(const UiOverlayModel& m);
     void drawStreamMenu(const UiMenuModel& m);

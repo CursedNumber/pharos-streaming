@@ -11,6 +11,7 @@
 #include <dwrite.h>
 #include <winrt/base.h>
 
+#include <algorithm>
 #include <string>
 
 using winrt::com_ptr;
@@ -30,6 +31,7 @@ bool ok(HRESULT hr, const char* what) {
 }
 
 // Palette (nautical navy + lighthouse gold).
+constexpr D2D1_COLOR_F kRailBg{0.078f, 0.125f, 0.184f, 1.f};  // #14202F
 constexpr D2D1_COLOR_F kBg{0.106f, 0.165f, 0.255f, 1.f};      // #1B2A41
 constexpr D2D1_COLOR_F kPanel{0.145f, 0.216f, 0.337f, 1.f};   // #253756
 constexpr D2D1_COLOR_F kPanelHi{0.180f, 0.263f, 0.404f, 1.f}; // focused fill
@@ -42,6 +44,8 @@ constexpr D2D1_COLOR_F kScrim{0.f, 0.f, 0.f, 0.62f};
 
 const wchar_t* kKeyLabels[12] = {L"1", L"2", L"3", L"4", L"5", L"6",
                                  L"7", L"8", L"9", L"DEL", L"0", L"OK"};
+
+const wchar_t* kRailItems[5] = {L"Stream", L"Hosts", L"Apps", L"Settings", L"Exit"};
 
 }  // namespace
 
@@ -165,37 +169,100 @@ bool UiRenderer::init(ID3D11Device* device, IDXGISwapChain1* swap, uint32_t widt
     return true;
 }
 
-void UiRenderer::drawHosts(const UiHostsModel& m) {
+void UiRenderer::drawShell(const UiShellModel& m) {
     if (!p_) return;
     auto& I = *p_;
     const float s = I.s;
     I.ctx->BeginDraw();
-    I.chrome();
-    I.text(L"Select a Pharos host", I.fmtSmall.get(), {124 * s, 168 * s, I.w, 220 * s}, kDim);
+    I.ctx->Clear(kBg);
 
-    const float rowW = I.w - 240 * s, rowH = 92 * s, gap = 14 * s;
-    float y = 250 * s;
-    for (size_t i = 0; i < m.rows.size(); ++i) {
-        const bool focused = static_cast<int>(i) == m.focus;
-        D2D1_RECT_F r{120 * s, y, 120 * s + rowW, y + rowH};
-        I.fillRect(r, focused ? kPanelHi : kPanel, 10 * s);
-        if (focused) I.strokeRect(r, kGold, 3.f * s, 10 * s);
-        const auto& row = m.rows[i];
-        I.text(row.name, I.fmtRow.get(), {r.left + 28 * s, r.top + 12 * s, r.right - 160 * s, r.bottom},
-               kText);
-        if (!row.detail.empty())
-            I.text(row.detail, I.fmtDetail.get(),
-                   {r.left + 28 * s, r.top + 54 * s, r.right - 160 * s, r.bottom}, kDim);
-        if (!row.tag.empty())
-            I.text(row.tag, I.fmtSmallRight.get(), {r.left, r.top, r.right - 28 * s, r.bottom},
-                   row.tag == L"paired" ? kGreen : kGold);
-        y += rowH + gap;
+    // Left nav rail.
+    const float railW = 320 * s;
+    I.fillRect({0, 0, railW, I.h}, kRailBg);
+    I.text(L"TRIREME", I.fmtTitle.get(), {36 * s, 44 * s, railW, 130 * s}, kGold);
+    I.fillRect({38 * s, 122 * s, 262 * s, 126 * s}, kGold);
+    float ry = 190 * s;
+    const float railRowH = 74 * s, railGap = 10 * s;
+    for (int i = 0; i < 5; ++i) {
+        const bool active = i == m.rail;
+        D2D1_RECT_F r{20 * s, ry, railW - 20 * s, ry + railRowH};
+        if (active && !m.inPane) {
+            I.fillRect(r, kPanelHi, 10 * s);
+            I.strokeRect(r, kGold, 3.f * s, 10 * s);
+        } else if (active) {
+            I.fillRect(r, kPanel, 10 * s);
+            I.fillRect({20 * s, ry + 8 * s, 27 * s, ry + railRowH - 8 * s}, kGold, 3 * s);
+        }
+        I.text(kRailItems[i], I.fmtRow.get(), {r.left + 34 * s, r.top + 17 * s, r.right, r.bottom},
+               active ? kText : kDim);
+        ry += railRowH + railGap;
     }
+
+    // Content pane for the focused section (Exit has none; show Stream).
+    const int section = m.rail < 4 ? m.rail : 0;
+    const float cx = railW + 60 * s, cw = I.w - cx - 80 * s;
+    const float rowH = 92 * s, gap = 14 * s;
+    float y = 190 * s;
+
+    auto rowList = [&](const std::vector<UiHostRow>& rows, int focus) {
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const bool focused = m.inPane && static_cast<int>(i) == focus;
+            D2D1_RECT_F r{cx, y, cx + cw, y + rowH};
+            I.fillRect(r, focused ? kPanelHi : kPanel, 10 * s);
+            if (focused) I.strokeRect(r, kGold, 3.f * s, 10 * s);
+            I.text(rows[i].name, I.fmtRow.get(),
+                   {r.left + 28 * s, r.top + 12 * s, r.right - 180 * s, r.bottom}, kText);
+            if (!rows[i].detail.empty())
+                I.text(rows[i].detail, I.fmtDetail.get(),
+                       {r.left + 28 * s, r.top + 54 * s, r.right - 180 * s, r.bottom}, kDim);
+            if (!rows[i].tag.empty())
+                I.text(rows[i].tag, I.fmtSmallRight.get(),
+                       {r.left, r.top, r.right - 28 * s, r.bottom},
+                       rows[i].tag == L"new" ? kGold : kGreen);
+            y += rowH + gap;
+        }
+    };
+
+    if (section == 0) {
+        D2D1_RECT_F r{cx, y, cx + cw, y + 210 * s};
+        I.fillRect(r, kPanel, 12 * s);
+        if (m.inPane) I.strokeRect(r, kGold, 3.f * s, 12 * s);
+        I.text(m.streamHeadline, I.fmtRow.get(),
+               {r.left + 36 * s, r.top + 34 * s, r.right - 36 * s, r.bottom}, kText);
+        I.text(m.streamDetail, I.fmtDetail.get(),
+               {r.left + 36 * s, r.top + 92 * s, r.right - 36 * s, r.bottom}, kDim);
+        if (!m.streamHint.empty())
+            I.text(m.streamHint, I.fmtSmallRight.get(),
+                   {r.left, r.top, r.right - 32 * s, r.bottom - 20 * s}, kGold);
+    } else if (section == 1) {
+        rowList(m.hostRows, m.hostFocus);
+        if (m.hostRows.empty())
+            I.text(L"No hosts yet — open pairing on the host to discover it", I.fmtSmall.get(),
+                   {cx, y, cx + cw, y + 60 * s}, kDim);
+    } else if (section == 2) {
+        rowList(m.appRows, m.appFocus);
+        if (m.appRows.empty())
+            I.text(m.appsEmpty, I.fmtSmall.get(), {cx, y, cx + cw, y + 60 * s}, kDim);
+    } else {
+        for (size_t i = 0; i < m.settingRows.size(); ++i) {
+            const bool focused = m.inPane && static_cast<int>(i) == m.settingsFocus;
+            D2D1_RECT_F r{cx, y, cx + cw, y + rowH};
+            I.fillRect(r, focused ? kPanelHi : kPanel, 10 * s);
+            if (focused) I.strokeRect(r, kGold, 3.f * s, 10 * s);
+            I.text(m.settingRows[i].label, I.fmtRow.get(),
+                   {r.left + 28 * s, r.top + 26 * s, r.right, r.bottom}, kText);
+            const std::wstring v = focused ? L"\x2039 " + m.settingRows[i].value + L" \x203A"
+                                           : m.settingRows[i].value;
+            I.text(v, I.fmtSmallRight.get(), {r.left, r.top, r.right - 28 * s, r.bottom},
+                   focused ? kGold : kDim);
+            y += rowH + gap;
+        }
+    }
+
     if (!m.status.empty())
-        I.text(m.status, I.fmtSmall.get(), {120 * s, I.h - 96 * s, I.w - 120 * s, I.h - 40 * s},
-               kDim);
-    I.text(L"D-pad Move   A Select", I.fmtSmallRight.get(),
-           {0, I.h - 96 * s, I.w - 120 * s, I.h - 40 * s}, kDim);
+        I.text(m.status, I.fmtSmall.get(), {cx, I.h - 96 * s, I.w - 120 * s, I.h - 40 * s}, kDim);
+    I.text(m.inPane ? L"A Select   B Rail" : L"D-pad Move   A Open", I.fmtSmallRight.get(),
+           {0, I.h - 96 * s, I.w - 80 * s, I.h - 40 * s}, kDim);
     I.ctx->EndDraw();
 }
 
@@ -261,23 +328,28 @@ void UiRenderer::drawStreamMenu(const UiMenuModel& m) {
     I.ctx->BeginDraw();
     I.fillRect({0, 0, I.w, I.h}, kScrim);  // dim the live video behind
 
-    const float pw = 560 * s, rowH = 88 * s, gap = 14 * s;
-    const float ph = 120 * s + m.items.size() * (rowH + gap) + 40 * s;
+    // Scroll window: show up to 7 rows, keeping the focused one in view.
+    const int total = static_cast<int>(m.items.size());
+    const int shown = std::min(total, 7);
+    int off = std::clamp(m.focus - 3, 0, std::max(0, total - shown));
+
+    const float pw = 620 * s, rowH = 88 * s, gap = 14 * s;
+    const float ph = 120 * s + shown * (rowH + gap) + 40 * s;
     const float px = (I.w - pw) / 2, py = (I.h - ph) / 2;
     I.fillRect({px, py, px + pw, py + ph}, kBg, 16 * s);
     I.strokeRect({px, py, px + pw, py + ph}, kGold, 2.f * s, 16 * s);
-    I.text(L"TRIREME", I.fmtCenter.get(), {px, py + 20 * s, px + pw, py + 90 * s}, kGold);
+    I.text(m.title, I.fmtCenter.get(), {px, py + 20 * s, px + pw, py + 90 * s}, kGold);
 
     float y = py + 110 * s;
-    for (size_t i = 0; i < m.items.size(); ++i) {
-        const bool focused = static_cast<int>(i) == m.focus;
+    for (int i = off; i < off + shown; ++i) {
+        const bool focused = i == m.focus;
         D2D1_RECT_F r{px + 32 * s, y, px + pw - 32 * s, y + rowH};
         I.fillRect(r, focused ? kPanelHi : kPanel, 10 * s);
         if (focused) I.strokeRect(r, kGold, 3.f * s, 10 * s);
-        I.text(m.items[i], I.fmtCenter.get(), r, kText);
+        I.text(m.items[static_cast<size_t>(i)], I.fmtCenter.get(), r, kText);
         y += rowH + gap;
     }
-    I.text(L"A Select   B Resume", I.fmtCenterSmall.get(), {px, y, px + pw, y + 40 * s}, kDim);
+    I.text(m.hint, I.fmtCenterSmall.get(), {px, y, px + pw, y + 40 * s}, kDim);
     I.ctx->EndDraw();
 }
 

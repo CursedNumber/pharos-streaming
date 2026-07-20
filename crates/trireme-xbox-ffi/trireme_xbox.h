@@ -22,6 +22,15 @@ typedef void (*EndCallback)(void *ctx, const char *error);
 // Host link-health heartbeat (~2x/s): `true` while the host is shedding video.
 typedef void (*LinkHealthCallback)(void *ctx, bool degraded);
 
+// One host app catalog entry, C view. Strings are valid only for the duration
+// of the callback — copy out. `art` (PNG bytes) is omitted for now.
+typedef struct TriremeAppInfo {
+  const char *id;
+  const char *name;
+  uint8_t kind;
+  bool running;
+} TriremeAppInfo;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -72,7 +81,12 @@ TriremeStream *trireme_start(const char *addr,
                              EndCallback on_end,
                              LinkHealthCallback on_link_health,
                              void *audio_ctx,
-                             void (*on_audio)(void *ctx, const uint8_t *data, uintptr_t len));
+                             void (*on_audio)(void *ctx, const uint8_t *data, uintptr_t len),
+                             void *catalog_ctx,
+                             void (*on_catalog)(void *ctx,
+                                                const TriremeAppInfo *apps,
+                                                uintptr_t count),
+                             void (*on_notice)(void *ctx, const char *message));
 
 // Stop the stream and free the handle. Safe on null; call exactly once.
 void trireme_stop(TriremeStream *h);
@@ -92,7 +106,11 @@ void trireme_pad_button(TriremeStream *h, uint8_t slot, uint8_t button, bool pre
 // Canonical gamepad axis, normalized to [-1.0, 1.0] (triggers [0.0, 1.0]).
 void trireme_pad_axis(TriremeStream *h, uint8_t slot, uint8_t axis, float value);
 
-// Keyboard scancode (for a paired USB/BT keyboard; couch UI shortcuts).
+// Host app catalog control (ids from TriremeAppInfo).
+void trireme_app_launch(TriremeStream *h, const char *id);
+void trireme_app_switch(TriremeStream *h, const char *id);
+void trireme_app_end(TriremeStream *h, const char *id);
+
 // Live stream preferences (Auto = 0 everywhere; applied by the QoS loop ~1s).
 void trireme_set_resolution_pref(TriremeStream *h, uint32_t target_h, uint32_t floor_h);
 void trireme_set_bitrate_pref(TriremeStream *h, uint32_t min_kbps, uint32_t max_kbps);

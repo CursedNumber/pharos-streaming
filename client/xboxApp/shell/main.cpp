@@ -252,6 +252,44 @@ void onEnd(void*, const char* err) {
 }
 void onLinkHealth(void*, bool degraded) { g_degraded = degraded; }
 
+// Host app catalog (arrives on the stream's app relay; QUIC thread).
+struct AppEntry {
+    std::string id, name;
+    uint8_t kind = 0;
+    bool running = false;
+};
+std::mutex g_appsMx;
+std::vector<AppEntry> g_apps;
+std::string g_notice;  // latest host toast, under g_appsMx
+std::atomic<double> g_noticeAt{0};
+
+void onCatalog(void*, const TriremeAppInfo* apps, uintptr_t n) noexcept {
+    try {
+        std::vector<AppEntry> v;
+        v.reserve(n);
+        for (uintptr_t i = 0; i < n; ++i)
+            v.push_back({apps[i].id ? apps[i].id : "", apps[i].name ? apps[i].name : "",
+                         apps[i].kind, apps[i].running});
+        {
+            std::lock_guard<std::mutex> lk(g_appsMx);
+            g_apps = std::move(v);
+        }
+        shellLog("catalog: " + std::to_string(n) + " apps");
+    } catch (...) {
+    }
+}
+void onNotice(void*, const char* msg) noexcept {
+    try {
+        std::lock_guard<std::mutex> lk(g_appsMx);
+        g_notice = msg ? msg : "";
+        g_noticeAt = std::chrono::duration<double>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+        shellLog("host notice: " + g_notice);
+    } catch (...) {
+    }
+}
+
 TriremeStream* startStream(const std::string& addr, int streamPort, const std::string& pubkey,
                            const std::string& idPath) {
     const std::string target = addr + ":" + std::to_string(streamPort);
@@ -261,7 +299,8 @@ TriremeStream* startStream(const std::string& addr, int streamPort, const std::s
     TriremeStream* s = trireme_start(target.c_str(), pubkey.empty() ? nullptr : pubkey.c_str(),
                                      idPath.c_str(), 0, 0, 60000, &g_video, onFrame, onEnd,
                                      onLinkHealth, g_audioUp.load() ? &g_audio : nullptr,
-                                     g_audioUp.load() ? onAudio : nullptr);
+                                     g_audioUp.load() ? onAudio : nullptr, nullptr, onCatalog,
+                                     onNotice);
     if (s) g_stream = s;
     else shellLog("trireme_start returned null");
     return s;
@@ -332,10 +371,12 @@ constexpr uint32_t kFpsValues[] = {0, 30, 60, 120};
 
 struct AppSettings {
     int res = 0, bitrate = 0, fps = 0;  // indices; 0 = Auto
+    std::string last;                   // pubkey of the last-connected host
 
     static AppSettings load(const std::filesystem::path& p) {
         AppSettings s;
         auto cfg = readConfig(p);
+        s.last = cfgOr(cfg, "last", "");
         s.res = std::clamp(atoi(cfgOr(cfg, "res", "0").c_str()), 0,
                            static_cast<int>(std::size(kResValues)) - 1);
         s.bitrate = std::clamp(atoi(cfgOr(cfg, "bitrate", "0").c_str()), 0,
@@ -346,7 +387,8 @@ struct AppSettings {
     }
     void save(const std::filesystem::path& p) const {
         std::ofstream f(p, std::ios::trunc);
-        f << "res=" << res << "\nbitrate=" << bitrate << "\nfps=" << fps << "\n";
+        f << "res=" << res << "\nbitrate=" << bitrate << "\nfps=" << fps << "\nlast=" << last
+          << "\n";
     }
     // Push onto a live stream (the QoS loop re-sends within ~1s).
     void apply(TriremeStream* s) const {
@@ -368,7 +410,7 @@ struct AppSettings {
 
 // --- app --------------------------------------------------------------------
 
-enum class Screen { Hosts, Pin, Streaming };
+enum class Screen { Shell, Pin, Streaming };
 
 // Canonical pad indices (core-proto): buttons 0=A 1=B 2=X 3=Y 4=LB 5=RB
 // 6=Back 7=Start 8=Guide 9=LS 10=RS; axes 0=LX 1=LY 2=RX 3=RY 4=LT 5=RT
@@ -389,12 +431,18 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
     std::string idPath;
     std::filesystem::path hostsPath;
 
-    Screen screen = Screen::Hosts;
+    Screen screen = Screen::Shell;
     std::vector<KnownHost> known;
     std::vector<DiscoveredHost> discovered;
-    int focus = 0;
     std::wstring status;
     bool uiReady = false;
+
+    // Shell (rail + pane) focus state.
+    int railFocus = 0;   // 0 Stream, 1 Hosts, 2 Apps, 3 Settings, 4 Exit
+    bool inPane = false;
+    int hostFocus = 0;
+    int appFocus = 0;
+    std::vector<AppEntry> appsNow;  // per-frame snapshot of g_apps
 
     // PIN screen state.
     DiscoveredHost pinTarget;
@@ -410,11 +458,13 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
     uint64_t lastLoggedDecoded = 0;
     bool streamMenuOpen = false;
     int streamMenuFocus = 0;
+    bool appsOpen = false;  // in-stream Apps modal
+    int appsModalFocus = 0;
 
-    // Settings overlay (over Hosts or over the stream menu).
+    // Settings: pane in the shell, modal over the stream menu.
     AppSettings settings;
     std::filesystem::path settingsPath;
-    bool settingsOpen = false;
+    bool settingsOpen = false;  // streaming-only modal
     int settingsFocus = 0;
 
     GamepadButtons prevButtons{};
@@ -427,6 +477,11 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
     void SetWindow(CoreWindow const& w) {
         window = w;
         w.Closed([this](auto&&, auto&&) { quit = true; });
+        // Claim the system back gesture: on Xbox an unhandled BackRequested
+        // (the B button) navigates OUT of the app. All back behavior is ours,
+        // driven from the gamepad polling; exit is explicit via the rail/menu.
+        SystemNavigationManager::GetForCurrentView().BackRequested(
+            [](auto&&, BackRequestedEventArgs const& a) { a.Handled(true); });
         // Lifecycle telemetry: if the system yanks us (suspend/background), the
         // log shows it — distinguishes an external kill from an internal crash.
         w.VisibilityChanged([](auto&&, VisibilityChangedEventArgs const& a) {
@@ -451,26 +506,48 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
         if (auto s = g_stream.exchange(nullptr)) trireme_stop(s);
         pad = PadForwardState{};
         streamMenuOpen = false;
-        screen = Screen::Hosts;
+        appsOpen = false;
+        settingsOpen = false;
+        screen = Screen::Shell;
         status = why;
     }
 
-    // --- hosts screen -------------------------------------------------------
+    // --- shell (rail + panes) -----------------------------------------------
 
     struct Row {
-        enum Kind { Known, Disco, Settings, Exit } kind;
+        enum Kind { Known, Disco } kind;
         size_t idx = 0;
     };
-    std::vector<Row> rows;  // rebuilt each frame alongside the UI model
+    std::vector<Row> rows;  // hosts pane rows, rebuilt each frame with the model
 
-    UiHostsModel hostsModel() {
-        UiHostsModel m;
+    // The host this rail's Stream section connects to: the last-connected one
+    // (settings.last pubkey) when it is still known, else the first known.
+    const KnownHost* lastHost() const {
+        if (known.empty()) return nullptr;
+        for (const auto& k : known)
+            if (!settings.last.empty() && k.pubkey == settings.last) return &k;
+        return &known.front();
+    }
+
+    UiShellModel shellModel() {
+        UiShellModel m;
+        m.rail = railFocus;
+        m.inPane = inPane;
+        // Stream pane.
+        if (const KnownHost* k = lastHost()) {
+            m.streamHeadline = widen(k->name);
+            m.streamDetail = widen(k->addr) + L" \x2022 paired";
+            m.streamHint = L"A  Connect";
+        } else {
+            m.streamHeadline = L"No paired host";
+            m.streamDetail = L"Pair one from the Hosts tab";
+        }
+        // Hosts pane.
         rows.clear();
         discovered = disco.snapshot();
         for (size_t i = 0; i < known.size(); ++i) {
-            const auto& k = known[i];
             rows.push_back({Row::Known, i});
-            m.rows.push_back({widen(k.name), widen(k.addr), L"paired"});
+            m.hostRows.push_back({widen(known[i].name), widen(known[i].addr), L"paired"});
         }
         for (size_t i = 0; i < discovered.size(); ++i) {
             const auto& d = discovered[i];
@@ -479,37 +556,42 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
             });
             if (isKnown) continue;  // merged: the known row already covers it
             rows.push_back({Row::Disco, i});
-            m.rows.push_back({widen(d.alias.empty() ? d.instance : d.alias), widen(d.addr), L"new"});
+            m.hostRows.push_back(
+                {widen(d.alias.empty() ? d.instance : d.alias), widen(d.addr), L"new"});
         }
-        rows.push_back({Row::Settings, 0});
-        m.rows.push_back({L"Settings",
-                          settings.resText() + L" / " + settings.bitrateText() + L" / " +
-                              settings.fpsText(),
-                          L""});
-        rows.push_back({Row::Exit, 0});
-        m.rows.push_back({L"Exit Trireme", L"", L""});
-        focus = std::clamp(focus, 0, static_cast<int>(rows.size()) - 1);
-        m.focus = focus;
+        hostFocus = std::clamp(hostFocus, 0, std::max(0, static_cast<int>(rows.size()) - 1));
+        m.hostFocus = hostFocus;
+        // Apps pane (catalog only flows during a stream).
+        for (const auto& a : appsNow)
+            m.appRows.push_back({widen(a.name), L"", a.running ? L"running" : L""});
+        appFocus = std::clamp(appFocus, 0, std::max(0, static_cast<int>(appsNow.size()) - 1));
+        m.appFocus = appFocus;
+        m.appsEmpty = L"Connect to a host to browse its apps";
+        // Settings pane.
+        m.settingRows = {{L"Resolution", settings.resText()},
+                         {L"Max bitrate", settings.bitrateText()},
+                         {L"Max framerate", settings.fpsText()}};
+        m.settingsFocus = settingsFocus;
         m.status = status;
         return m;
     }
 
+    void connectTo(const KnownHost& k) {
+        g_userActive = true;
+        streamHostName = k.name;
+        settings.last = k.pubkey;
+        settings.save(settingsPath);
+        if (startStream(k.addr, k.streamPort, k.pubkey, idPath)) enterStreaming();
+        else status = L"connect failed";
+    }
+
     void hostsActivate() {
         if (rows.empty()) return;
-        const Row r = rows[static_cast<size_t>(focus)];
-        if (r.kind == Row::Exit) { quit = true; return; }
-        if (r.kind == Row::Settings) {
-            settingsOpen = true;
-            settingsFocus = 0;
-            return;
-        }
-        g_userActive = true;
+        const Row r = rows[static_cast<size_t>(hostFocus)];
         if (r.kind == Row::Known) {
-            const auto& k = known[r.idx];
-            streamHostName = k.name;
-            if (startStream(k.addr, k.streamPort, k.pubkey, idPath)) enterStreaming();
-            else status = L"connect failed";
+            connectTo(known[r.idx]);
         } else {
+            g_userActive = true;
             pinTarget = discovered[r.idx];
             pinDigits.clear();
             pinFocus = 0;
@@ -563,8 +645,10 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
         saveHosts(hostsPath, known);
         shellLog("paired + saved host " + h.name + " (" + h.addr + ")");
         streamHostName = h.name;
+        settings.last = h.pubkey;
+        settings.save(settingsPath);
         if (startStream(h.addr, h.streamPort, h.pubkey, idPath)) enterStreaming();
-        else { screen = Screen::Hosts; status = L"paired, but connect failed"; }
+        else { screen = Screen::Shell; status = L"paired, but connect failed"; }
     }
 
     // --- streaming ----------------------------------------------------------
@@ -638,9 +722,14 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
         }
     }
 
-    UiOverlayModel overlayModel() {
+    UiOverlayModel overlayModel(bool freshNotice) {
         UiOverlayModel m;
         m.degraded = g_degraded.load();
+        if (freshNotice) {
+            std::lock_guard<std::mutex> lk(g_appsMx);
+            m.line = widen(g_notice);
+            return m;
+        }
         std::wstringstream ss;
         ss << widen(streamHostName) << L"   " << g_video.frameWidth() << L"x"
            << g_video.frameHeight() << L"   frames " << g_video.decoded() << L"   audio "
@@ -669,7 +758,7 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
 
     void updateStreamMenuInput(GamepadReading const& r) {
         const GamepadButtons cur = r.Buttons;
-        constexpr int kItems = 4;  // Resume / Settings / Disconnect / Exit
+        constexpr int kItems = 5;  // Resume / Apps / Settings / Disconnect / Exit
         if (nav(cur, GamepadButtons::DPadDown)) streamMenuFocus++;
         if (nav(cur, GamepadButtons::DPadUp)) streamMenuFocus--;
         streamMenuFocus = std::clamp(streamMenuFocus, 0, kItems - 1);
@@ -679,9 +768,46 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
         } else if (edge(cur, GamepadButtons::A)) {
             shellLog("menu: activate item " + std::to_string(streamMenuFocus));
             if (streamMenuFocus == 0) streamMenuOpen = false;
-            else if (streamMenuFocus == 1) { settingsOpen = true; settingsFocus = 0; }
-            else if (streamMenuFocus == 2) stopStream(L"disconnected");
+            else if (streamMenuFocus == 1) { appsOpen = true; appsModalFocus = 0; }
+            else if (streamMenuFocus == 2) { settingsOpen = true; settingsFocus = 0; }
+            else if (streamMenuFocus == 3) stopStream(L"disconnected");
             else quit = true;
+        }
+        prevButtons = cur;
+    }
+
+    // In-stream Apps modal: A launches (or switches to a running app), X ends a
+    // running app, B returns to the stream menu.
+    void updateAppsModalInput(GamepadReading const& r) {
+        const GamepadButtons cur = r.Buttons;
+        const int n = static_cast<int>(appsNow.size());
+        if (nav(cur, GamepadButtons::DPadDown)) appsModalFocus++;
+        if (nav(cur, GamepadButtons::DPadUp)) appsModalFocus--;
+        appsModalFocus = std::clamp(appsModalFocus, 0, std::max(0, n - 1));
+        if (edge(cur, GamepadButtons::B)) {
+            appsOpen = false;
+        } else if (edge(cur, GamepadButtons::A) && n > 0) {
+            const AppEntry& a = appsNow[static_cast<size_t>(appsModalFocus)];
+            TriremeStream* s = g_stream.load();
+            if (s) {
+                if (a.running) {
+                    shellLog("apps: switch to " + a.id);
+                    trireme_app_switch(s, a.id.c_str());
+                } else {
+                    shellLog("apps: launch " + a.id);
+                    trireme_app_launch(s, a.id.c_str());
+                }
+            }
+            appsOpen = false;
+            streamMenuOpen = false;  // drop back to the stream to watch it come up
+        } else if (edge(cur, GamepadButtons::X) && n > 0) {
+            const AppEntry& a = appsNow[static_cast<size_t>(appsModalFocus)];
+            if (a.running) {
+                if (TriremeStream* s = g_stream.load()) {
+                    shellLog("apps: end " + a.id);
+                    trireme_app_end(s, a.id.c_str());
+                }
+            }
         }
         prevButtons = cur;
     }
@@ -695,37 +821,81 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
         int dir = 0;
         if (nav(cur, GamepadButtons::DPadRight)) dir = 1;
         if (nav(cur, GamepadButtons::DPadLeft)) dir = -1;
-        if (dir != 0) {
-            auto cycle = [&](int v, size_t n) {
-                return (v + dir + static_cast<int>(n)) % static_cast<int>(n);
-            };
-            if (settingsFocus == 0) settings.res = cycle(settings.res, std::size(kResValues));
-            else if (settingsFocus == 1)
-                settings.bitrate = cycle(settings.bitrate, std::size(kBitrateMbps));
-            else settings.fps = cycle(settings.fps, std::size(kFpsValues));
-            settings.save(settingsPath);
-            settings.apply(g_stream.load());  // live-tune if streaming
-        }
+        if (dir != 0) adjustSetting(dir);
         if (edge(cur, GamepadButtons::B)) settingsOpen = false;
         prevButtons = cur;
     }
 
-    void updateUiInput(GamepadReading const& r) {
+    void updateShellInput(GamepadReading const& r) {
         const GamepadButtons cur = r.Buttons;
-        if (screen == Screen::Hosts) {
-            if (nav(cur, GamepadButtons::DPadDown)) focus++;
-            if (nav(cur, GamepadButtons::DPadUp)) focus--;
-            focus = std::clamp(focus, 0, std::max(0, static_cast<int>(rows.size()) - 1));
-            if (edge(cur, GamepadButtons::A)) hostsActivate();
-        } else if (screen == Screen::Pin) {
-            if (!pairBusy) {
-                if (nav(cur, GamepadButtons::DPadRight) && pinFocus % 3 < 2) pinFocus++;
-                if (nav(cur, GamepadButtons::DPadLeft) && pinFocus % 3 > 0) pinFocus--;
-                if (nav(cur, GamepadButtons::DPadDown) && pinFocus / 3 < 3) pinFocus += 3;
-                if (nav(cur, GamepadButtons::DPadUp) && pinFocus / 3 > 0) pinFocus -= 3;
-                if (edge(cur, GamepadButtons::A)) pinActivate();
-                if (edge(cur, GamepadButtons::B)) { screen = Screen::Hosts; status.clear(); }
+        if (!inPane) {
+            if (nav(cur, GamepadButtons::DPadDown)) railFocus++;
+            if (nav(cur, GamepadButtons::DPadUp)) railFocus--;
+            railFocus = std::clamp(railFocus, 0, 4);
+            const bool enter =
+                edge(cur, GamepadButtons::A) || nav(cur, GamepadButtons::DPadRight);
+            if (enter) {
+                if (railFocus == 4) {
+                    if (edge(cur, GamepadButtons::A)) quit = true;
+                } else {
+                    inPane = true;
+                }
             }
+        } else {
+            if (edge(cur, GamepadButtons::B)) { inPane = false; prevButtons = cur; return; }
+            switch (railFocus) {
+                case 0:  // Stream: one-press reconnect
+                    if (nav(cur, GamepadButtons::DPadLeft)) inPane = false;
+                    if (edge(cur, GamepadButtons::A))
+                        if (const KnownHost* k = lastHost()) connectTo(*k);
+                    break;
+                case 1:  // Hosts
+                    if (nav(cur, GamepadButtons::DPadLeft)) inPane = false;
+                    if (nav(cur, GamepadButtons::DPadDown)) hostFocus++;
+                    if (nav(cur, GamepadButtons::DPadUp)) hostFocus--;
+                    if (edge(cur, GamepadButtons::A)) hostsActivate();
+                    break;
+                case 2:  // Apps (informational when idle; live control is in-stream)
+                    if (nav(cur, GamepadButtons::DPadLeft)) inPane = false;
+                    if (nav(cur, GamepadButtons::DPadDown)) appFocus++;
+                    if (nav(cur, GamepadButtons::DPadUp)) appFocus--;
+                    break;
+                case 3: {  // Settings (left/right adjusts, so left does NOT exit)
+                    if (nav(cur, GamepadButtons::DPadDown)) settingsFocus++;
+                    if (nav(cur, GamepadButtons::DPadUp)) settingsFocus--;
+                    settingsFocus = std::clamp(settingsFocus, 0, 2);
+                    int dir = 0;
+                    if (nav(cur, GamepadButtons::DPadRight)) dir = 1;
+                    if (nav(cur, GamepadButtons::DPadLeft)) dir = -1;
+                    if (dir != 0) adjustSetting(dir);
+                    break;
+                }
+            }
+        }
+        prevButtons = cur;
+    }
+
+    void adjustSetting(int dir) {
+        auto cycle = [&](int v, size_t n) {
+            return (v + dir + static_cast<int>(n)) % static_cast<int>(n);
+        };
+        if (settingsFocus == 0) settings.res = cycle(settings.res, std::size(kResValues));
+        else if (settingsFocus == 1)
+            settings.bitrate = cycle(settings.bitrate, std::size(kBitrateMbps));
+        else settings.fps = cycle(settings.fps, std::size(kFpsValues));
+        settings.save(settingsPath);
+        settings.apply(g_stream.load());  // live-tune if streaming
+    }
+
+    void updatePinInput(GamepadReading const& r) {
+        const GamepadButtons cur = r.Buttons;
+        if (!pairBusy) {
+            if (nav(cur, GamepadButtons::DPadRight) && pinFocus % 3 < 2) pinFocus++;
+            if (nav(cur, GamepadButtons::DPadLeft) && pinFocus % 3 > 0) pinFocus--;
+            if (nav(cur, GamepadButtons::DPadDown) && pinFocus / 3 < 3) pinFocus += 3;
+            if (nav(cur, GamepadButtons::DPadUp) && pinFocus / 3 > 0) pinFocus -= 3;
+            if (edge(cur, GamepadButtons::A)) pinActivate();
+            if (edge(cur, GamepadButtons::B)) { screen = Screen::Shell; status.clear(); }
         }
         prevButtons = cur;
     }
@@ -774,20 +944,25 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
             }
 
             try {
+                {
+                    std::lock_guard<std::mutex> lk(g_appsMx);
+                    appsNow = g_apps;
+                }
                 auto pads = Gamepad::Gamepads();
                 if (pads.Size() > 0) {
                     auto r = pads.GetAt(0).GetCurrentReading();
-                    if (settingsOpen) {
-                        updateSettingsInput(r);
-                    } else if (screen == Screen::Streaming) {
-                        if (streamMenuOpen) {
-                            updateStreamMenuInput(r);
-                        } else {
+                    if (screen == Screen::Streaming) {
+                        if (appsOpen) updateAppsModalInput(r);
+                        else if (settingsOpen) updateSettingsInput(r);
+                        else if (streamMenuOpen) updateStreamMenuInput(r);
+                        else {
                             if (s) forwardPad(s, r);
                             prevButtons = r.Buttons;
                         }
+                    } else if (screen == Screen::Pin) {
+                        updatePinInput(r);
                     } else {
-                        updateUiInput(r);
+                        updateShellInput(r);
                     }
                 }
                 if (screen == Screen::Pin) pollPairResult();
@@ -805,15 +980,9 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
             if (!haveVideo) gfx.clear(back.get(), 0.106f, 0.165f, 0.255f);
 
             if (uiReady) try {
-                if (settingsOpen) {
-                    UiSettingsModel sm;
-                    sm.rows = {{L"Resolution", settings.resText()},
-                               {L"Max bitrate", settings.bitrateText()},
-                               {L"Max framerate", settings.fpsText()}};
-                    sm.focus = settingsFocus;
-                    ui.drawSettings(sm);
-                } else if (screen == Screen::Hosts) ui.drawHosts(hostsModel());
-                else if (screen == Screen::Pin) {
+                if (screen == Screen::Shell) {
+                    ui.drawShell(shellModel());
+                } else if (screen == Screen::Pin) {
                     UiPinModel pm;
                     pm.title = L"Pair with " +
                                widen(pinTarget.alias.empty() ? pinTarget.instance : pinTarget.alias);
@@ -822,14 +991,35 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
                     pm.busy = pairBusy;
                     pm.status = pinStatus;
                     ui.drawPin(pm);
+                } else if (screen == Screen::Streaming && appsOpen) {
+                    UiMenuModel mm;
+                    mm.title = L"APPS";
+                    mm.hint = L"A Launch/Switch   X End   B Back";
+                    if (appsNow.empty()) mm.items = {L"(no apps published by this host)"};
+                    else
+                        for (const auto& a : appsNow)
+                            mm.items.push_back(widen(a.name) +
+                                               (a.running ? L"  \x2022 running" : L""));
+                    mm.focus = appsModalFocus;
+                    ui.drawStreamMenu(mm);
+                } else if (screen == Screen::Streaming && settingsOpen) {
+                    UiSettingsModel sm;
+                    sm.rows = {{L"Resolution", settings.resText()},
+                               {L"Max bitrate", settings.bitrateText()},
+                               {L"Max framerate", settings.fpsText()}};
+                    sm.focus = settingsFocus;
+                    ui.drawSettings(sm);
                 } else if (screen == Screen::Streaming && streamMenuOpen) {
                     UiMenuModel mm;
-                    mm.items = {L"Resume", L"Settings", L"Disconnect", L"Exit Trireme"};
+                    mm.items = {L"Resume", L"Apps", L"Settings", L"Disconnect", L"Exit Trireme"};
                     mm.focus = streamMenuFocus;
                     ui.drawStreamMenu(mm);
-                } else if (screen == Screen::Streaming &&
-                           (now() - streamStartAt < 5.0 || g_degraded.load())) {
-                    ui.drawOverlay(overlayModel());
+                } else if (screen == Screen::Streaming) {
+                    // Stats overlay for the first seconds / on degradation, and
+                    // host notices (toasts) whenever fresh.
+                    const bool freshNotice = now() - g_noticeAt.load() < 4.0;
+                    if (now() - streamStartAt < 5.0 || g_degraded.load() || freshNotice)
+                        ui.drawOverlay(overlayModel(freshNotice));
                 }
             } catch (hresult_error const& e) {
                 char b[16];

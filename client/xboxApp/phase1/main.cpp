@@ -230,7 +230,7 @@ void workerInner(std::filesystem::path localState) {
     TriremeStream* h =
         trireme_start(streamAddr.c_str(), pubkey.empty() ? nullptr : pubkey.c_str(),
                       idPath.c_str(), width, height, refresh, nullptr, onFrame, onEnd,
-                      onLinkHealth, nullptr, onAudio);
+                      onLinkHealth, nullptr, onAudio, nullptr, nullptr, nullptr);
     if (!h) {
         verdict(false, "trireme_start returned null");
         return;

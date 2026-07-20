@@ -37,6 +37,22 @@ pub type FrameCallback = extern "C" fn(ctx: *mut c_void, data: *const u8, len: u
 pub type AudioCallback = extern "C" fn(ctx: *mut c_void, data: *const u8, len: usize);
 /// Stream ended. `error` is NUL-terminated UTF-8, or null for a clean close.
 pub type EndCallback = extern "C" fn(ctx: *mut c_void, error: *const c_char);
+/// The host's app catalog (replaces any previous). Strings are valid only for
+/// the duration of the call — copy out. Fired on the QUIC thread; never block.
+pub type CatalogCallback =
+    extern "C" fn(ctx: *mut c_void, apps: *const TriremeAppInfo, count: usize);
+/// A transient host status note (toast), NUL-terminated UTF-8.
+pub type NoticeCallback = extern "C" fn(ctx: *mut c_void, message: *const c_char);
+
+/// One host app catalog entry, C view. `art` (PNG bytes) is omitted for now —
+/// the Xbox shell renders text tiles.
+#[repr(C)]
+pub struct TriremeAppInfo {
+    pub id: *const c_char,
+    pub name: *const c_char,
+    pub kind: u8,
+    pub running: bool,
+}
 /// Host link-health heartbeat (~2x/s): `true` while the host is shedding video.
 pub type LinkHealthCallback = extern "C" fn(ctx: *mut c_void, degraded: bool);
 
@@ -81,6 +97,44 @@ unsafe impl Sync for CAudioSink {}
 impl AudioSink for CAudioSink {
     fn on_packet(&self, opus: Vec<u8>) {
         (self.on_packet)(self.ctx, opus.as_ptr(), opus.len());
+    }
+}
+
+struct CCatalogSink {
+    ctx: *mut c_void,
+    on_catalog: CatalogCallback,
+    on_notice: NoticeCallback,
+}
+unsafe impl Send for CCatalogSink {}
+unsafe impl Sync for CCatalogSink {}
+
+impl core_ffi::AppCatalogSink for CCatalogSink {
+    fn on_catalog(&self, apps: Vec<core_ffi::AppInfo>) {
+        // Marshal to C: keep the CStrings alive for the duration of the call.
+        let strings: Vec<(std::ffi::CString, std::ffi::CString)> = apps
+            .iter()
+            .map(|a| {
+                (
+                    std::ffi::CString::new(a.id.as_str()).unwrap_or_default(),
+                    std::ffi::CString::new(a.name.as_str()).unwrap_or_default(),
+                )
+            })
+            .collect();
+        let c_apps: Vec<TriremeAppInfo> = apps
+            .iter()
+            .zip(&strings)
+            .map(|(a, (id, name))| TriremeAppInfo {
+                id: id.as_ptr(),
+                name: name.as_ptr(),
+                kind: a.kind,
+                running: a.running,
+            })
+            .collect();
+        (self.on_catalog)(self.ctx, c_apps.as_ptr(), c_apps.len());
+    }
+    fn on_notice(&self, message: String) {
+        let c = std::ffi::CString::new(message).unwrap_or_default();
+        (self.on_notice)(self.ctx, c.as_ptr());
     }
 }
 
@@ -218,6 +272,9 @@ pub unsafe extern "C" fn trireme_start(
     on_link_health: LinkHealthCallback,
     audio_ctx: *mut c_void,
     on_audio: Option<extern "C" fn(ctx: *mut c_void, data: *const u8, len: usize)>,
+    catalog_ctx: *mut c_void,
+    on_catalog: Option<extern "C" fn(ctx: *mut c_void, apps: *const TriremeAppInfo, count: usize)>,
+    on_notice: Option<extern "C" fn(ctx: *mut c_void, message: *const c_char)>,
 ) -> *mut TriremeStream {
     let addr = cstr_req(addr);
     if addr.is_empty() {
@@ -236,6 +293,15 @@ pub unsafe extern "C" fn trireme_start(
             on_packet: cb,
         }) as Box<dyn AudioSink>
     });
+    // Catalog + notice callbacks travel together; both must be set to enable.
+    let catalog_sink: Option<Box<dyn core_ffi::AppCatalogSink>> = match (on_catalog, on_notice) {
+        (Some(c), Some(n)) => Some(Box::new(CCatalogSink {
+            ctx: catalog_ctx,
+            on_catalog: c,
+            on_notice: n,
+        })),
+        _ => None,
+    };
 
     let gp = start_video_stream(
         addr,
@@ -245,7 +311,7 @@ pub unsafe extern "C" fn trireme_start(
         frame_sink,
         audio_sink,
         None, // gyro_sink   (Xbox pads have no IMU relay yet)
-        None, // app_catalog (Phase 6)
+        catalog_sink,
         None, // clipboard   (Phase 6)
         false,
         StreamMode {
@@ -321,6 +387,32 @@ pub unsafe extern "C" fn trireme_pad_button(
 pub unsafe extern "C" fn trireme_pad_axis(h: *mut TriremeStream, slot: u8, axis: u8, value: f32) {
     if let Some(s) = h.as_ref() {
         s.gp.axis(slot, axis, value);
+    }
+}
+
+// --- Host app catalog control (Apps grid) -----------------------------------
+
+/// Launch a host app by catalog id (from a [`TriremeAppInfo`]).
+#[no_mangle]
+pub unsafe extern "C" fn trireme_app_launch(h: *mut TriremeStream, id: *const c_char) {
+    if let (Some(s), Some(id)) = (h.as_ref(), cstr_opt(id)) {
+        s.gp.launch_app(id);
+    }
+}
+
+/// Switch to (raise + focus) a running host app by catalog id.
+#[no_mangle]
+pub unsafe extern "C" fn trireme_app_switch(h: *mut TriremeStream, id: *const c_char) {
+    if let (Some(s), Some(id)) = (h.as_ref(), cstr_opt(id)) {
+        s.gp.switch_to(id);
+    }
+}
+
+/// End (kill) a running host app by catalog id.
+#[no_mangle]
+pub unsafe extern "C" fn trireme_app_end(h: *mut TriremeStream, id: *const c_char) {
+    if let (Some(s), Some(id)) = (h.as_ref(), cstr_opt(id)) {
+        s.gp.end_process(id);
     }
 }
 
