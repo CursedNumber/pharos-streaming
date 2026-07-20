@@ -123,6 +123,27 @@ bool VideoPipeline::Impl::ensureVproc(uint32_t ow, uint32_t oh) {
     cd.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
     if (!ok(vdev->CreateVideoProcessorEnumerator(&cd, venum.put()), "CreateVPEnum")) return false;
     if (!ok(vdev->CreateVideoProcessor(venum.get(), 0, vproc.put()), "CreateVP")) return false;
+
+    // Sample only the real frame: the decoder's textures are padded up to its
+    // alignment (e.g. 1080 -> 1088 rows) and the padding is uninitialized
+    // (renders as green). Letterbox into the backbuffer on aspect mismatch,
+    // with black bars via the output background color.
+    RECT src{0, 0, static_cast<LONG>(fw), static_cast<LONG>(fh)};
+    vctx->VideoProcessorSetStreamSourceRect(vproc.get(), 0, TRUE, &src);
+    LONG dw = ow, dh = oh, dx = 0, dy = 0;
+    const uint64_t fitW = static_cast<uint64_t>(fw) * oh, fitH = static_cast<uint64_t>(fh) * ow;
+    if (fitW > fitH) {  // wider than the screen: bars top/bottom
+        dh = static_cast<LONG>(fitH / fw); dy = (static_cast<LONG>(oh) - dh) / 2;
+    } else if (fitH > fitW) {  // taller: bars left/right
+        dw = static_cast<LONG>(fitW / fh); dx = (static_cast<LONG>(ow) - dw) / 2;
+    }
+    RECT dst{dx, dy, dx + dw, dy + dh};
+    vctx->VideoProcessorSetStreamDestRect(vproc.get(), 0, TRUE, &dst);
+    RECT tgt{0, 0, static_cast<LONG>(ow), static_cast<LONG>(oh)};
+    vctx->VideoProcessorSetOutputTargetRect(vproc.get(), TRUE, &tgt);
+    D3D11_VIDEO_COLOR bg{};
+    bg.RGBA = {0.f, 0.f, 0.f, 1.f};
+    vctx->VideoProcessorSetOutputBackgroundColor(vproc.get(), FALSE, &bg);
     return true;
 }
 
