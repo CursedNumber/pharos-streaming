@@ -93,6 +93,11 @@ void trireme_pad_button(TriremeStream *h, uint8_t slot, uint8_t button, bool pre
 void trireme_pad_axis(TriremeStream *h, uint8_t slot, uint8_t axis, float value);
 
 // Keyboard scancode (for a paired USB/BT keyboard; couch UI shortcuts).
+// Live stream preferences (Auto = 0 everywhere; applied by the QoS loop ~1s).
+void trireme_set_resolution_pref(TriremeStream *h, uint32_t target_h, uint32_t floor_h);
+void trireme_set_bitrate_pref(TriremeStream *h, uint32_t min_kbps, uint32_t max_kbps);
+void trireme_set_fps_pref(TriremeStream *h, uint32_t min_fps, uint32_t max_fps);
+
 void trireme_key(TriremeStream *h, uint32_t scancode, bool pressed);
 
 // Relative pointer motion (right-stick-as-cursor, or a paired mouse).

@@ -321,6 +321,51 @@ void pairWorker(PairJob job, std::string pin, std::string idPath) {
     g_pairJob = std::move(job);
 }
 
+// --- settings ---------------------------------------------------------------
+//
+// Mirrors the Android sliders: resolution / bitrate / fps caps, Auto = 0.
+// Stored as indices into the value tables; persisted in LocalState\settings.txt.
+
+constexpr uint32_t kResValues[] = {0, 720, 1080, 1440, 2160};
+constexpr uint32_t kBitrateMbps[] = {0, 10, 20, 30, 50, 80, 100, 150, 200, 300};
+constexpr uint32_t kFpsValues[] = {0, 30, 60, 120};
+
+struct AppSettings {
+    int res = 0, bitrate = 0, fps = 0;  // indices; 0 = Auto
+
+    static AppSettings load(const std::filesystem::path& p) {
+        AppSettings s;
+        auto cfg = readConfig(p);
+        s.res = std::clamp(atoi(cfgOr(cfg, "res", "0").c_str()), 0,
+                           static_cast<int>(std::size(kResValues)) - 1);
+        s.bitrate = std::clamp(atoi(cfgOr(cfg, "bitrate", "0").c_str()), 0,
+                               static_cast<int>(std::size(kBitrateMbps)) - 1);
+        s.fps = std::clamp(atoi(cfgOr(cfg, "fps", "0").c_str()), 0,
+                           static_cast<int>(std::size(kFpsValues)) - 1);
+        return s;
+    }
+    void save(const std::filesystem::path& p) const {
+        std::ofstream f(p, std::ios::trunc);
+        f << "res=" << res << "\nbitrate=" << bitrate << "\nfps=" << fps << "\n";
+    }
+    // Push onto a live stream (the QoS loop re-sends within ~1s).
+    void apply(TriremeStream* s) const {
+        if (!s) return;
+        trireme_set_resolution_pref(s, kResValues[res], 0);
+        trireme_set_bitrate_pref(s, 0, kBitrateMbps[bitrate] * 1000);
+        trireme_set_fps_pref(s, 0, kFpsValues[fps]);
+    }
+    std::wstring resText() const {
+        return res == 0 ? L"Auto" : std::to_wstring(kResValues[res]) + L"p";
+    }
+    std::wstring bitrateText() const {
+        return bitrate == 0 ? L"Auto" : std::to_wstring(kBitrateMbps[bitrate]) + L" Mbps";
+    }
+    std::wstring fpsText() const {
+        return fps == 0 ? L"Auto" : std::to_wstring(kFpsValues[fps]) + L" fps";
+    }
+};
+
 // --- app --------------------------------------------------------------------
 
 enum class Screen { Hosts, Pin, Streaming };
@@ -366,6 +411,12 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
     bool streamMenuOpen = false;
     int streamMenuFocus = 0;
 
+    // Settings overlay (over Hosts or over the stream menu).
+    AppSettings settings;
+    std::filesystem::path settingsPath;
+    bool settingsOpen = false;
+    int settingsFocus = 0;
+
     GamepadButtons prevButtons{};
     double navNextAt = 0;
 
@@ -407,7 +458,7 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
     // --- hosts screen -------------------------------------------------------
 
     struct Row {
-        enum Kind { Known, Disco, Exit } kind;
+        enum Kind { Known, Disco, Settings, Exit } kind;
         size_t idx = 0;
     };
     std::vector<Row> rows;  // rebuilt each frame alongside the UI model
@@ -430,6 +481,11 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
             rows.push_back({Row::Disco, i});
             m.rows.push_back({widen(d.alias.empty() ? d.instance : d.alias), widen(d.addr), L"new"});
         }
+        rows.push_back({Row::Settings, 0});
+        m.rows.push_back({L"Settings",
+                          settings.resText() + L" / " + settings.bitrateText() + L" / " +
+                              settings.fpsText(),
+                          L""});
         rows.push_back({Row::Exit, 0});
         m.rows.push_back({L"Exit Trireme", L"", L""});
         focus = std::clamp(focus, 0, static_cast<int>(rows.size()) - 1);
@@ -442,6 +498,11 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
         if (rows.empty()) return;
         const Row r = rows[static_cast<size_t>(focus)];
         if (r.kind == Row::Exit) { quit = true; return; }
+        if (r.kind == Row::Settings) {
+            settingsOpen = true;
+            settingsFocus = 0;
+            return;
+        }
         g_userActive = true;
         if (r.kind == Row::Known) {
             const auto& k = known[r.idx];
@@ -512,6 +573,7 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
         screen = Screen::Streaming;
         streamStartAt = now();
         status.clear();
+        settings.apply(g_stream.load());  // assert saved caps on every connect
     }
 
     // Send neutral state for everything currently forwarded as active — called
@@ -607,7 +669,7 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
 
     void updateStreamMenuInput(GamepadReading const& r) {
         const GamepadButtons cur = r.Buttons;
-        constexpr int kItems = 3;  // Resume / Disconnect / Exit
+        constexpr int kItems = 4;  // Resume / Settings / Disconnect / Exit
         if (nav(cur, GamepadButtons::DPadDown)) streamMenuFocus++;
         if (nav(cur, GamepadButtons::DPadUp)) streamMenuFocus--;
         streamMenuFocus = std::clamp(streamMenuFocus, 0, kItems - 1);
@@ -617,9 +679,34 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
         } else if (edge(cur, GamepadButtons::A)) {
             shellLog("menu: activate item " + std::to_string(streamMenuFocus));
             if (streamMenuFocus == 0) streamMenuOpen = false;
-            else if (streamMenuFocus == 1) stopStream(L"disconnected");
+            else if (streamMenuFocus == 1) { settingsOpen = true; settingsFocus = 0; }
+            else if (streamMenuFocus == 2) stopStream(L"disconnected");
             else quit = true;
         }
+        prevButtons = cur;
+    }
+
+    void updateSettingsInput(GamepadReading const& r) {
+        const GamepadButtons cur = r.Buttons;
+        constexpr int kRows = 3;
+        if (nav(cur, GamepadButtons::DPadDown)) settingsFocus++;
+        if (nav(cur, GamepadButtons::DPadUp)) settingsFocus--;
+        settingsFocus = std::clamp(settingsFocus, 0, kRows - 1);
+        int dir = 0;
+        if (nav(cur, GamepadButtons::DPadRight)) dir = 1;
+        if (nav(cur, GamepadButtons::DPadLeft)) dir = -1;
+        if (dir != 0) {
+            auto cycle = [&](int v, size_t n) {
+                return (v + dir + static_cast<int>(n)) % static_cast<int>(n);
+            };
+            if (settingsFocus == 0) settings.res = cycle(settings.res, std::size(kResValues));
+            else if (settingsFocus == 1)
+                settings.bitrate = cycle(settings.bitrate, std::size(kBitrateMbps));
+            else settings.fps = cycle(settings.fps, std::size(kFpsValues));
+            settings.save(settingsPath);
+            settings.apply(g_stream.load());  // live-tune if streaming
+        }
+        if (edge(cur, GamepadButtons::B)) settingsOpen = false;
         prevButtons = cur;
     }
 
@@ -664,6 +751,8 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
         idPath = (localState / "identity.toml").string();
         hostsPath = localState / "hosts.txt";
         known = loadHosts(hostsPath);
+        settingsPath = localState / "settings.txt";
+        settings = AppSettings::load(settingsPath);
         shellLog("known hosts: " + std::to_string(known.size()));
 
         disco.start();
@@ -688,7 +777,9 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
                 auto pads = Gamepad::Gamepads();
                 if (pads.Size() > 0) {
                     auto r = pads.GetAt(0).GetCurrentReading();
-                    if (screen == Screen::Streaming) {
+                    if (settingsOpen) {
+                        updateSettingsInput(r);
+                    } else if (screen == Screen::Streaming) {
                         if (streamMenuOpen) {
                             updateStreamMenuInput(r);
                         } else {
@@ -714,7 +805,14 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
             if (!haveVideo) gfx.clear(back.get(), 0.106f, 0.165f, 0.255f);
 
             if (uiReady) try {
-                if (screen == Screen::Hosts) ui.drawHosts(hostsModel());
+                if (settingsOpen) {
+                    UiSettingsModel sm;
+                    sm.rows = {{L"Resolution", settings.resText()},
+                               {L"Max bitrate", settings.bitrateText()},
+                               {L"Max framerate", settings.fpsText()}};
+                    sm.focus = settingsFocus;
+                    ui.drawSettings(sm);
+                } else if (screen == Screen::Hosts) ui.drawHosts(hostsModel());
                 else if (screen == Screen::Pin) {
                     UiPinModel pm;
                     pm.title = L"Pair with " +
@@ -726,7 +824,7 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
                     ui.drawPin(pm);
                 } else if (screen == Screen::Streaming && streamMenuOpen) {
                     UiMenuModel mm;
-                    mm.items = {L"Resume", L"Disconnect", L"Exit Trireme"};
+                    mm.items = {L"Resume", L"Settings", L"Disconnect", L"Exit Trireme"};
                     mm.focus = streamMenuFocus;
                     ui.drawStreamMenu(mm);
                 } else if (screen == Screen::Streaming &&

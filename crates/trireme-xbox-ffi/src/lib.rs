@@ -324,6 +324,46 @@ pub unsafe extern "C" fn trireme_pad_axis(h: *mut TriremeStream, slot: u8, axis:
     }
 }
 
+// --- Live stream preferences (settings screen) -----------------------------
+//
+// All three mirror the Android sliders: live atomics the QoS loop re-sends each
+// tick, so changes apply mid-stream within ~1s. `0` = Auto everywhere.
+
+/// Desired resolution range: `target_h` = ceiling coded height (0 = host
+/// native), `floor_h` = lowest rung auto-downscale may reach (0 = no floor).
+#[no_mangle]
+pub unsafe extern "C" fn trireme_set_resolution_pref(
+    h: *mut TriremeStream,
+    target_h: u32,
+    floor_h: u32,
+) {
+    if let Some(s) = h.as_ref() {
+        s.gp.set_resolution_pref(target_h, floor_h);
+    }
+}
+
+/// Desired bitrate range in kbps: `max_kbps` = cap (0 = uncapped/Auto),
+/// `min_kbps` = floor the adaptive ladder should hold (0 = none).
+#[no_mangle]
+pub unsafe extern "C" fn trireme_set_bitrate_pref(
+    h: *mut TriremeStream,
+    min_kbps: u32,
+    max_kbps: u32,
+) {
+    if let Some(s) = h.as_ref() {
+        s.gp.set_bitrate_pref(min_kbps, max_kbps);
+    }
+}
+
+/// Desired framerate range: `max_fps` = cap (0 = Auto/panel), `min_fps` =
+/// adaptation floor (0 = none).
+#[no_mangle]
+pub unsafe extern "C" fn trireme_set_fps_pref(h: *mut TriremeStream, min_fps: u32, max_fps: u32) {
+    if let Some(s) = h.as_ref() {
+        s.gp.set_fps_pref(min_fps, max_fps);
+    }
+}
+
 /// Keyboard scancode (for a paired USB/BT keyboard; couch UI shortcuts).
 #[no_mangle]
 pub unsafe extern "C" fn trireme_key(h: *mut TriremeStream, scancode: u32, pressed: bool) {

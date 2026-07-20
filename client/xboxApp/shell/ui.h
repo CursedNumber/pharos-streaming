@@ -45,6 +45,17 @@ struct UiMenuModel {
     int focus = 0;
 };
 
+struct UiSettingsRow {
+    std::wstring label;
+    std::wstring value;  // shown as "< value >" on the focused row
+};
+
+struct UiSettingsModel {
+    std::vector<UiSettingsRow> rows;
+    int focus = 0;
+    std::wstring hint;
+};
+
 class UiRenderer {
 public:
     bool init(ID3D11Device* device, IDXGISwapChain1* swap, uint32_t w, uint32_t h);
@@ -52,6 +63,7 @@ public:
     void drawPin(const UiPinModel& m);
     void drawOverlay(const UiOverlayModel& m);
     void drawStreamMenu(const UiMenuModel& m);
+    void drawSettings(const UiSettingsModel& m);
     void shutdown();
 
 private:

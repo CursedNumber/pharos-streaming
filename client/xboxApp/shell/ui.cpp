@@ -281,6 +281,39 @@ void UiRenderer::drawStreamMenu(const UiMenuModel& m) {
     I.ctx->EndDraw();
 }
 
+void UiRenderer::drawSettings(const UiSettingsModel& m) {
+    if (!p_) return;
+    auto& I = *p_;
+    const float s = I.s;
+    I.ctx->BeginDraw();
+    I.fillRect({0, 0, I.w, I.h}, kScrim);
+
+    const float pw = 720 * s, rowH = 92 * s, gap = 14 * s;
+    const float ph = 120 * s + m.rows.size() * (rowH + gap) + 70 * s;
+    const float px = (I.w - pw) / 2, py = (I.h - ph) / 2;
+    I.fillRect({px, py, px + pw, py + ph}, kBg, 16 * s);
+    I.strokeRect({px, py, px + pw, py + ph}, kGold, 2.f * s, 16 * s);
+    I.text(L"SETTINGS", I.fmtCenter.get(), {px, py + 20 * s, px + pw, py + 90 * s}, kGold);
+
+    float y = py + 110 * s;
+    for (size_t i = 0; i < m.rows.size(); ++i) {
+        const bool focused = static_cast<int>(i) == m.focus;
+        D2D1_RECT_F r{px + 32 * s, y, px + pw - 32 * s, y + rowH};
+        I.fillRect(r, focused ? kPanelHi : kPanel, 10 * s);
+        if (focused) I.strokeRect(r, kGold, 3.f * s, 10 * s);
+        I.text(m.rows[i].label, I.fmtRow.get(),
+               {r.left + 28 * s, r.top + 26 * s, r.right, r.bottom}, kText);
+        const std::wstring v =
+            focused ? L"\x2039 " + m.rows[i].value + L" \x203A" : m.rows[i].value;
+        I.text(v, I.fmtSmallRight.get(), {r.left, r.top, r.right - 28 * s, r.bottom},
+               focused ? kGold : kDim);
+        y += rowH + gap;
+    }
+    I.text(m.hint.empty() ? L"D-pad Adjust   B Back" : m.hint, I.fmtCenterSmall.get(),
+           {px, y + 8 * s, px + pw, y + 48 * s}, kDim);
+    I.ctx->EndDraw();
+}
+
 void UiRenderer::shutdown() {
     delete p_;
     p_ = nullptr;
