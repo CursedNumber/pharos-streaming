@@ -26,6 +26,8 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <csignal>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -60,6 +62,35 @@ void shellLog(const std::string& msg) {
 }
 
 namespace {
+
+// Last-gasp crash reporter: an access violation on ANY thread lands here
+// before the process dies; name the module + offset so the log tells us where.
+// (Rust panic=abort uses __fastfail, which bypasses this — the panic hook set
+// via trireme_set_panic_log covers that side.)
+LONG WINAPI crashFilter(EXCEPTION_POINTERS* ep) {
+    auto* er = ep->ExceptionRecord;
+    void* addr = er->ExceptionAddress;
+    char modName[192] = "?";
+    void* base = nullptr;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(addr, &mbi, sizeof(mbi)) && mbi.AllocationBase) {
+        base = mbi.AllocationBase;
+        GetModuleFileNameA(static_cast<HMODULE>(base), modName, sizeof(modName));
+    }
+    char buf[384];
+    snprintf(buf, sizeof(buf), "CRASH: code=0x%08X addr=%p module=%s rva=0x%llx",
+             static_cast<unsigned>(er->ExceptionCode), addr, modName,
+             static_cast<unsigned long long>(static_cast<char*>(addr) -
+                                             static_cast<char*>(base)));
+    shellLog(buf);
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2) {
+        snprintf(buf, sizeof(buf), "CRASH: AV %s address %p",
+                 er->ExceptionInformation[0] ? "writing" : "reading",
+                 reinterpret_cast<void*>(er->ExceptionInformation[1]));
+        shellLog(buf);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 
 void check(HRESULT hr, const char* what) {
     if (FAILED(hr)) {
@@ -198,11 +229,21 @@ std::atomic<bool> g_userActive{false};  // UI took over; auto-connect stands dow
 std::mutex g_endMx;
 std::string g_endReason;
 
-void onFrame(void* ctx, const uint8_t* data, uintptr_t len) {
-    static_cast<VideoPipeline*>(ctx)->submit(data, static_cast<size_t>(len));
+// These fire on the Rust QUIC thread: a C++ exception here would unwind
+// through Rust frames (UB/abort), so swallow and log.
+void onFrame(void* ctx, const uint8_t* data, uintptr_t len) noexcept {
+    try {
+        static_cast<VideoPipeline*>(ctx)->submit(data, static_cast<size_t>(len));
+    } catch (...) {
+        shellLog("onFrame threw");
+    }
 }
-void onAudio(void* ctx, const uint8_t* data, uintptr_t len) {
-    static_cast<AudioPipeline*>(ctx)->submit(data, static_cast<size_t>(len));
+void onAudio(void* ctx, const uint8_t* data, uintptr_t len) noexcept {
+    try {
+        static_cast<AudioPipeline*>(ctx)->submit(data, static_cast<size_t>(len));
+    } catch (...) {
+        shellLog("onAudio threw");
+    }
 }
 void onEnd(void*, const char* err) {
     shellLog(std::string("stream ended: ") + (err ? err : "(clean)"));
@@ -335,6 +376,19 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
     void SetWindow(CoreWindow const& w) {
         window = w;
         w.Closed([this](auto&&, auto&&) { quit = true; });
+        // Lifecycle telemetry: if the system yanks us (suspend/background), the
+        // log shows it — distinguishes an external kill from an internal crash.
+        w.VisibilityChanged([](auto&&, VisibilityChangedEventArgs const& a) {
+            shellLog(std::string("window visibility: ") + (a.Visible() ? "visible" : "HIDDEN"));
+        });
+        w.Activated([](auto&&, WindowActivatedEventArgs const& a) {
+            shellLog("window activation: " +
+                     std::to_string(static_cast<int>(a.WindowActivationState())));
+        });
+        CoreApplication::Suspending([](auto&&, auto&&) { shellLog("PLM: SUSPENDING"); });
+        CoreApplication::Resuming([](auto&&, auto&&) { shellLog("PLM: resuming"); });
+        CoreApplication::EnteredBackground([](auto&&, auto&&) { shellLog("PLM: entered background"); });
+        CoreApplication::LeavingBackground([](auto&&, auto&&) { shellLog("PLM: leaving background"); });
     }
 
     static double now() {
@@ -474,13 +528,18 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
             trireme_pad_connect(s, 0, 0x045E, 0x0B12);  // Xbox Series pad ids
             pad.connected = true;
         }
-        // View+B chord opens the in-stream menu; everything else forwards.
+        // View+LB opens the in-stream menu; everything else forwards. NOT
+        // View+B: that is Dev Mode's reserved "return to Dev Home" chord (the
+        // system terminates the app externally — no in-process trap sees it).
+        // Not LS+RS either: games bind stick-clicks (sprint/ultimates).
         const bool view = (r.Buttons & GamepadButtons::View) == GamepadButtons::View;
-        const bool bBtn = (r.Buttons & GamepadButtons::B) == GamepadButtons::B;
-        if (view && bBtn) {
+        const bool lb = (r.Buttons & GamepadButtons::LeftShoulder) == GamepadButtons::LeftShoulder;
+        if (view && lb) {
+            shellLog("menu: View+LB chord — releasing forwarded input");
             releaseForwarded(s);
             streamMenuOpen = true;
             streamMenuFocus = 0;
+            shellLog("menu: open");
             return;
         }
 
@@ -526,7 +585,7 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
            << g_audio.packets();
         if (g_audio.underruns() > 0) ss << L" (" << g_audio.underruns() << L" underruns)";
         if (m.degraded) ss << L"   LINK DEGRADED";
-        else ss << L"   View+B menu";
+        else ss << L"   View+LB menu";
         m.line = ss.str();
         return m;
     }
@@ -552,8 +611,11 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
         if (nav(cur, GamepadButtons::DPadDown)) streamMenuFocus++;
         if (nav(cur, GamepadButtons::DPadUp)) streamMenuFocus--;
         streamMenuFocus = std::clamp(streamMenuFocus, 0, kItems - 1);
-        if (edge(cur, GamepadButtons::B)) streamMenuOpen = false;
-        else if (edge(cur, GamepadButtons::A)) {
+        if (edge(cur, GamepadButtons::B)) {
+            shellLog("menu: closed (B)");
+            streamMenuOpen = false;
+        } else if (edge(cur, GamepadButtons::A)) {
+            shellLog("menu: activate item " + std::to_string(streamMenuFocus));
             if (streamMenuFocus == 0) streamMenuOpen = false;
             else if (streamMenuFocus == 1) stopStream(L"disconnected");
             else quit = true;
@@ -622,28 +684,36 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
                 s = nullptr;
             }
 
-            auto pads = Gamepad::Gamepads();
-            if (pads.Size() > 0) {
-                auto r = pads.GetAt(0).GetCurrentReading();
-                if (screen == Screen::Streaming) {
-                    if (streamMenuOpen) {
-                        updateStreamMenuInput(r);
+            try {
+                auto pads = Gamepad::Gamepads();
+                if (pads.Size() > 0) {
+                    auto r = pads.GetAt(0).GetCurrentReading();
+                    if (screen == Screen::Streaming) {
+                        if (streamMenuOpen) {
+                            updateStreamMenuInput(r);
+                        } else {
+                            if (s) forwardPad(s, r);
+                            prevButtons = r.Buttons;
+                        }
                     } else {
-                        if (s) forwardPad(s, r);
-                        prevButtons = r.Buttons;
+                        updateUiInput(r);
                     }
-                } else {
-                    updateUiInput(r);
                 }
+                if (screen == Screen::Pin) pollPairResult();
+            } catch (hresult_error const& e) {
+                char b[16];
+                snprintf(b, sizeof(b), "0x%08X", static_cast<uint32_t>(e.code()));
+                shellLog(std::string("input handling threw ") + b);
+            } catch (...) {
+                shellLog("input handling threw (unknown)");
             }
-            if (screen == Screen::Pin) pollPairResult();
 
             auto back = gfx.backbuffer();
             const bool haveVideo =
                 screen == Screen::Streaming && g_video.blitLatest(back.get(), gfx.width, gfx.height);
             if (!haveVideo) gfx.clear(back.get(), 0.106f, 0.165f, 0.255f);
 
-            if (uiReady) {
+            if (uiReady) try {
                 if (screen == Screen::Hosts) ui.drawHosts(hostsModel());
                 else if (screen == Screen::Pin) {
                     UiPinModel pm;
@@ -663,6 +733,17 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
                            (now() - streamStartAt < 5.0 || g_degraded.load())) {
                     ui.drawOverlay(overlayModel());
                 }
+            } catch (hresult_error const& e) {
+                char b[16];
+                snprintf(b, sizeof(b), "0x%08X", static_cast<uint32_t>(e.code()));
+                shellLog(std::string("ui draw threw ") + b + " — disabling UI layer");
+                uiReady = false;
+            } catch (std::exception const& e) {
+                shellLog(std::string("ui draw threw: ") + e.what() + " — disabling UI layer");
+                uiReady = false;
+            } catch (...) {
+                shellLog("ui draw threw (unknown) — disabling UI layer");
+                uiReady = false;
             }
             gfx.present();
 
@@ -691,10 +772,36 @@ int __stdcall wWinMain(void*, void*, wchar_t*, int) {
     try {
         std::filesystem::path ls{std::wstring{
             winrt::Windows::Storage::ApplicationData::Current().LocalFolder().Path()}};
-        std::lock_guard<std::mutex> lk(g_logMx);
-        g_log.open(ls / "shell.log", std::ios::trunc);
+        {
+            std::lock_guard<std::mutex> lk(g_logMx);
+            g_log.open(ls / "shell.log", std::ios::trunc);
+        }
+        trireme_set_panic_log((ls / "panic.log").string().c_str());
     } catch (...) {
     }
+    SetUnhandledExceptionFilter(crashFilter);
+    // Uncaught C++ exceptions on background threads (audio graph, DeviceWatcher,
+    // QUIC callbacks) go std::terminate -> __fastfail, which bypasses the SEH
+    // filter AND the Rust panic hook. terminate handlers still run first.
+    std::set_terminate([] {
+        shellLog("TERMINATE: unhandled C++ exception on some thread");
+        if (auto e = std::current_exception()) {
+            try {
+                std::rethrow_exception(e);
+            } catch (hresult_error const& he) {
+                char b[16];
+                snprintf(b, sizeof(b), "0x%08X", static_cast<uint32_t>(he.code()));
+                shellLog(std::string("TERMINATE: hresult_error ") + b + " " +
+                         to_string(he.message()));
+            } catch (std::exception const& se) {
+                shellLog(std::string("TERMINATE: std::exception ") + se.what());
+            } catch (...) {
+                shellLog("TERMINATE: non-std exception");
+            }
+        }
+        std::abort();
+    });
+    signal(SIGABRT, [](int) { shellLog("ABORT: abort() called"); });
     CoreApplication::Run(make<App>());
     return 0;
 }

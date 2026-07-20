@@ -114,7 +114,16 @@ void AudioPipeline::Impl::buildGraph() {
         inNode.AddOutgoingConnection(outNode);
         inNode.QuantumStarted([this](AudioFrameInputNode const& n,
                                      FrameInputNodeQuantumStartedEventArgs const& a) {
-            if (!stopping.load(std::memory_order_relaxed)) onQuantum(n, a.RequiredSamples());
+            // An exception escaping this handler = std::terminate on the audio
+            // graph thread; log instead.
+            try {
+                if (!stopping.load(std::memory_order_relaxed)) onQuantum(n, a.RequiredSamples());
+            } catch (hresult_error const& e) {
+                shellLog("audio: quantum threw 0x" +
+                         std::to_string(static_cast<uint32_t>(e.code())));
+            } catch (...) {
+                shellLog("audio: quantum threw (unknown)");
+            }
         });
         graph.Start();
         graphUp = true;

@@ -31,6 +31,10 @@ extern "C" {
 // goes to stderr, visible in the Visual Studio remote debugger's output.
 void trireme_init_logging(const char *level);
 
+// Route Rust panics into an append-only file before the process aborts (the
+// UWP build is panic=abort, so a background-thread panic is otherwise silent).
+void trireme_set_panic_log(const char *path);
+
 // The "hello core" round-trip target for Phase 0: proves the UWP-target static
 // lib links and runs. Returns the wire protocol version the core speaks.
 uint32_t trireme_protocol_version(void);

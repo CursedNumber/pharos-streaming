@@ -93,14 +93,17 @@ void HostDiscovery::start() {
              L"System.Devices.Dnssd.PortNumber", L"System.Devices.Dnssd.TextAttributes"},
             DeviceInformationKind::AssociationEndpointService);
         p_->addedTok = p_->watcher.Added([impl = p_](auto&&, DeviceInformation const& di) {
-            impl->onSeen(di);
+            try { impl->onSeen(di); } catch (...) {}
         });
         p_->updatedTok = p_->watcher.Updated([impl = p_](auto&&, DeviceInformationUpdate const& u) {
-            impl->onUpdated(u);
+            try { impl->onUpdated(u); } catch (...) {}
         });
         p_->removedTok = p_->watcher.Removed([impl = p_](auto&&, DeviceInformationUpdate const& u) {
-            std::lock_guard<std::mutex> lk(impl->mx);
-            impl->found.erase(to_string(u.Id()));
+            try {
+                std::lock_guard<std::mutex> lk(impl->mx);
+                impl->found.erase(to_string(u.Id()));
+            } catch (...) {
+            }
         });
         p_->watcher.Start();
         shellLog("discovery: watching _pharos._udp");

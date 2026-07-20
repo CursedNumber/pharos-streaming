@@ -121,6 +121,26 @@ pub unsafe extern "C" fn trireme_init_logging(level: *const c_char) {
     core_ffi::init_logging(cstr_opt(level).unwrap_or_else(|| "info".to_string()));
 }
 
+/// Route Rust panics into an append-only file before the process aborts. With
+/// `panic=abort` (the UWP build) a panic on any background thread kills the
+/// process with no trace; the hook still runs first, so this leaves the panic
+/// message + location where the shell's log harvesting can find it.
+#[no_mangle]
+pub unsafe extern "C" fn trireme_set_panic_log(path: *const c_char) {
+    let Some(p) = cstr_opt(path) else { return };
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+        {
+            let _ = writeln!(f, "RUST PANIC: {info}");
+            let _ = f.flush();
+        }
+    }));
+}
+
 /// The "hello core" round-trip target for Phase 0: proves the UWP-target static
 /// lib links and runs. Returns the wire protocol version the core speaks.
 #[no_mangle]
