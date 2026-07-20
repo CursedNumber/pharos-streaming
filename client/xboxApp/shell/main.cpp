@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Pharos/Trireme authors
 //
-// Trireme Xbox client shell. Layer 2: the D3D11 swapchain (layer 1) plus a
-// Media Foundation HEVC decode + present path (video.cpp). It connects to a
-// Pharos host (config from LocalState\stream.txt for now; the D2D UI replaces
-// that in layer 3), feeds access units to the decoder, and blits decoded frames
-// to the swapchain. Debug lines land in LocalState\shell.log.
+// Trireme Xbox client shell. Layer 2: the D3D11 swapchain (layer 1) plus HEVC
+// decode + present (video_ffmpeg.cpp hardware path, video.cpp MF fallback) and
+// Opus audio playback (audio.cpp). It connects to a Pharos host (config from
+// LocalState\stream.txt for now; the D2D UI replaces that in layer 3), feeds
+// access units to the decoder, and blits decoded frames to the swapchain.
+// Debug lines land in LocalState\shell.log.
 
 #include <windows.h>
 
@@ -30,6 +31,7 @@
 #include <string>
 #include <thread>
 
+#include "audio.h"
 #include "trireme_xbox.h"
 #include "video.h"
 
@@ -141,12 +143,17 @@ struct Graphics {
 // --- streaming --------------------------------------------------------------
 
 VideoPipeline g_video;
+AudioPipeline g_audio;
+std::atomic<bool> g_audioUp{false};
 std::atomic<TriremeStream*> g_stream{nullptr};
 std::atomic<bool> g_degraded{false};
 std::atomic<bool> g_ended{false};
 
 void onFrame(void* ctx, const uint8_t* data, uintptr_t len) {
     static_cast<VideoPipeline*>(ctx)->submit(data, static_cast<size_t>(len));
+}
+void onAudio(void* ctx, const uint8_t* data, uintptr_t len) {
+    static_cast<AudioPipeline*>(ctx)->submit(data, static_cast<size_t>(len));
 }
 void onEnd(void*, const char* err) {
     shellLog(std::string("stream ended: ") + (err ? err : "(clean)"));
@@ -190,7 +197,8 @@ void connectWorker(std::filesystem::path localState) {
     }
     TriremeStream* s = trireme_start(streamAddr.c_str(), pubkey.empty() ? nullptr : pubkey.c_str(),
                                      idPath.c_str(), w, h, refresh, &g_video, onFrame, onEnd,
-                                     onLinkHealth, nullptr, nullptr);
+                                     onLinkHealth, g_audioUp.load() ? &g_audio : nullptr,
+                                     g_audioUp.load() ? onAudio : nullptr);
     if (!s) { shellLog("trireme_start returned null"); return; }
     g_stream = s;
     shellLog("stream started");
@@ -229,6 +237,8 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
 
         if (!g_video.init(gfx.device.get(), gfx.context.get()))
             shellLog("video pipeline init FAILED — staying on nav background");
+        g_audioUp = g_audio.init();
+        if (!g_audioUp) shellLog("audio pipeline unavailable — video only");
 
         std::filesystem::path ls{std::wstring{
             winrt::Windows::Storage::ApplicationData::Current().LocalFolder().Path()}};
@@ -249,11 +259,14 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
                 shellLog("decoded=" + std::to_string(d) + " submitted=" +
                          std::to_string(g_video.submitted()) + " " +
                          std::to_string(g_video.frameWidth()) + "x" +
-                         std::to_string(g_video.frameHeight()));
+                         std::to_string(g_video.frameHeight()) + " audio_pkts=" +
+                         std::to_string(g_audio.packets()) + " underruns=" +
+                         std::to_string(g_audio.underruns()));
                 lastLoggedDecoded = d;
             }
         }
         if (auto s = g_stream.exchange(nullptr)) trireme_stop(s);
+        g_audio.shutdown();
         g_video.shutdown();
         shellLog("shell exit");
     }
