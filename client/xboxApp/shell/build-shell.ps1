@@ -70,6 +70,15 @@ if ($useFF) {
 if ($LASTEXITCODE -ne 0) { throw "cl failed ($LASTEXITCODE)" }
 
 Copy-Item (Join-Path $srcDir "AppxManifest.xml") $appx -Force
+# Stamp a build-unique package version (0.2.MMdd.HHmm): the console blocks
+# reinstalling a same-version package whose contents differ, which stalls the
+# deploy loop with the repo's static version.
+$now = Get-Date
+$ver = "0.2.{0}.{1}" -f [int]$now.ToString("MMdd"), [int]$now.ToString("HHmm")
+$mf = Join-Path $appx "AppxManifest.xml"
+(Get-Content $mf -Raw) -replace '(<Identity[^>]*Version=")[0-9.]+(")', "`${1}$ver`${2}" |
+    Set-Content $mf -Encoding utf8
+Write-Host "==> stamped package version $ver"
 Copy-Item (Join-Path $srcDir "Assets\*") (Join-Path $appx "Assets") -Force
 if ($useFF -and -not $ffStatic) {
     # Dynamic FFmpeg: bundle the av* DLLs. Their VCRUNTIME140_APP.dll comes from
