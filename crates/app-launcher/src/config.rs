@@ -486,6 +486,72 @@ impl Catalog {
     }
 }
 
+// ── Environment rows ────────────────────────────────────────────────────────
+//
+// An entry's `env` is the escape hatch that carries Vulkan-layer / wrapper
+// variables (ReShade, vkBasalt, the DLSS layers) into a game, so it is worth
+// checking rather than passing through: every consumer spells a variable as a
+// shell-ish `KEY=VALUE`, and a key that isn't a usable name is either dropped
+// (the redirect fragment, which `.`-sources it) or turned into a malformed
+// `environ` entry (a direct spawn). One definition here; the panel validates
+// against it before saving and the launcher enforces it before spawning.
+
+/// Why one row of an entry's `env` can't be used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvRowIssue {
+    /// A value with no key to put it under.
+    EmptyKey,
+    /// Not a POSIX-portable variable name.
+    BadKey,
+    /// An earlier row already sets this key; this one would silently win.
+    Duplicate,
+}
+
+/// Is `k` a POSIX-portable environment-variable name (`[A-Za-z_][A-Za-z0-9_]*`)?
+pub fn valid_env_key(k: &str) -> bool {
+    let mut cs = k.chars();
+    matches!(cs.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Classify every row of `env`, index-aligned with it. A wholly blank row is
+/// `None` (an editor row nobody filled in yet, dropped by [`sanitize_env`]), not
+/// an error to shout about while the user is still typing.
+pub fn env_row_issues(env: &[(String, String)]) -> Vec<Option<EnvRowIssue>> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(env.len());
+    for (k, v) in env {
+        let k = k.trim();
+        out.push(if k.is_empty() {
+            // A wholly blank row is pending, not broken.
+            if v.trim().is_empty() {
+                None
+            } else {
+                Some(EnvRowIssue::EmptyKey)
+            }
+        } else if !valid_env_key(k) {
+            Some(EnvRowIssue::BadKey)
+        } else if !seen.insert(k) {
+            Some(EnvRowIssue::Duplicate)
+        } else {
+            None
+        });
+    }
+    out
+}
+
+/// Trim keys and drop wholly blank rows. What an editor should do before it
+/// validates, so an unfilled "Add variable" click never reaches `apps.toml`.
+pub fn sanitize_env(env: &mut Vec<(String, String)>) {
+    env.retain(|(k, v)| !(k.trim().is_empty() && v.trim().is_empty()));
+    for (k, _) in env.iter_mut() {
+        let trimmed = k.trim();
+        if trimmed.len() != k.len() {
+            *k = trimmed.to_string();
+        }
+    }
+}
+
 /// Load the persisted catalog from `apps.toml`. A missing file is an empty
 /// catalog; an unparseable one logs and returns empty (never panics — the host
 /// must keep streaming regardless).
@@ -689,6 +755,61 @@ mod tests {
         "#;
         let c: Catalog = toml::from_str(legacy).unwrap();
         assert_eq!(c.find("old").unwrap().fps_cap, FpsCap::Off);
+    }
+
+    #[test]
+    fn env_key_shape() {
+        assert!(valid_env_key("A"));
+        assert!(valid_env_key("_x9"));
+        assert!(valid_env_key("VK_LOADER_LAYERS_ENABLE"));
+        assert!(!valid_env_key(""));
+        assert!(!valid_env_key("9a"));
+        assert!(!valid_env_key("a-b"));
+        assert!(!valid_env_key("A=B"));
+        assert!(!valid_env_key("has space"));
+    }
+
+    #[test]
+    fn env_rows_are_classified() {
+        let env = vec![
+            ("VK_LOADER_LAYERS_ENABLE".into(), "VK_LAYER_reshade".into()),
+            ("".into(), "".into()),          // pending row, not an error
+            ("".into(), "orphan".into()),    // value with no name
+            ("2BAD".into(), "x".into()),     // not a variable name
+            (" GOOD ".into(), "y".into()),   // trimmed before checking
+            ("GOOD".into(), "again".into()), // duplicate of the row above
+        ];
+        assert_eq!(
+            env_row_issues(&env),
+            vec![
+                None,
+                None,
+                Some(EnvRowIssue::EmptyKey),
+                Some(EnvRowIssue::BadKey),
+                None,
+                Some(EnvRowIssue::Duplicate),
+            ]
+        );
+    }
+
+    #[test]
+    fn sanitize_env_drops_blanks_and_trims_keys() {
+        let mut env = vec![
+            ("".into(), "".into()),
+            ("  SPACED  ".into(), " kept ".into()),
+            ("".into(), "orphan".into()),
+        ];
+        sanitize_env(&mut env);
+        // The blank row is gone; the key is trimmed and the VALUE is left alone
+        // (trailing space in a value can be meaningful); the orphan value stays so
+        // validation can report it instead of silently discarding what was typed.
+        assert_eq!(
+            env,
+            vec![
+                ("SPACED".to_string(), " kept ".to_string()),
+                (String::new(), "orphan".to_string()),
+            ]
+        );
     }
 
     #[test]

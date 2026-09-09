@@ -19,12 +19,13 @@ use std::path::Path;
 use egui_phosphor::regular as ph;
 
 use app_launcher::config::{
-    AppCompositor, AppEntry, AppKind, FpsCap, GyroMode, LaunchKind, LaunchTarget,
+    AppCompositor, AppEntry, AppKind, EnvRowIssue, FpsCap, GyroMode, LaunchKind, LaunchTarget,
 };
 
 use crate::a11y::Describe;
 use crate::i18n::tr;
 use crate::model::{AppEditor, PanelState};
+use crate::theme;
 
 /// Box-art card thumbnail size (portrait, ~2:3 like Steam grid art).
 const THUMB: egui::Vec2 = egui::vec2(132.0, 198.0);
@@ -299,6 +300,8 @@ fn commit(state: &mut PanelState, editor: &mut AppEditor) -> Result<(), String> 
     } else {
         draft.slug = app_launcher::scan::slugify(&draft.slug);
     }
+
+    validate_env(draft)?;
 
     // Reject a slug that collides with another entry (or the Desktop built-in).
     if draft.slug == "desktop" {
@@ -648,14 +651,23 @@ fn form_fields(ui: &mut egui::Ui, draft: &mut AppEntry) {
                         .weak(),
                 );
             }
+            // Flag a bad row as it's typed rather than only at save: these
+            // variables are the escape hatch for wrappers and Vulkan layers, and a
+            // key the shell can't express is dropped at spawn, so silence here
+            // would read as "the layer doesn't work" much later.
+            let issues = app_launcher::config::env_row_issues(&draft.env);
             let mut remove: Option<usize> = None;
             for (i, (k, v)) in draft.env.iter_mut().enumerate() {
+                let issue = issues.get(i).copied().flatten();
                 ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(k)
-                            .desired_width(140.0)
-                            .hint_text("KEY"),
-                    );
+                    let key = egui::TextEdit::singleline(k)
+                        .desired_width(140.0)
+                        .hint_text("KEY");
+                    let key = match issue {
+                        Some(_) => key.text_color(theme::error()),
+                        None => key,
+                    };
+                    ui.add(key);
                     ui.add(
                         egui::TextEdit::singleline(v)
                             .desired_width(200.0)
@@ -664,18 +676,62 @@ fn form_fields(ui: &mut egui::Ui, draft: &mut AppEntry) {
                     if ui.small_button(ph::X).clicked() {
                         remove = Some(i);
                     }
+                    if let Some(issue) = issue {
+                        ui.colored_label(
+                            theme::error(),
+                            format!("{}  {}", ph::WARNING, env_issue_text(issue)),
+                        );
+                    }
                 });
             }
             if let Some(i) = remove {
                 draft.env.remove(i);
             }
+            // No second blank row while one is still empty — that is how unfilled
+            // rows used to reach `apps.toml`.
+            let has_blank = draft
+                .env
+                .iter()
+                .any(|(k, v)| k.trim().is_empty() && v.trim().is_empty());
             if ui
-                .button(format!("{}  {}", ph::PLUS, tr("apps.field.env_add")))
+                .add_enabled(
+                    !has_blank,
+                    egui::Button::new(format!("{}  {}", ph::PLUS, tr("apps.field.env_add"))),
+                )
                 .clicked()
             {
                 draft.env.push((String::new(), String::new()));
             }
         });
+}
+
+/// Drop the unfilled rows, trim the keys, and refuse a row that can't work — an
+/// entry whose `env` looks set but is silently dropped at spawn is the failure
+/// this gate exists to prevent. Split out of [`commit`] so it is testable without
+/// a whole `PanelState` (which loads from disk and probes the host).
+fn validate_env(draft: &mut AppEntry) -> Result<(), String> {
+    app_launcher::config::sanitize_env(&mut draft.env);
+    match app_launcher::config::env_row_issues(&draft.env)
+        .into_iter()
+        .enumerate()
+        .find_map(|(i, issue)| issue.map(|issue| (i, issue)))
+    {
+        Some((i, issue)) => Err(format!(
+            "{} {}",
+            tr("apps.env.rejected").replace("{key}", draft.env[i].0.trim()),
+            env_issue_text(issue)
+        )),
+        None => Ok(()),
+    }
+}
+
+/// One row's problem, phrased for the person typing it.
+fn env_issue_text(issue: EnvRowIssue) -> String {
+    match issue {
+        EnvRowIssue::EmptyKey => tr("apps.env.empty_key"),
+        EnvRowIssue::BadKey => tr("apps.env.bad_key"),
+        EnvRowIssue::Duplicate => tr("apps.env.duplicate"),
+    }
 }
 
 /// Does this entry's `env` go through the Steam URI handoff, where it can only
@@ -984,4 +1040,64 @@ fn dialog_dir(current: &str) -> Option<std::path::PathBuf> {
         }
     }
     dirs::home_dir()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn draft_with(env: Vec<(&str, &str)>) -> AppEntry {
+        AppEntry {
+            env: env
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..AppEntry::new()
+        }
+    }
+
+    #[test]
+    fn save_drops_unfilled_rows_and_trims_keys() {
+        let mut d = draft_with(vec![("", ""), (" DXVK_HUD ", "fps")]);
+        assert!(validate_env(&mut d).is_ok());
+        assert_eq!(d.env, vec![("DXVK_HUD".to_string(), "fps".to_string())]);
+    }
+
+    #[test]
+    fn save_is_refused_for_a_row_that_cannot_work() {
+        for bad in [
+            vec![("2BAD", "x")],
+            vec![("has space", "x")],
+            vec![("", "orphan")],
+            vec![("SAME", "a"), ("SAME", "b")],
+        ] {
+            let mut d = draft_with(bad.clone());
+            assert!(
+                validate_env(&mut d).is_err(),
+                "expected {bad:?} to be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn steam_entries_get_the_launch_options_caveat() {
+        // A Steam game on the built-in compositor goes through the URI handoff,
+        // where env only lands via the redirect shim — that's the surprise worth
+        // flagging. A gamescope session spawns Steam itself, so it inherits the
+        // entry's env directly and needs no caveat, and neither does an entry
+        // with nothing set.
+        let mut steam = draft_with(vec![("VK_LOADER_LAYERS_ENABLE", "VK_LAYER_reshade")]);
+        steam.launch = Some(LaunchKind::SteamGame { appid: 70 });
+        assert!(steam_env_caveat(&steam));
+
+        let mut session = steam.clone();
+        session.compositor = AppCompositor::Gamescope;
+        assert!(!steam_env_caveat(&session));
+
+        let mut empty = steam.clone();
+        empty.env.clear();
+        assert!(!steam_env_caveat(&empty));
+
+        assert!(!steam_env_caveat(&draft_with(vec![("A", "b")])));
+    }
 }

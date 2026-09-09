@@ -298,14 +298,11 @@ pub fn app_env_pending_path() -> PathBuf {
     app_env_dir().join("pending")
 }
 
-/// Is `k` a POSIX-portable environment-variable name (`[A-Za-z_][A-Za-z0-9_]*`)?
-/// The fragment is `.`-sourced by /bin/sh, so anything else can't be expressed as
-/// an assignment and is dropped rather than quietly mangled.
-pub fn valid_env_key(k: &str) -> bool {
-    let mut cs = k.chars();
-    matches!(cs.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
-        && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
+/// The fragment is `.`-sourced by /bin/sh, so a key that isn't a usable variable
+/// name can't be expressed as an assignment and is dropped rather than quietly
+/// mangled. Same predicate the editor validates against and the direct-spawn path
+/// enforces — one definition, in the schema.
+pub use crate::config::valid_env_key;
 
 /// Render the sourceable fragment for `env`, returning it alongside the keys that
 /// were dropped as unusable. Values are single-quoted with embedded `'` escaped,

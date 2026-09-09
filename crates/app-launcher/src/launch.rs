@@ -295,9 +295,7 @@ pub fn launch(entry: &AppEntry, ctx: &LaunchContext) -> anyhow::Result<Option<Ch
             cmd.current_dir(dir);
         }
     }
-    for (k, v) in &entry.env {
-        cmd.env(k, v);
-    }
+    apply_entry_env(&mut cmd, &entry.slug, &entry.env);
 
     tracing::info!(
         "launching app `{}` ({}) on {:?}",
@@ -520,9 +518,7 @@ fn launch_steam_session(
                 cmd.current_dir(dir);
             }
         }
-        for (k, v) in &entry.env {
-            cmd.env(k, v);
-        }
+        apply_entry_env(&mut cmd, &entry.slug, &entry.env);
         tracing::info!(
             "launching Steam session `{}`: gamescope {}",
             entry.slug,
@@ -658,9 +654,7 @@ fn launch_in_gamescope(
                 cmd.current_dir(dir);
             }
         }
-        for (k, v) in &entry.env {
-            cmd.env(k, v);
-        }
+        apply_entry_env(&mut cmd, &entry.slug, &entry.env);
         tracing::info!(
             "launching app `{}` in gamescope: gamescope {}",
             entry.slug,
@@ -773,9 +767,7 @@ fn launch_in_xwayland(
                 cmd.current_dir(dir);
             }
         }
-        for (k, v) in &entry.env {
-            cmd.env(k, v);
-        }
+        apply_entry_env(&mut cmd, &entry.slug, &entry.env);
         tracing::info!(
             "launching app `{}` ({}) on Xwayland :{}",
             entry.slug,
@@ -958,6 +950,25 @@ fn ensure_rtss_running() {
     match std::process::Command::new(&exe).spawn() {
         Ok(_) => tracing::info!("started RTSS for the perf overlay ({})", exe.display()),
         Err(e) => tracing::warn!("start RTSS ({}): {e}", exe.display()),
+    }
+}
+
+/// Apply an entry's `env` to a child, skipping rows that aren't usable variable
+/// names. `apps.toml` is hand-editable and the panel is not the only writer, so
+/// the spawn paths enforce the same rule the editor validates against instead of
+/// handing the kernel a malformed `environ` entry that no one can see afterwards.
+/// Applied last by every caller, so an entry still overrides what we set above it.
+fn apply_entry_env(cmd: &mut Command, slug: &str, env: &[(String, String)]) {
+    for (k, v) in env {
+        let key = k.trim();
+        if !crate::config::valid_env_key(key) {
+            tracing::warn!(
+                "app `{slug}`: skipping env var `{k}` — not a usable variable name \
+                 ([A-Za-z_][A-Za-z0-9_]*)"
+            );
+            continue;
+        }
+        cmd.env(key, v);
     }
 }
 
@@ -1252,9 +1263,7 @@ fn spawn_steam_url(spec: &SteamHandoffSpec) -> std::io::Result<Child> {
             cmd.current_dir(PathBuf::from(dir));
         }
     }
-    for (k, v) in &spec.env {
-        cmd.env(k, v);
-    }
+    apply_entry_env(&mut cmd, &spec.slug, &spec.env);
     cmd.spawn()
 }
 

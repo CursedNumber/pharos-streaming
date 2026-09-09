@@ -254,6 +254,22 @@ nb = "valgfritt"
 en = "Environment variables"
 nb = "Miljøvariabler"
 
+["apps.env.empty_key"]
+en = "value with no variable name"
+nb = "verdi uten variabelnavn"
+
+["apps.env.bad_key"]
+en = "not a usable variable name (letters, digits and _, never starting with a digit)"
+nb = "ikke et brukbart variabelnavn (bokstaver, tall og _, aldri med tall først)"
+
+["apps.env.duplicate"]
+en = "already set by an earlier row"
+nb = "allerede satt av en tidligere rad"
+
+["apps.env.rejected"]
+en = "Environment variable {key}:"
+nb = "Miljøvariabel {key}:"
+
 ["apps.field.env_steam"]
 en = "Steam launches this game itself, so these reach it only while streaming, through the Pharos redirect (needs PHAROS_STEAM_REDIRECT=1). Otherwise put them in the game's Steam launch options as VAR=value %command%."
 nb = "Steam starter dette spillet selv, så disse når det bare under strømming, via Pharos-omdirigeringen (krever PHAROS_STEAM_REDIRECT=1). Ellers legg dem i spillets oppstartsvalg i Steam som VAR=verdi %command%."
