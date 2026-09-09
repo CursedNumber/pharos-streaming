@@ -60,6 +60,32 @@ unset DISPLAY
 export WAYLAND_DISPLAY="${PHAROS_WAYLAND_DISPLAY}"
 [ -n "${PHAROS_PULSE_SINK:-}" ] && export PULSE_SINK="${PHAROS_PULSE_SINK}"
 export PROTON_ENABLE_WAYLAND="${PHAROS_PROTON_ENABLE_WAYLAND:-1}"
+
+# Per-game env from this app's catalog entry (`apps.toml` `env`), written by the
+# launcher as one fragment per appid. Sourced LAST so an entry's variable wins
+# over the stream defaults above, mirroring launch.rs's "per-entry env applied
+# last" rule. Steam exports SteamAppId/SteamGameId into the game environment we
+# were exec'd in; if some Steam ever doesn't, fall back to the `pending` pointer
+# the launcher wrote for the handoff in flight. No id, no fragment, or an id that
+# isn't all digits => nothing sourced, launch unchanged.
+_dir="${XDG_RUNTIME_DIR:-/tmp}/pharos/app-env"
+_appid="${SteamAppId:-${SteamGameId:-}}"
+case "${_appid:-x}" in
+    ''|*[!0-9]*) _appid="" ;;
+esac
+if [ -z "$_appid" ] && [ -r "$_dir/pending" ]; then
+    # shellcheck disable=SC1091
+    . "$_dir/pending"
+    _appid="${PHAROS_APP_ENV_APPID:-}"
+    case "${_appid:-x}" in
+        ''|*[!0-9]*) _appid="" ;;
+    esac
+fi
+if [ -n "$_appid" ] && [ -r "$_dir/$_appid" ]; then
+    # shellcheck disable=SC1090
+    . "$_dir/$_appid"
+fi
+
 exec env "$@"
 "#;
 
@@ -428,5 +454,80 @@ mod tests {
         assert!(SHIM_SCRIPT.contains("exec env \"$@\""));
         assert!(SHIM_SCRIPT.contains("PHAROS_NO_REDIRECT"));
         assert_eq!(SHIM_BASENAME, "pharos-redirect");
+    }
+
+    #[test]
+    fn shim_reads_per_app_env() {
+        // The per-app fragment is sourced from the appid Steam exports, with the
+        // launcher's `pending` pointer as the fallback.
+        assert!(SHIM_SCRIPT.contains("SteamAppId"));
+        assert!(SHIM_SCRIPT.contains("SteamGameId"));
+        assert!(SHIM_SCRIPT.contains("PHAROS_APP_ENV_APPID"));
+        assert!(SHIM_SCRIPT.contains("pharos/app-env"));
+    }
+
+    /// End-to-end on the real `/bin/sh`: the shim is the only thing standing
+    /// between an entry's `env` and a Steam-forked game, and its failure mode is
+    /// silence, so exercise it as a process rather than trusting the source text.
+    /// Builds a live marker (this pid + its start-ticks + a real socket file) in a
+    /// private `XDG_RUNTIME_DIR`, then runs `sh <shim> printenv PHAROS_TEST_VAR`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shim_applies_per_app_env_only_on_a_live_redirect() {
+        use std::os::unix::net::UnixListener;
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join(format!("pharos-shim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("pharos/app-env")).unwrap();
+        let shim = dir.join("pharos-redirect");
+        std::fs::write(&shim, SHIM_SCRIPT).unwrap();
+
+        // The staleness guard wants a socket that exists, owned by a live pid.
+        let sock = "wayland-test";
+        let _listener = UnixListener::bind(dir.join(sock)).unwrap();
+        let marker = crate::redirect::MarkerEnv::for_current(sock, None);
+        let (frag, skipped) =
+            crate::redirect::render_app_env(&[("PHAROS_TEST_VAR".into(), "it's live".into())]);
+        assert!(skipped.is_empty());
+        std::fs::write(dir.join("pharos/app-env/70"), &frag).unwrap();
+
+        let run = |appid: Option<&str>, with_marker: bool| -> String {
+            if with_marker {
+                std::fs::write(dir.join("pharos/launch-env"), marker.render()).unwrap();
+            } else {
+                let _ = std::fs::remove_file(dir.join("pharos/launch-env"));
+            }
+            let mut c = Command::new("sh");
+            c.arg(&shim)
+                .args(["printenv", "PHAROS_TEST_VAR"])
+                .env("XDG_RUNTIME_DIR", &dir)
+                .env_remove("SteamAppId")
+                .env_remove("SteamGameId")
+                .env_remove("PHAROS_TEST_VAR");
+            if let Some(id) = appid {
+                c.env("SteamAppId", id);
+            }
+            let out = c.output().expect("run shim");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // Live marker + the game's own appid → the entry's env reaches the game.
+        assert_eq!(run(Some("70"), true), "it's live");
+        // A different game must not inherit it.
+        assert_eq!(run(Some("620"), true), "");
+        // No marker (desktop play) → passthrough, env untouched.
+        assert_eq!(run(Some("70"), false), "");
+
+        // Fallback: no SteamAppId in the environment, but the launcher left a
+        // pointer for the handoff in flight.
+        std::fs::write(
+            dir.join("pharos/app-env/pending"),
+            "PHAROS_APP_ENV_APPID='70'\n",
+        )
+        .unwrap();
+        assert_eq!(run(None, true), "it's live");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

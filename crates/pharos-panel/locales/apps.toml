@@ -254,6 +254,10 @@ nb = "valgfritt"
 en = "Environment variables"
 nb = "Miljøvariabler"
 
+["apps.field.env_steam"]
+en = "Steam launches this game itself, so these reach it only while streaming, through the Pharos redirect (needs PHAROS_STEAM_REDIRECT=1). Otherwise put them in the game's Steam launch options as VAR=value %command%."
+nb = "Steam starter dette spillet selv, så disse når det bare under strømming, via Pharos-omdirigeringen (krever PHAROS_STEAM_REDIRECT=1). Ellers legg dem i spillets oppstartsvalg i Steam som VAR=verdi %command%."
+
 ["apps.field.env_add"]
 en = "Add variable"
 nb = "Legg til variabel"

@@ -2743,6 +2743,9 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
     }
     let _marker_guard = app_launcher::redirect::enabled().then(|| {
         app_launcher::redirect::sweep_stale_marker();
+        // Same reasoning for the per-app env fragments the launcher arms for a
+        // Steam handoff: a crashed prior run must not leave a game's env armed.
+        app_launcher::redirect::sweep_app_env();
         MarkerGuard
     });
 

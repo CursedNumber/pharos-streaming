@@ -18,7 +18,9 @@ use std::path::Path;
 
 use egui_phosphor::regular as ph;
 
-use app_launcher::config::{AppCompositor, AppEntry, AppKind, FpsCap, GyroMode, LaunchTarget};
+use app_launcher::config::{
+    AppCompositor, AppEntry, AppKind, FpsCap, GyroMode, LaunchKind, LaunchTarget,
+};
 
 use crate::a11y::Describe;
 use crate::i18n::tr;
@@ -634,6 +636,18 @@ fn form_fields(ui: &mut egui::Ui, draft: &mut AppEntry) {
 
             ui.add_space(6.0);
             ui.label(egui::RichText::new(tr("apps.field.env")).small().weak());
+            // Where these variables actually land differs by launch path, and the
+            // Steam one is the surprise: Steam forks the game from its own client,
+            // so the vars ride the redirect shim (which needs its opt-in) rather
+            // than the launch command. Say so here rather than letting a saved
+            // entry look like it took effect.
+            if steam_env_caveat(draft) {
+                ui.label(
+                    egui::RichText::new(tr("apps.field.env_steam"))
+                        .small()
+                        .weak(),
+                );
+            }
             let mut remove: Option<usize> = None;
             for (i, (k, v)) in draft.env.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
@@ -662,6 +676,16 @@ fn form_fields(ui: &mut egui::Ui, draft: &mut AppEntry) {
                 draft.env.push((String::new(), String::new()));
             }
         });
+}
+
+/// Does this entry's `env` go through the Steam URI handoff, where it can only
+/// reach the game via the redirect shim? True for a Steam game hosted by the
+/// built-in compositor; a `gamescope` Steam session spawns Steam itself, so it
+/// inherits the entry's env directly and needs no caveat.
+fn steam_env_caveat(draft: &AppEntry) -> bool {
+    !draft.env.is_empty()
+        && draft.compositor == AppCompositor::Builtin
+        && matches!(draft.resolved_kind(), LaunchKind::SteamGame { .. })
 }
 
 /// Launch-target picker. The virtual-display targets work today; the physical

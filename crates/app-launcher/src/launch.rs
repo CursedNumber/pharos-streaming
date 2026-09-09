@@ -979,6 +979,11 @@ struct SteamHandoffSpec {
     /// display-redirect feature is on — the worker idempotently arms the game's
     /// Launch Options so it renders into the stream (see [`crate::redirect`]).
     redirect_appid: Option<u32>,
+    /// The appid of the launch line, parsed regardless of the redirect gate. Only
+    /// used to phrase the per-app-env diagnostics: `env` on a Steam entry rides
+    /// the redirect shim, so when the redirect is off we must say so instead of
+    /// dropping the variables silently (which is what this path used to do).
+    appid: Option<u32>,
 }
 
 /// Spawn a detached, named worker thread that pre-warms Steam (if needed),
@@ -1017,6 +1022,7 @@ fn spawn_steam_handoff_worker(
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
         redirect_appid,
+        appid: parse_steam_appid(line),
     };
     let thread_name = format!("steam-launch-{}", spec.slug);
     std::thread::Builder::new()
@@ -1028,6 +1034,11 @@ fn spawn_steam_handoff_worker(
 
 /// Worker body: wait for Steam to be ready (pre-warming if not), then fire the
 /// URI-handoff command. Logs success/failure via tracing; never panics.
+/// How long the app-env `pending` pointer stays valid after a handoff — long
+/// enough to cover a cold Proton/shader-cache start, short enough that it is gone
+/// before the user is plausibly launching a different game by hand.
+const APP_ENV_PENDING_TTL: Duration = Duration::from_secs(180);
+
 fn run_steam_handoff(spec: SteamHandoffSpec) {
     // Seamless display redirect: idempotently wrap the game's Steam Launch Options
     // in the `pharos-redirect` shim so a game a desktop Steam forks still renders
@@ -1093,6 +1104,69 @@ fn run_steam_handoff(spec: SteamHandoffSpec) {
         }
     }
 
+    // Per-entry `env` for a game the Steam CLIENT forks. It cannot ride the
+    // handoff command below: that process delivers a URI and exits, and Steam
+    // spawns the game from ITS environment (a Steam Pharos pre-warms inherits the
+    // compositor's, not the entry's). So hand the variables to the redirect shim,
+    // which is already wrapping this game's Launch Options and already re-execs it
+    // with a sourced env. Applies on a live redirect only, so desktop play is
+    // untouched; without the redirect opt-in there is no shim, and the honest
+    // answer is a warning rather than the silent drop this path used to do.
+    let mut wrote_pending = false;
+    if !spec.env.is_empty() {
+        match spec.redirect_appid {
+            Some(appid) => match crate::redirect::write_app_env(appid, &spec.env) {
+                Ok(0) => tracing::warn!(
+                    "steam-launch[{}]: none of this app's env vars are usable shell variable \
+                     names — nothing will be applied to appid {appid}",
+                    spec.slug
+                ),
+                Ok(n) => {
+                    tracing::info!(
+                        "steam-launch[{}]: armed {n} env var(s) for appid {appid} via the \
+                         redirect shim (applied while the stream is live)",
+                        spec.slug
+                    );
+                    match crate::redirect::write_app_env_pending(appid) {
+                        Ok(()) => wrote_pending = true,
+                        Err(e) => tracing::warn!(
+                            "steam-launch[{}]: app-env fallback pointer not written \
+                             (non-fatal): {e}",
+                            spec.slug
+                        ),
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    "steam-launch[{}]: writing app env for appid {appid} failed — the game will \
+                     launch WITHOUT those vars: {e}",
+                    spec.slug
+                ),
+            },
+            None => {
+                let why = if spec.appid.is_none() {
+                    "this launch line isn't a `rungameid` handoff, so there's no appid to arm — \
+                     put the vars in the game's Steam launch options as `VAR=value %command%`"
+                } else if steam_session_active() {
+                    "a gamescope Steam session owns this launch, and it inherits the env of the \
+                     SESSION entry — put the vars there instead"
+                } else if !crate::redirect::enabled() {
+                    "the seamless redirect is off, and it owns the only path that reaches a \
+                     Steam-forked game — set PHAROS_STEAM_REDIRECT=1, or put the vars in the \
+                     game's Steam launch options as `VAR=value %command%`"
+                } else {
+                    "this app isn't launching into the virtual display, so the redirect (and \
+                     its env) doesn't apply"
+                };
+                tracing::warn!(
+                    "steam-launch[{}]: {} env var(s) set on this app will NOT reach the game: {}",
+                    spec.slug,
+                    spec.env.len(),
+                    why
+                );
+            }
+        }
+    }
+
     if !crate::steam::is_ready() {
         tracing::info!(
             "steam-launch[{}]: Steam not ready — pre-warming and waiting up to {}s",
@@ -1134,6 +1208,18 @@ fn run_steam_handoff(spec: SteamHandoffSpec) {
                 spec.line
             );
         }
+    }
+
+    // Retire the app-env fallback pointer once the launch window has closed. It
+    // only matters for a Steam that doesn't export `SteamAppId`, and it names one
+    // appid, so it must not outlive this handoff and mislabel the next game the
+    // user starts by hand. Freshness enforced here rather than by an mtime test in
+    // the shim, where the portable spellings run out. The per-appid fragment stays
+    // (it is addressed by appid, so it can't be applied to the wrong game) until
+    // the next compositor start sweeps it.
+    if wrote_pending {
+        std::thread::sleep(APP_ENV_PENDING_TTL);
+        crate::redirect::clear_app_env_pending();
     }
 }
 

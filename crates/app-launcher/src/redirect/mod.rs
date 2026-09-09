@@ -223,13 +223,7 @@ pub fn marker_path() -> PathBuf {
 
 /// Atomically write the marker (temp + rename), creating the `pharos/` dir.
 pub fn write_marker(m: &MarkerEnv) -> std::io::Result<()> {
-    let path = marker_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&tmp, m.render())?;
-    std::fs::rename(&tmp, &path)
+    write_atomic(&marker_path(), &m.render())
 }
 
 /// Remove the marker (ignore if already gone). Desktop launches then pass through.
@@ -266,6 +260,129 @@ fn self_start_ticks() -> u64 {
     }
 }
 
+// ── Per-app env: `apps.toml` `env` for a game a running Steam forks ──────────
+//
+// The Launch-Options gap: env set on the `steam://rungameid/<id>` handoff command
+// dies with that command. A running Steam forks the game from the CLIENT's
+// environment, and a Steam that Pharos pre-warms inherits the compositor's — so
+// an entry's `env` never reached a Steam title, silently. The shim is already in
+// the game's Launch Options for a redirected game, and it already re-execs the
+// game with an env it sources at exec time; so the env rides there, as one
+// sourceable fragment per appid written next to the marker.
+//
+// Consequences worth knowing: it applies only on a LIVE redirect (the shim
+// sources it after the staleness guard), so desktop play is never touched, and
+// it needs the redirect opt-in like everything else that edits Launch Options.
+
+/// `$XDG_RUNTIME_DIR/pharos/app-env` — one sourceable fragment per Steam appid,
+/// plus the `pending` fallback pointer. Same tmpfs as the marker, so nothing here
+/// outlives a logout.
+pub fn app_env_dir() -> PathBuf {
+    marker_path()
+        .parent()
+        .map(|d| d.join("app-env"))
+        .unwrap_or_else(|| PathBuf::from("app-env"))
+}
+
+/// The fragment for one appid.
+pub fn app_env_path(appid: u32) -> PathBuf {
+    app_env_dir().join(appid.to_string())
+}
+
+/// Fallback pointer for the (unexpected) case where Steam doesn't put
+/// `SteamAppId`/`SteamGameId` in the wrapper's environment: names the appid of
+/// the handoff currently in flight. Written only when there IS env to apply and
+/// removed by the launcher once the launch window closes, so its freshness is
+/// enforced by the writer rather than by a non-portable mtime test in the shim.
+pub fn app_env_pending_path() -> PathBuf {
+    app_env_dir().join("pending")
+}
+
+/// Is `k` a POSIX-portable environment-variable name (`[A-Za-z_][A-Za-z0-9_]*`)?
+/// The fragment is `.`-sourced by /bin/sh, so anything else can't be expressed as
+/// an assignment and is dropped rather than quietly mangled.
+pub fn valid_env_key(k: &str) -> bool {
+    let mut cs = k.chars();
+    matches!(cs.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Render the sourceable fragment for `env`, returning it alongside the keys that
+/// were dropped as unusable. Values are single-quoted with embedded `'` escaped,
+/// exactly like [`MarkerEnv::render`].
+pub fn render_app_env(env: &[(String, String)]) -> (String, Vec<String>) {
+    let mut s = String::new();
+    let mut skipped = Vec::new();
+    for (k, v) in env {
+        let k = k.trim();
+        if !valid_env_key(k) {
+            skipped.push(k.to_string());
+            continue;
+        }
+        s.push_str(&format!("export {k}='{}'\n", v.replace('\'', "'\\''")));
+    }
+    (s, skipped)
+}
+
+/// Atomically write the per-appid fragment. Returns how many variables it
+/// carries; an entry whose keys are all unusable writes nothing and clears any
+/// fragment left by a previous launch, so a fixed-then-broken edit can't keep
+/// applying the old values.
+pub fn write_app_env(appid: u32, env: &[(String, String)]) -> std::io::Result<usize> {
+    let (body, skipped) = render_app_env(env);
+    for k in &skipped {
+        tracing::warn!(
+            "launch-redirect: dropping app env var `{k}` for appid {appid} — not a usable shell \
+             variable name ([A-Za-z_][A-Za-z0-9_]*)"
+        );
+    }
+    let count = body.lines().count();
+    if count == 0 {
+        remove_app_env(appid);
+        return Ok(0);
+    }
+    write_atomic(&app_env_path(appid), &body)?;
+    Ok(count)
+}
+
+/// Point the shim at `appid` for the launch in flight (see
+/// [`app_env_pending_path`]).
+pub fn write_app_env_pending(appid: u32) -> std::io::Result<()> {
+    write_atomic(
+        &app_env_pending_path(),
+        &kv("PHAROS_APP_ENV_APPID", &appid.to_string()),
+    )
+}
+
+/// Drop the fallback pointer once the launch window has closed.
+pub fn clear_app_env_pending() {
+    let _ = std::fs::remove_file(app_env_pending_path());
+}
+
+/// Remove one appid's fragment (ignore if already gone).
+pub fn remove_app_env(appid: u32) {
+    let _ = std::fs::remove_file(app_env_path(appid));
+}
+
+/// Clear every fragment at compositor startup — the sibling of
+/// [`sweep_stale_marker`], for the same reason: a crashed prior run must not
+/// leave env armed for a game we're no longer launching.
+pub fn sweep_app_env() {
+    let _ = std::fs::remove_dir_all(app_env_dir());
+}
+
+/// Temp + rename write, creating the parent dir. Shared by the marker and the
+/// per-app fragments so both land atomically for a shim that may source them at
+/// any moment.
+fn write_atomic(path: &std::path::Path, body: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,6 +415,50 @@ mod tests {
             proton_enable_wayland: false,
         };
         assert!(m.render().contains("PHAROS_PULSE_SINK='wei'\\''rd'\n"));
+    }
+
+    #[test]
+    fn app_env_renders_exports_and_escapes() {
+        let (body, skipped) = render_app_env(&[
+            ("VK_LOADER_LAYERS_ENABLE".into(), "VK_LAYER_reshade".into()),
+            ("QUOTED".into(), "it's".into()),
+        ]);
+        assert!(skipped.is_empty());
+        assert!(body.contains("export VK_LOADER_LAYERS_ENABLE='VK_LAYER_reshade'\n"));
+        assert!(body.contains("export QUOTED='it'\\''s'\n"));
+    }
+
+    #[test]
+    fn app_env_drops_unusable_keys() {
+        // A key that isn't a shell name can't be expressed as an assignment; it is
+        // dropped (and reported) rather than corrupting the whole fragment, which
+        // `.`-sourcing a malformed line would do.
+        let (body, skipped) = render_app_env(&[
+            ("2BAD".into(), "x".into()),
+            ("has space".into(), "x".into()),
+            ("A=B".into(), "x".into()),
+            ("".into(), "x".into()),
+            ("GOOD_1".into(), "y".into()),
+        ]);
+        assert_eq!(skipped, vec!["2BAD", "has space", "A=B", ""]);
+        assert_eq!(body, "export GOOD_1='y'\n");
+    }
+
+    #[test]
+    fn app_env_key_shape() {
+        assert!(valid_env_key("A"));
+        assert!(valid_env_key("_x9"));
+        assert!(!valid_env_key(""));
+        assert!(!valid_env_key("9a"));
+        assert!(!valid_env_key("a-b"));
+    }
+
+    #[test]
+    fn app_env_paths_sit_beside_the_marker() {
+        let dir = app_env_dir();
+        assert_eq!(dir.parent(), marker_path().parent());
+        assert!(app_env_path(70).ends_with("app-env/70"));
+        assert!(app_env_pending_path().ends_with("app-env/pending"));
     }
 
     #[test]
