@@ -15,7 +15,14 @@ license.workspace = true
 # (mirrors the `host-info` / `control-ipc` "lean leaf" rule). Steam/desktop
 # scanning is hand-rolled (a tolerant KeyValues reader) rather than pulling an
 # external, version-fragile crate, so this builds clean on Linux, Windows, and
-# ARM with the same six deps.
+# ARM.
+#
+# The one bought-in parser is `serde_json`, for the Vulkan layer manifests
+# (`vklayer.rs`). Those are real JSON written by third parties — nested objects,
+# escapes, two different top-level shapes — where a hand-rolled reader would be
+# the riskier choice, not the leaner one; unlike the VDF editors, which are
+# hand-rolled because they must preserve Steam's bytes exactly. It is already in
+# the workspace graph (control-ipc, pharos-panel) and pulls nothing new.
 
 [dependencies]
 serde = { workspace = true }
@@ -24,6 +31,7 @@ dirs = "5"
 anyhow = "1"
 thiserror = { workspace = true }
 tracing = "0.1"
+serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

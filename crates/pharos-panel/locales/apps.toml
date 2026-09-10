@@ -254,6 +254,18 @@ nb = "valgfritt"
 en = "Environment variables"
 nb = "Miljøvariabler"
 
+["apps.field.vk_layers"]
+en = "Post-processing layers"
+nb = "Etterbehandlingslag"
+
+["apps.field.vk_layers_none"]
+en = "No Vulkan layers found on this host. Install one (ReShade, vkBasalt, a DLSS layer) and it appears here."
+nb = "Fant ingen Vulkan-lag på denne verten. Installer ett (ReShade, vkBasalt, et DLSS-lag), så dukker det opp her."
+
+["apps.field.vk_layers_missing"]
+en = "no longer installed"
+nb = "ikke installert lenger"
+
 ["apps.env.empty_key"]
 en = "value with no variable name"
 nb = "verdi uten variabelnavn"

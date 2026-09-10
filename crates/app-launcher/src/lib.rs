@@ -34,10 +34,14 @@ pub mod scan;
 /// Steam readiness + lifecycle (prewarm / shutdown), used by the compositor's
 /// Steam Big Picture auto close+relaunch handling.
 pub mod steam;
+/// Installed Vulkan implicit layers (ReShade, vkBasalt, the DLSS layers) and the
+/// env that arms one for a single app.
+pub mod vklayer;
 
 pub use config::{AppEntry, AppKind, Catalog, FpsCap, GyroMode, LaunchKind, LaunchTarget};
 pub use launch::{launch, session_audio_sink, set_session_audio_sink, LaunchContext};
 pub use scan::{DesktopApp, SteamGame};
+pub use vklayer::LayerFamily;
 
 /// `~/.config/pharos/` on Linux / `%APPDATA%\pharos\` on Windows, or
 /// `$PHAROS_CONFIG_DIR` if overridden.

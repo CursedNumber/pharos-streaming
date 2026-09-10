@@ -21,6 +21,7 @@ use egui_phosphor::regular as ph;
 use app_launcher::config::{
     AppCompositor, AppEntry, AppKind, EnvRowIssue, FpsCap, GyroMode, LaunchKind, LaunchTarget,
 };
+use app_launcher::LayerFamily;
 
 use crate::a11y::Describe;
 use crate::i18n::tr;
@@ -257,7 +258,7 @@ fn editor_ui(ui: &mut egui::Ui, state: &mut PanelState) {
         ui.separator();
         ui.add_space(8.0);
 
-        form_fields(ui, &mut editor.draft);
+        form_fields(ui, &mut editor.draft, &editor.vk_layers);
 
         ui.add_space(10.0);
         ui.horizontal(|ui| {
@@ -451,7 +452,7 @@ fn apply_suggestion(draft: &mut AppEntry, s: AppEntry) {
 }
 
 /// All the editable fields.
-fn form_fields(ui: &mut egui::Ui, draft: &mut AppEntry) {
+fn form_fields(ui: &mut egui::Ui, draft: &mut AppEntry, layers: &[LayerFamily]) {
     egui::Grid::new("apps_form")
         .num_columns(2)
         .spacing([12.0, 8.0])
@@ -638,6 +639,9 @@ fn form_fields(ui: &mut egui::Ui, draft: &mut AppEntry) {
             });
 
             ui.add_space(6.0);
+            vk_layer_toggles(ui, draft, layers);
+
+            ui.add_space(6.0);
             ui.label(egui::RichText::new(tr("apps.field.env")).small().weak());
             // Where these variables actually land differs by launch path, and the
             // Steam one is the surprise: Steam forks the game from its own client,
@@ -703,6 +707,63 @@ fn form_fields(ui: &mut egui::Ui, draft: &mut AppEntry) {
                 draft.env.push((String::new(), String::new()));
             }
         });
+}
+
+/// Post-processing layers installed on this host, as checkboxes. The typed half
+/// of an app's environment: checking one writes a family key into `vk_layers`,
+/// and the launcher turns that into the layer's own `enable_environment` switch
+/// plus the loader's enable list at spawn time (never on gamescope itself). The
+/// raw env grid below stays the escape hatch for anything not listed here.
+///
+/// MangoHud is absent on purpose: the perf-overlay checkbox above owns it.
+fn vk_layer_toggles(ui: &mut egui::Ui, draft: &mut AppEntry, layers: &[LayerFamily]) {
+    ui.label(
+        egui::RichText::new(tr("apps.field.vk_layers"))
+            .small()
+            .weak(),
+    );
+    if layers.is_empty() {
+        ui.label(
+            egui::RichText::new(tr("apps.field.vk_layers_none"))
+                .small()
+                .weak(),
+        );
+    }
+    for fam in layers {
+        let mut on = draft.vk_layers.iter().any(|k| k == &fam.key);
+        let label = if fam.description.is_empty() {
+            fam.key.clone()
+        } else {
+            format!("{}  ·  {}", fam.key, fam.description)
+        };
+        if ui.checkbox(&mut on, label).changed() {
+            draft.vk_layers.retain(|k| k != &fam.key);
+            if on {
+                draft.vk_layers.push(fam.key.clone());
+            }
+        }
+    }
+    // A selection whose layer has since been uninstalled would otherwise vanish
+    // from the UI while still sitting in apps.toml (and warning at every launch),
+    // so keep showing it — with its state visible — until the user clears it.
+    let missing: Vec<String> = draft
+        .vk_layers
+        .iter()
+        .filter(|k| !layers.iter().any(|f| &&f.key == k))
+        .cloned()
+        .collect();
+    for key in missing {
+        ui.horizontal(|ui| {
+            let mut on = true;
+            if ui.checkbox(&mut on, &key).changed() && !on {
+                draft.vk_layers.retain(|k| k != &key);
+            }
+            ui.colored_label(
+                theme::error(),
+                format!("{}  {}", ph::WARNING, tr("apps.field.vk_layers_missing")),
+            );
+        });
+    }
 }
 
 /// Drop the unfilled rows, trim the keys, and refuse a row that can't work — an

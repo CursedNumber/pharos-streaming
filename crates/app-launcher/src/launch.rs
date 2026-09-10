@@ -295,7 +295,7 @@ pub fn launch(entry: &AppEntry, ctx: &LaunchContext) -> anyhow::Result<Option<Ch
             cmd.current_dir(dir);
         }
     }
-    apply_entry_env(&mut cmd, &entry.slug, &entry.env);
+    apply_entry_env(&mut cmd, &entry.slug, &effective_env(entry));
 
     tracing::info!(
         "launching app `{}` ({}) on {:?}",
@@ -390,7 +390,9 @@ pub fn steam_session_active() -> bool {
 /// and the install-correct Steam client argv in Big Picture mode. An
 /// `autolaunch` URI (`steam://rungameid/<appid>`) appended after `-gamepadui`
 /// makes the client boot straight into that game — the SteamOS boot-to-game
-/// shape — so a per-game session never shows Big Picture navigation.
+/// shape — so a per-game session never shows Big Picture navigation. Any
+/// `inner_env` is applied to the nested command with an `env` prefix, so it
+/// reaches Steam and its games without touching gamescope itself.
 #[cfg(target_os = "linux")]
 fn steam_session_args(
     w: u32,
@@ -399,6 +401,7 @@ fn steam_session_args(
     extra: &[String],
     client: &[String],
     autolaunch: Option<&str>,
+    inner_env: &[(String, String)],
 ) -> Vec<String> {
     let mut a: Vec<String> = vec!["-e".into(), "-f".into()];
     a.push("-W".into());
@@ -411,6 +414,10 @@ fn steam_session_args(
     }
     a.extend(extra.iter().cloned());
     a.push("--".into());
+    // Anything in `inner_env` is for Steam and the games it forks, NOT for
+    // gamescope: an `env K=V` prefix on the nested command keeps a Vulkan layer
+    // off gamescope's own renderer (see [`env_prefix_argv`]).
+    a.extend(env_prefix_argv(inner_env));
     a.extend(client.iter().cloned());
     a.push("-gamepadui".into());
     if let Some(uri) = autolaunch {
@@ -492,6 +499,7 @@ fn launch_steam_session(
             &extra,
             &install.session_client_argv(),
             autolaunch,
+            &crate::vklayer::enable_env(&entry.vk_layers, &crate::vklayer::scan()),
         );
         let mut cmd = Command::new("gamescope");
         cmd.args(&args);
@@ -518,6 +526,9 @@ fn launch_steam_session(
                 cmd.current_dir(dir);
             }
         }
+        // The entry's own `env` goes on gamescope (and is inherited by everything
+        // inside it), as it always has; the layer toggles do NOT — they ride the
+        // inner argv instead, so they never attach to gamescope's own renderer.
         apply_entry_env(&mut cmd, &entry.slug, &entry.env);
         tracing::info!(
             "launching Steam session `{}`: gamescope {}",
@@ -631,6 +642,11 @@ fn launch_in_gamescope(
         }
         args.extend(extra);
         args.push("--".into());
+        // Layer toggles arm the app inside the wrap, never gamescope itself.
+        args.extend(env_prefix_argv(&crate::vklayer::enable_env(
+            &entry.vk_layers,
+            &crate::vklayer::scan(),
+        )));
         if kind_shell || entry.shell {
             args.push("/bin/sh".into());
             args.push("-c".into());
@@ -654,6 +670,9 @@ fn launch_in_gamescope(
                 cmd.current_dir(dir);
             }
         }
+        // The entry's own `env` goes on gamescope (and is inherited by everything
+        // inside it), as it always has; the layer toggles do NOT — they ride the
+        // inner argv instead, so they never attach to gamescope's own renderer.
         apply_entry_env(&mut cmd, &entry.slug, &entry.env);
         tracing::info!(
             "launching app `{}` in gamescope: gamescope {}",
@@ -767,7 +786,7 @@ fn launch_in_xwayland(
                 cmd.current_dir(dir);
             }
         }
-        apply_entry_env(&mut cmd, &entry.slug, &entry.env);
+        apply_entry_env(&mut cmd, &entry.slug, &effective_env(entry));
         tracing::info!(
             "launching app `{}` ({}) on Xwayland :{}",
             entry.slug,
@@ -953,6 +972,53 @@ fn ensure_rtss_running() {
     }
 }
 
+/// An entry's effective environment: the typed Vulkan-layer toggles realised as
+/// env, then the entry's own `env` on top, so a hand-typed variable still
+/// overrides what a toggle generated. The one place the two are combined, so
+/// every spawn path — direct, Xwayland, gamescope, Steam handoff — arms layers
+/// the same way.
+fn effective_env(entry: &AppEntry) -> Vec<(String, String)> {
+    if entry.vk_layers.is_empty() {
+        return entry.env.clone();
+    }
+    let installed = crate::vklayer::scan();
+    let layer_env = crate::vklayer::enable_env(&entry.vk_layers, &installed);
+    if !layer_env.is_empty() {
+        tracing::info!(
+            "app `{}`: arming Vulkan layer(s) {:?}",
+            entry.slug,
+            entry.vk_layers
+        );
+    }
+    merge_env(layer_env, &entry.env)
+}
+
+/// Generated env first, hand-typed env second — `Command::env` and the shim's
+/// sourced fragment both let the later write win, so this ordering is what makes
+/// a typed variable able to override (or undo) what a toggle generated.
+fn merge_env(
+    mut layer_env: Vec<(String, String)>,
+    entry_env: &[(String, String)],
+) -> Vec<(String, String)> {
+    layer_env.extend(entry_env.iter().cloned());
+    layer_env
+}
+
+/// `env`-prefix tokens that carry `env` into a nested command, for the paths that
+/// must NOT apply it to the wrapper itself. gamescope is a Vulkan client of the
+/// Pharos compositor, so an implicit layer armed in *its* environment would
+/// post-process the whole session as well as the game — the same trap the
+/// MangoHud knobs already sidestep by declining to run under gamescope at all.
+/// Prefixing the inner argv arms the layer for the app alone.
+fn env_prefix_argv(env: &[(String, String)]) -> Vec<String> {
+    if env.is_empty() {
+        return Vec::new();
+    }
+    let mut argv = vec!["env".to_string()];
+    argv.extend(env.iter().map(|(k, v)| format!("{k}={v}")));
+    argv
+}
+
 /// Apply an entry's `env` to a child, skipping rows that aren't usable variable
 /// names. `apps.toml` is hand-editable and the panel is not the only writer, so
 /// the spawn paths enforce the same rule the editor validates against instead of
@@ -1027,11 +1093,11 @@ fn spawn_steam_handoff_worker(
         x11_display: ctx.x11_display.clone(),
         audio_sink: ctx.audio_sink.clone(),
         cwd: entry.cwd.clone(),
-        env: entry
-            .env
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
+        // Layer toggles + the entry's own env, resolved here on the caller's
+        // thread: the worker outlives this frame and must own its data, and the
+        // fragment it writes for the shim is the only route into a Steam-forked
+        // game (see the app-env block in `run_steam_handoff`).
+        env: effective_env(entry),
         redirect_appid,
         appid: parse_steam_appid(line),
     };
@@ -2060,6 +2126,7 @@ mod tests {
             &["--hdr-enabled".into()],
             &["steam".into()],
             None,
+            &[],
         );
         let want: Vec<String> = [
             "-e",
@@ -2080,7 +2147,7 @@ mod tests {
         .collect();
         assert_eq!(a, want);
         // Unknown refresh → no -r flag at all rather than a guess.
-        let a = steam_session_args(1920, 1080, None, &[], &["steam".into()], None);
+        let a = steam_session_args(1920, 1080, None, &[], &["steam".into()], None, &[]);
         assert!(!a.contains(&"-r".to_string()), "{a:?}");
         // Boot-to-game: the autolaunch URI rides LAST, after -gamepadui, so the
         // client parses all its flags before the game URI (the SteamOS shape).
@@ -2091,12 +2158,71 @@ mod tests {
             &[],
             &["steam".into()],
             Some("steam://rungameid/275850"),
+            &[],
         );
         assert_eq!(
             a.last().map(String::as_str),
             Some("steam://rungameid/275850")
         );
         assert_eq!(a[a.len() - 2], "-gamepadui");
+
+        // Layer env rides an `env` prefix on the NESTED command, immediately
+        // after `--`: gamescope is itself a Vulkan client of the compositor, so a
+        // layer armed in its own environment would post-process the session too.
+        let a = steam_session_args(
+            1920,
+            1080,
+            None,
+            &[],
+            &["steam".into()],
+            None,
+            &[("ENABLE_RESHADE".into(), "1".into())],
+        );
+        let dashdash = a.iter().position(|s| s == "--").expect("-- present");
+        assert_eq!(a[dashdash + 1], "env");
+        assert_eq!(a[dashdash + 2], "ENABLE_RESHADE=1");
+        assert_eq!(a[dashdash + 3], "steam");
+    }
+
+    #[test]
+    fn hand_typed_env_wins_over_a_layer_toggle() {
+        // The escape hatch has to be able to beat the typed control, including
+        // pointing VK_LOADER_LAYERS_ENABLE somewhere else entirely.
+        let merged = merge_env(
+            vec![
+                ("ENABLE_RESHADE".into(), "1".into()),
+                ("VK_LOADER_LAYERS_ENABLE".into(), "VK_LAYER_reshade".into()),
+            ],
+            &[(
+                "VK_LOADER_LAYERS_ENABLE".to_string(),
+                "VK_LAYER_x".to_string(),
+            )],
+        );
+        assert_eq!(
+            merged.last(),
+            Some(&(
+                "VK_LOADER_LAYERS_ENABLE".to_string(),
+                "VK_LAYER_x".to_string()
+            ))
+        );
+        // With no toggles the effective env is exactly the entry's own, and no
+        // manifest scan happens at all.
+        let entry = AppEntry {
+            env: vec![("A".into(), "1".into())],
+            ..AppEntry::new()
+        };
+        assert_eq!(effective_env(&entry), entry.env);
+    }
+
+    #[test]
+    fn env_prefix_argv_is_empty_when_there_is_nothing_to_carry() {
+        // No toggles => no `env` wrapper at all, so the nested command stays
+        // byte-identical to what it was before this feature existed.
+        assert!(env_prefix_argv(&[]).is_empty());
+        assert_eq!(
+            env_prefix_argv(&[("A".into(), "1".into()), ("B".into(), "x y".into())]),
+            vec!["env".to_string(), "A=1".to_string(), "B=x y".to_string()]
+        );
     }
 
     /// A steam-session pointed at the physical desktop makes no sense (the

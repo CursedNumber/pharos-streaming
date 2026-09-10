@@ -921,6 +921,9 @@ pub struct AppEditor {
     pub desktop: Option<Vec<app_launcher::DesktopApp>>,
     /// Filter text for the easy-mode picker list.
     pub picker_filter: String,
+    /// Vulkan implicit layers installed on this box, scanned once when the editor
+    /// opens (reading manifests every frame would hit the disk at 60Hz).
+    pub vk_layers: Vec<app_launcher::LayerFamily>,
 }
 
 impl AppEditor {
@@ -932,6 +935,7 @@ impl AppEditor {
             steam: None,
             desktop: None,
             picker_filter: String::new(),
+            vk_layers: app_launcher::vklayer::scan(),
         }
     }
 
@@ -943,6 +947,7 @@ impl AppEditor {
             steam: None,
             desktop: None,
             picker_filter: String::new(),
+            vk_layers: app_launcher::vklayer::scan(),
         }
     }
 }

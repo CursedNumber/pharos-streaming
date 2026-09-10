@@ -288,6 +288,16 @@ pub struct AppEntry {
     /// Extra environment for the child, as `[["KEY","VALUE"], …]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<(String, String)>,
+    /// Vulkan implicit layers to arm for this app, as family keys from
+    /// [`crate::vklayer::scan`] (a layer name with its architecture suffix
+    /// stripped, so a selection survives a 32-bit build being added later).
+    /// Realised as env at spawn — the layer's own `enable_environment` switch
+    /// plus the loader's `VK_LOADER_LAYERS_ENABLE` list — injected BEFORE
+    /// [`env`](AppEntry::env) so a hand-typed variable still wins. MangoHud is
+    /// deliberately not offered here; it is the
+    /// [`perf_overlay`](AppEntry::perf_overlay) checkbox.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vk_layers: Vec<String>,
     /// Local path to a box-art / icon image (PNG or JPEG). Shown in the panel and
     /// relayed (as bytes) to Trireme clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -345,6 +355,7 @@ impl AppEntry {
             shell: false,
             cwd: None,
             env: Vec::new(),
+            vk_layers: Vec::new(),
             box_art: None,
             target: LaunchTarget::default(),
             gyro_mode: GyroMode::default(),
@@ -368,6 +379,7 @@ impl AppEntry {
             shell: false,
             cwd: None,
             env: Vec::new(),
+            vk_layers: Vec::new(),
             box_art: None,
             // Desktop mirror mode (issue #6) is the default for the built-in
             // Desktop entry: streaming "your desktop" now means the REAL
@@ -397,6 +409,7 @@ impl AppEntry {
             shell: false,
             cwd: None,
             env: Vec::new(),
+            vk_layers: Vec::new(),
             box_art: None,
             target: LaunchTarget::VirtualDisplay,
             gyro_mode: GyroMode::default(),
@@ -755,6 +768,30 @@ mod tests {
         "#;
         let c: Catalog = toml::from_str(legacy).unwrap();
         assert_eq!(c.find("old").unwrap().fps_cap, FpsCap::Off);
+    }
+
+    #[test]
+    fn vk_layers_roundtrip_through_toml() {
+        let cat = Catalog {
+            apps: vec![AppEntry {
+                slug: "nms".into(),
+                name: "No Man's Sky".into(),
+                vk_layers: vec!["VK_LAYER_reshade".into()],
+                ..AppEntry::new()
+            }],
+        };
+        let text = toml::to_string_pretty(&cat).unwrap();
+        let back: Catalog = toml::from_str(&text).unwrap();
+        assert_eq!(back.apps[0].vk_layers, vec!["VK_LAYER_reshade".to_string()]);
+        // Absent for an entry with no layers, and an old apps.toml still loads.
+        let plain = toml::to_string_pretty(&Catalog {
+            apps: vec![AppEntry::new()],
+        })
+        .unwrap();
+        assert!(!plain.contains("vk_layers"), "{plain}");
+        let legacy: Catalog =
+            toml::from_str("[[app]]\nslug = \"a\"\nname = \"A\"\ncommand = \"x\"\n").unwrap();
+        assert!(legacy.apps[0].vk_layers.is_empty());
     }
 
     #[test]
