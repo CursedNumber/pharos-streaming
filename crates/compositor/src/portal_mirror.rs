@@ -60,6 +60,43 @@ use smithay::utils::{Rectangle, Transform};
 // Portal session
 // ---------------------------------------------------------------------------
 
+/// The stable application id Pharos registers with xdg-desktop-portal.
+///
+/// The host runs as a bare `systemd-run` unit (`pharos-host.service`), so the
+/// portal can't derive an app id from its cgroup and sees an anonymous caller.
+/// Registering one gives KDE something to key a pre-authorization on: with
+/// `kde-authorized` / `remote-desktop` / `no.aasle.Pharos` = `yes` in the
+/// permission store, `xdg-desktop-portal-kde` skips the "Share your screen?"
+/// dialog entirely (see `rig/authorize-remote-desktop.sh`).
+pub const PORTAL_APP_ID: &str = "no.aasle.Pharos";
+
+/// Register [`PORTAL_APP_ID`] for this process's portal D-Bus connection.
+///
+/// Must run before the first portal call on the connection; a later call is
+/// refused (the connection is already bound to an id), which is harmless, so
+/// failures only log. Best-effort: older portals (<1.19) lack the Registry and
+/// simply fall back to the dialog.
+async fn register_app_id() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let id = match PORTAL_APP_ID.parse::<ashpd::AppID>() {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!("portal-mirror: invalid app id {PORTAL_APP_ID}: {e}");
+            return;
+        }
+    };
+    match ashpd::register_host_app(id).await {
+        Ok(()) => tracing::info!("portal-mirror: registered portal app id {PORTAL_APP_ID}"),
+        Err(e) => tracing::warn!(
+            "portal-mirror: couldn't register portal app id {PORTAL_APP_ID} ({e}); \
+             KDE pre-authorization won't apply, the share dialog will show"
+        ),
+    }
+}
+
 /// One selected monitor/stream from the portal.
 #[derive(Debug, Clone)]
 pub struct MirrorStreamInfo {
@@ -111,6 +148,7 @@ impl MirrorSession {
     /// token) on that specific error — rather than failing desktop-mirror
     /// entirely on backends like this one.
     pub async fn open(restore_token: Option<&str>) -> Result<Self> {
+        register_app_id().await;
         match Self::try_open(restore_token, PersistMode::ExplicitlyRevoked).await {
             Ok(s) => Ok(s),
             Err(e) if is_persist_unsupported(&e) => {
