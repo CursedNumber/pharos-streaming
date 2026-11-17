@@ -27,6 +27,18 @@ pub struct HostConfig {
     pub compositor: CompositorConfig,
     #[serde(default)]
     pub dsu: DsuConfig,
+    #[serde(default)]
+    pub gyro: GyroConfig,
+}
+
+/// `[gyro]`: host-wide gyro policy. Re-read live (every couple of seconds).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GyroConfig {
+    /// Global switch for gyro→mouse aim. Off by default: an app set to the
+    /// Mouse gyro mode then gets raw motion (the DSU server) instead, so a
+    /// stray gyro can never wander the host cursor unless this is turned on.
+    #[serde(default)]
+    pub mouse_enabled: bool,
 }
 
 /// `[dsu]`: the DSU ("cemuhook") motion server that hands client gyro to

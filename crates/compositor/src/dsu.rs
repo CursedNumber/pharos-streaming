@@ -194,7 +194,12 @@ impl Server {
             let now = Instant::now();
             if now >= self.next_config {
                 self.next_config = now + CONFIG_POLL;
-                self.apply_config(&host_core::config::load().dsu);
+                let cfg = host_core::config::load();
+                // This poll also carries the global gyro→mouse switch, so it
+                // flips live without a restart (one atomic store).
+                crate::host_input::GYRO_MOUSE_ENABLED
+                    .store(cfg.gyro.mouse_enabled, std::sync::atomic::Ordering::Relaxed);
+                self.apply_config(&cfg.dsu);
             }
             self.poll_requests();
             match rx.recv_timeout(Duration::from_millis(50)) {

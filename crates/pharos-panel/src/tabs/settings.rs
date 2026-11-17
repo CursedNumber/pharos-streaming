@@ -350,6 +350,16 @@ fn motion_section(ui: &mut egui::Ui, state: &mut PanelState) {
         {
             state.dirty_host = true;
         }
+        if ui
+            .checkbox(
+                &mut state.host_config.gyro_mouse_enabled,
+                tr("settings.motion.gyro_mouse"),
+            )
+            .describe(tr("settings.motion.gyro_mouse_desc"))
+            .changed()
+        {
+            state.dirty_host = true;
+        }
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new(tr("settings.motion.hint"))

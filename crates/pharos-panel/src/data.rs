@@ -165,6 +165,14 @@ struct HostConfigToml {
     compositor: CompositorToml,
     #[serde(default)]
     dsu: DsuToml,
+    #[serde(default)]
+    gyro: GyroToml,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GyroToml {
+    #[serde(default)]
+    mouse_enabled: bool,
 }
 
 /// Only the switch: `port`/`bind`/axis remaps are hand-edited and preserved.
@@ -307,6 +315,7 @@ pub fn load_host_config() -> HostConfigUi {
         ipv6: cfg.network.ipv6,
         enable_virtual_displays: cfg.compositor.enable_virtual_displays,
         dsu_enabled: cfg.dsu.enabled,
+        gyro_mouse_enabled: cfg.gyro.mouse_enabled,
     }
 }
 
@@ -392,6 +401,19 @@ fn merge_host_config_toml(existing: &str, c: &HostConfigUi) -> Result<String> {
     }
     if !dsu.is_empty() {
         root.insert("dsu".into(), dsu.into());
+    }
+
+    let mut gyro = match root.remove("gyro") {
+        Some(toml::Value::Table(t)) => t,
+        _ => toml::Table::new(),
+    };
+    if c.gyro_mouse_enabled {
+        gyro.insert("mouse_enabled".into(), true.into());
+    } else {
+        gyro.remove("mouse_enabled");
+    }
+    if !gyro.is_empty() {
+        root.insert("gyro".into(), gyro.into());
     }
 
     toml::to_string_pretty(&root).context("serialize config.toml")

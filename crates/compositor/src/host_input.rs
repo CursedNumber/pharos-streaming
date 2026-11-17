@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::process::Child;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{dispatch_gyro_mouse, dsu, gamepad, gyro_imu, CalloopData};
@@ -20,6 +21,11 @@ use app_launcher::GyroMode;
 use core_proto::InputEvent;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use tracing::info;
+
+/// Live mirror of `config.toml [gyro] mouse_enabled` (default off), refreshed
+/// by the DSU thread's config poll. Off = gyro→mouse never fires; an app set to
+/// [`GyroMode::Mouse`] is treated as [`GyroMode::Enabled`] (raw, via DSU).
+pub static GYRO_MOUSE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Connect/disconnect state for one controller this host has observed, keyed
 /// `(vendor, product)`. `connected` flips on every `GamepadConnect`/`Disconnect`;
@@ -178,6 +184,15 @@ impl HostInput {
         self.active_app_gyro_mode = mode;
     }
 
+    /// The gyro mode actually in force: the app's choice, with Mouse demoted to
+    /// Enabled while the global gyro→mouse switch is off.
+    fn gyro_mode(&self) -> GyroMode {
+        match self.active_app_gyro_mode {
+            GyroMode::Mouse if !GYRO_MOUSE_ENABLED.load(Ordering::Relaxed) => GyroMode::Enabled,
+            m => m,
+        }
+    }
+
     /// A `(vendor, product, liveness)` snapshot suitable for building the panel's
     /// `HostStatus.controllers` field each tick. Stable order isn't required —
     /// the panel sorts client-side by (connected, last_connected_ms, name).
@@ -253,7 +268,8 @@ impl HostInput {
                 // Enabled = raw gyro reaches the game. The virtual Xbox pad has no
                 // gyro axes, so "raw" means the DSU server, which emulators read
                 // (a no-op while `[dsu]` is off).
-                if self.active_app_gyro_mode == GyroMode::Enabled {
+                let mode = self.gyro_mode();
+                if mode == GyroMode::Enabled {
                     self.dsu.motion(slot, [gx, gy, gz], [ax, ay, az]);
                 }
                 // A client pad's gyro becomes mouse aim ONLY when the active app opted
@@ -264,7 +280,7 @@ impl HostInput {
                 // flooded the host cursor regardless of GyroMode or the client's
                 // wants_gyro opt-in. `GyroMouse::delta` is stateless, so there's no
                 // accumulator to keep drained in the non-Mouse modes.
-                if self.active_app_gyro_mode == GyroMode::Mouse {
+                if mode == GyroMode::Mouse {
                     let (dx, dy) = self.pads.gyro.delta(gx, gy, gz);
                     if dx != 0.0 || dy != 0.0 {
                         self.gyro_log = self.gyro_log.wrapping_add(1);
@@ -351,7 +367,7 @@ impl HostInput {
         focus_surface: Option<&WlSurface>,
     ) {
         let (gdx, gdy) = self.gyro_imu.take();
-        if self.active_app_gyro_mode != GyroMode::Mouse {
+        if self.gyro_mode() != GyroMode::Mouse {
             return;
         }
         if gdx != 0.0 || gdy != 0.0 {

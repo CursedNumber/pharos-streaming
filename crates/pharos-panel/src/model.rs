@@ -548,6 +548,8 @@ pub struct HostConfigUi {
     /// `[dsu] enabled`: the DSU motion server that relays client gyro to
     /// emulators. Off by default; the host picks it up live.
     pub dsu_enabled: bool,
+    /// `[gyro] mouse_enabled`: global gyro→mouse switch. Off by default.
+    pub gyro_mouse_enabled: bool,
 }
 
 impl Default for HostConfigUi {
@@ -567,6 +569,7 @@ impl Default for HostConfigUi {
             ipv6: false,
             enable_virtual_displays: true,
             dsu_enabled: false,
+            gyro_mouse_enabled: false,
         }
     }
 }

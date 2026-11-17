@@ -175,6 +175,14 @@ nb = "Del klientens gyro over DSU"
 en = "Runs a DSU (cemuhook) motion server on 127.0.0.1:26760, fed by the gyro of the client's controller or phone. Emulators like Lichii/Eden, Cemu, and Dolphin read it: pick CemuhookUDP / DSU as the motion source. Only apps whose gyro mode is Enabled receive motion. Takes effect within a couple of seconds, no restart."
 nb = "Kjører en DSU-bevegelsesserver (cemuhook) på 127.0.0.1:26760, drevet av gyroen i klientens kontroller eller telefon. Emulatorer som Lichii/Eden, Cemu og Dolphin leser den: velg CemuhookUDP / DSU som bevegelseskilde. Bare apper med gyromodus Aktivert får bevegelse. Trer i kraft i løpet av et par sekunder, uten omstart."
 
+["settings.motion.gyro_mouse"]
+en = "Allow gyro → mouse aim"
+nb = "Tillat gyro → musesikting"
+
+["settings.motion.gyro_mouse_desc"]
+en = "Global switch for turning controller or phone gyro into host mouse movement. Off (default): apps set to the Mouse gyro mode get raw gyro over DSU instead, and the cursor never moves from gyro. Takes effect within a couple of seconds."
+nb = "Hovedbryter for å gjøre gyro fra kontroller eller telefon om til musebevegelse på verten. Av (standard): apper med gyromodus Mus får rå gyro over DSU i stedet, og pekeren flyttes aldri av gyro. Trer i kraft i løpet av et par sekunder."
+
 ["settings.motion.hint"]
 en = "Port and axis mapping can be changed in config.toml under [dsu] (port, gyro_axes, accel_axes)."
 nb = "Port og aksetilordning kan endres i config.toml under [dsu] (port, gyro_axes, accel_axes)."
