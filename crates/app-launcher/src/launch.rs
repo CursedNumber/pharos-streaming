@@ -690,9 +690,9 @@ fn launch_in_gamescope(
 /// Launch an entry whose [`AppCompositor`] is `Xwayland`: bring up a rootful,
 /// fullscreen Xwayland on the virtual display, wait for its socket, then run
 /// the app against it (`DISPLAY=:N`, `WAYLAND_DISPLAY` scrubbed so an
-/// X11-capable toolkit can't silently prefer Wayland). No window manager runs
-/// inside the X server — right for fullscreen games/emulators, wrong for
-/// multi-window desktop apps. `-terminate 10` makes the server exit on its own
+/// X11-capable toolkit can't silently prefer Wayland). A minimal built-in
+/// window manager ([`crate::xwm`]) fills the screen with each main window and
+/// centres dialogs. `-terminate 10` makes the server exit on its own
 /// 10s after its last client disconnects. The grace delay is load-bearing: a
 /// bare `-terminate` exits on the FIRST disconnect, so an app that probes the
 /// display before opening its window (Eden/Lichii does) killed the server under
@@ -772,6 +772,8 @@ fn launch_in_xwayland(
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+
+        crate::xwm::spawn(xdpy);
 
         let mut cmd = build_command(entry, line, kind_shell)?;
         cmd.env("DISPLAY", format!(":{xdpy}"));

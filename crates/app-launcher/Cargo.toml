@@ -33,5 +33,10 @@ thiserror = { workspace = true }
 tracing = "0.1"
 serde_json = "1"
 
+# Pure-Rust X11 client (no libxcb) for the tiny fullscreen WM that runs
+# inside the per-app Xwayland (`xwm.rs`). Already in the workspace graph.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", default-features = false }
+
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

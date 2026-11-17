@@ -37,6 +37,8 @@ pub mod steam;
 /// Installed Vulkan implicit layers (ReShade, vkBasalt, the DLSS layers) and the
 /// env that arms one for a single app.
 pub mod vklayer;
+#[cfg(target_os = "linux")]
+pub mod xwm;
 
 pub use config::{AppEntry, AppKind, Catalog, FpsCap, GyroMode, LaunchKind, LaunchTarget};
 pub use launch::{launch, session_audio_sink, set_session_audio_sink, LaunchContext};
