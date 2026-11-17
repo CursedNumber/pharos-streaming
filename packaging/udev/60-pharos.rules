@@ -1,0 +1,4 @@
+# Pharos: let the logged-in desktop user create virtual input devices
+# (client gamepads become uinput Xbox 360 pads) without joining the `input`
+# group. `uaccess` grants access to whoever owns the active local seat only.
+KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", TAG+="uaccess"

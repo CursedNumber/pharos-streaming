@@ -120,11 +120,17 @@ Start with: systemctl --user enable --now pharos-host pharos-tray"""
 # Explicit, curated from `ldd` of the release binaries (dpkg-shlibdeps would
 # pin the exact libnvidia-encode-NNN driver package, which must stay a soft
 # requirement; see Recommends).
-depends = "libc6 (>= 2.35), libgcc-s1, libdrm2, libexpat1, libgbm1, libopus0, libpixman-1-0, libxkbcommon0, pulseaudio-utils, libpipewire-0.3-0"
-# The compositor dlopens EGL/GLES for rendering and needs the NVIDIA driver's
-# encode/decode libs at load time; the panel presents via Vulkan/Wayland.
-# All soft deps: package names for the NVIDIA bits vary per driver series.
-recommends = "libegl1, libgles2, libvulkan1, libwayland-client0"
+depends = "libc6 (>= 2.35), libgcc-s1, libdrm2, libegl1, libexpat1, libgbm1, libopus0, libpixman-1-0, libxkbcommon0, pulseaudio-utils, libpipewire-0.3-0"
+# The compositor dlopens EGL (hard: it renders through it, hence Depends above)
+# and needs the NVIDIA driver's encode/decode libs at load time; those package
+# names vary per driver series (libnvidia-encode1 on Debian,
+# libnvidia-encode-NNN on Ubuntu), so they stay undeclared. The panel presents
+# via Vulkan/Wayland. Xwayland runs X11 apps/games inside the stream; the
+# portal enables desktop-mirror mode.
+recommends = "libgles2, libvulkan1, libwayland-client0, xwayland, xdg-desktop-portal"
+# Per-feature extras: gamescope for the Steam Big Picture session, mpv for the
+# media-player app, ffmpeg for the software VVC encode path.
+suggests = "gamescope, mpv, ffmpeg"
 assets = [
     ["target/release/pharos-compositor", "usr/bin/", "755"],
     ["target/release/pharos-panel", "usr/bin/", "755"],
@@ -134,6 +140,8 @@ assets = [
     ["../../packaging/systemd/pharos-tray.service", "usr/lib/systemd/user/", "644"],
     ["../../packaging/systemd/pharos-usbimport.service", "usr/lib/systemd/system/", "644"],
     ["../../packaging/desktop/pharos-panel.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/udev/60-pharos.rules", "usr/lib/udev/rules.d/", "644"],
+    ["../../packaging/modules-load/pharos.conf", "usr/lib/modules-load.d/", "644"],
     ["../../packaging/icons/pharos.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
     ["../../README.md", "usr/share/doc/pharos/", "644"],
 ]

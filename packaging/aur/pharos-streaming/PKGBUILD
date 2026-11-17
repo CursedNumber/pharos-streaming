@@ -50,6 +50,11 @@ package_pharos() {
   optdepends=(
     'vulkan-driver: GPU-accelerated pharos-panel UI'
     'xdg-desktop-portal: desktop-mirror mode (issue #6) — also needs a portal backend for your desktop (e.g. xdg-desktop-portal-kde/-gnome/-wlr)'
+    'xorg-xwayland: run X11 apps and games inside the stream'
+    'gamescope: Steam Big Picture session'
+    'steam: Steam Big Picture session'
+    'mpv: media-player app'
+    'ffmpeg: software VVC encode'
   )
 
   cd "$pkgbase-$pkgver"
@@ -61,6 +66,8 @@ package_pharos() {
     -t "$pkgdir/usr/lib/systemd/system"
   install -Dm644 packaging/desktop/pharos-panel.desktop \
     -t "$pkgdir/usr/share/applications"
+  install -Dm644 packaging/udev/60-pharos.rules -t "$pkgdir/usr/lib/udev/rules.d"
+  install -Dm644 packaging/modules-load/pharos.conf -t "$pkgdir/usr/lib/modules-load.d"
   install -Dm644 packaging/icons/pharos.png \
     "$pkgdir/usr/share/icons/hicolor/256x256/apps/pharos.png"
 }

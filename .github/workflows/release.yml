@@ -117,6 +117,7 @@ jobs:
              target/release/pharos-tray target/release/pharos-usbimport "stage/$H/"
           cp packaging/systemd/*.service "stage/$H/systemd/"
           cp packaging/desktop/pharos-panel.desktop packaging/icons/pharos.png \
+             packaging/udev/60-pharos.rules packaging/modules-load/pharos.conf \
              LICENSE README.md "stage/$H/"
 
           C="trireme-$VER-linux-x86_64"
