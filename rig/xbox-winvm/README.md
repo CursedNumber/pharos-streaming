@@ -62,8 +62,10 @@ sendkeys — the guest layout is assumed en-US.
    the share.
 5. `phase1.log` ends in `PHASE1 VERDICT: PASS/FAIL — …`.
 
-Guest credentials: `dev` / `trireme-dev` (RDP on 127.0.0.1:3389, noVNC on
-127.0.0.1:8006 — view only).
+Guest credentials: user `dev`; the password is `$XBOX_VM_PASSWORD` if set,
+otherwise a random one `run-vm.sh` generates on first run into
+`~/xbox-winvm/password`. RDP on 127.0.0.1:3389, noVNC on 127.0.0.1:8006 (view
+only).
 
 ## Deploy + stream-test on a REAL console (Dev Mode)
 

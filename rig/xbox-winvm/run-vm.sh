@@ -25,6 +25,18 @@ chattr +C "$VMDIR/storage" 2>/dev/null || true
 
 # The oem hook + agent come from the repo (rig/xbox-winvm/).
 HERE="$(cd "$(dirname "$0")" && pwd)"
+
+# Guest password: $XBOX_VM_PASSWORD, else a random one generated on first run
+# and kept in $VMDIR/password (mode 600). Only a fresh install applies it.
+PWFILE="$VMDIR/password"
+if [[ -z "${XBOX_VM_PASSWORD:-}" ]]; then
+    if [[ ! -s "$PWFILE" ]]; then
+        mkdir -p "$VMDIR"
+        (umask 077; head -c 18 /dev/urandom | base64 | tr -d '/+=' > "$PWFILE")
+        echo "Generated a guest password in $PWFILE"
+    fi
+    XBOX_VM_PASSWORD="$(cat "$PWFILE")"
+fi
 cp "$HERE/oem-install.bat" "$VMDIR/oem/install.bat"
 cp "$HERE/oem-setup.ps1" "$VMDIR/oem/setup.ps1"
 mkdir -p "$VMDIR/shared/cmd/sys" "$VMDIR/shared/cmd/user"
@@ -40,7 +52,7 @@ sudo docker run -d --name "$NAME" \
     -v "$VMDIR/shared:/data" \
     -v "$VMDIR/oem:/oem" \
     -v "$ISO:/custom.iso" \
-    -e VERSION=11 -e USERNAME=dev -e PASSWORD=trireme-dev \
+    -e VERSION=11 -e USERNAME=dev -e PASSWORD="$XBOX_VM_PASSWORD" \
     -e CPU_CORES=8 -e RAM_SIZE=10G -e DISK_SIZE=128G \
     dockurr/windows:latest
 
