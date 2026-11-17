@@ -29,6 +29,8 @@ use std::path::PathBuf;
 pub mod config;
 pub mod env;
 pub mod launch;
+/// Per-client copies of chosen sections of an app's own config (pad mappings).
+pub mod per_client;
 pub mod redirect;
 pub mod scan;
 /// Steam readiness + lifecycle (prewarm / shutdown), used by the compositor's
@@ -40,7 +42,9 @@ pub mod vklayer;
 #[cfg(target_os = "linux")]
 pub mod xwm;
 
-pub use config::{AppEntry, AppKind, Catalog, FpsCap, GyroMode, LaunchKind, LaunchTarget};
+pub use config::{
+    AppEntry, AppKind, Catalog, FpsCap, GyroMode, LaunchKind, LaunchTarget, PerClientFile,
+};
 pub use launch::{launch, session_audio_sink, set_session_audio_sink, LaunchContext};
 pub use scan::{DesktopApp, SteamGame};
 pub use vklayer::LayerFamily;

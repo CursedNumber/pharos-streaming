@@ -90,6 +90,11 @@ pub struct HostInput {
     /// `pid_alive`). We keep the handle here and `try_wait()` it every frame
     /// alongside `running_apps` until it exits, so the process is always reaped.
     orphaned_children: Vec<(String, Child)>,
+    /// Which paired client (hex pubkey) launched each tracked app, so its
+    /// per-client app config (e.g. an emulator's pad mapping) is saved back
+    /// under that client when the app exits. Absent = no client (panel/CLI
+    /// launch with nobody connected, or an anonymous client).
+    app_clients: HashMap<String, String>,
     /// DSU slot the host-read Flydigi gyro is published on, while one streams.
     flydigi_slot: Option<u8>,
 }
@@ -112,6 +117,7 @@ impl HostInput {
             active_app_gyro_mode: GyroMode::default(),
             running_apps: HashMap::new(),
             orphaned_children: Vec::new(),
+            app_clients: HashMap::new(),
             flydigi_slot: None,
         }
     }
@@ -126,7 +132,14 @@ impl HostInput {
     /// process would zombie on exit (which latched `steam_session_active` and
     /// wedged the game-redirect for a gamescope session). We keep the displaced
     /// handle in `orphaned_children` so `reap_exited_apps` still reaps it.
-    pub fn track_app_child(&mut self, slug: String, child: Child) {
+    ///
+    /// `client` (the launching client's pairing pubkey) is remembered so the
+    /// app's per-client config is saved under it on exit.
+    pub fn track_app_child(&mut self, slug: String, child: Child, client: Option<String>) {
+        match client {
+            Some(c) => self.app_clients.insert(slug.clone(), c),
+            None => self.app_clients.remove(&slug),
+        };
         if let Some(old) = self.running_apps.insert(slug.clone(), child) {
             self.orphaned_children.push((slug, old));
         }
@@ -142,20 +155,28 @@ impl HostInput {
     /// case, so this matches the prior nesting story.)
     pub fn reap_exited_apps(&mut self) {
         let mut exited = false;
+        let mut gone: Vec<String> = Vec::new();
         self.running_apps
             .retain(|slug, child| match child.try_wait() {
                 Ok(Some(status)) => {
                     info!("app '{slug}' exited (status {status})");
                     exited = true;
+                    gone.push(slug.clone());
                     false
                 }
                 Err(e) => {
                     tracing::warn!("app '{slug}' try_wait failed: {e}; dropping handle");
                     exited = true;
+                    gone.push(slug.clone());
                     false
                 }
                 Ok(None) => true,
             });
+        for slug in gone {
+            if let Some(client) = self.app_clients.remove(&slug) {
+                save_per_client_config(slug, client);
+            }
+        }
         // Reap displaced (re-launched-over) children too, so none zombies. These
         // don't drive the gyro-reset side effect — they're already superseded.
         self.orphaned_children
@@ -444,5 +465,24 @@ impl HostInput {
             pkt.extend_from_slice(&gz.to_le_bytes());
             send(pkt);
         }
+    }
+}
+
+/// Save an exited app's per-client config sections (if its entry lists any)
+/// under the client that launched it. Off the render thread: it reads the
+/// catalog and the app's config file, and the loop must never block on disk
+/// (lesson-render-loop-no-block).
+fn save_per_client_config(slug: String, client: String) {
+    let label = slug.clone();
+    let spawned = std::thread::Builder::new()
+        .name("pharos-per-client-save".into())
+        .spawn(move || {
+            let catalog = app_launcher::config::load_with_builtins();
+            if let Some(entry) = catalog.find(&slug) {
+                app_launcher::per_client::save(entry, &client);
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("app '{label}': per-client config save thread failed to start: {e}");
     }
 }

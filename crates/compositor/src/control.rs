@@ -1011,19 +1011,22 @@ pub fn spawn_media_player(
 /// the single- and multi-output capture loops, and by the `launch-app` CLI verb
 /// once it reaches the host. Mirrors [`spawn_media_player`]: never `?`, returns a
 /// human error so a bad slug fails the request, not the host. A no-op entry (the
-/// Desktop built-in, empty command) succeeds with `Ok(None)`.
+/// Desktop built-in, empty command) succeeds with `Ok(None)`. `client` is the
+/// live client's pairing pubkey (hex), which picks its per-client app config.
 pub fn launch_app(
     slug: &str,
     socket_name: &std::ffi::OsStr,
     output_fps: u32,
     output_size: Option<(u32, u32)>,
+    client: Option<String>,
 ) -> Result<Option<std::process::Child>, String> {
     // `output_fps` is the virtual output's refresh (the single global pacer), so
     // an app's `FpsCap::Auto` resolves to "match the stream rate". `output_size`
     // is the primary output's native mode — it sizes a steam-session's gamescope
     // output to the streamed surface (issue #38).
     let mut ctx = app_launcher::LaunchContext::wayland(socket_name.to_os_string())
-        .with_output_fps(output_fps);
+        .with_output_fps(output_fps)
+        .with_client(client);
     if let Some((w, h)) = output_size {
         ctx = ctx.with_output_size(w, h);
     }

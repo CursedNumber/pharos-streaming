@@ -341,6 +341,23 @@ pub struct AppEntry {
     /// is constrained.)
     #[serde(default)]
     pub fps_cap: FpsCap,
+    /// Files of the app's own config to keep a separate copy of per paired
+    /// client (by section), e.g. an emulator's `[Controls]` in `qt-config.ini`
+    /// so the phone, the TV, and the Xbox each keep their own pad mapping. See
+    /// [`crate::per_client`]. Emitted as `[[app.per_client_config]]` tables, so
+    /// it sits after every scalar field (TOML's tables-come-last rule).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub per_client_config: Vec<PerClientFile>,
+}
+
+/// One per-client config file: a path (a leading `~/` means the host user's
+/// home) and the INI section names in it to keep per client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerClientFile {
+    /// The app's config file, e.g. `~/.config/lichii/qt-config.ini`.
+    pub file: String,
+    /// Section names without brackets, e.g. `["Controls"]`.
+    pub sections: Vec<String>,
 }
 
 impl AppEntry {
@@ -362,6 +379,7 @@ impl AppEntry {
             compositor: AppCompositor::default(),
             perf_overlay: false,
             fps_cap: FpsCap::default(),
+            per_client_config: Vec::new(),
         }
     }
 
@@ -391,6 +409,7 @@ impl AppEntry {
             compositor: AppCompositor::default(),
             perf_overlay: false,
             fps_cap: FpsCap::default(),
+            per_client_config: Vec::new(),
         }
     }
 
@@ -416,6 +435,7 @@ impl AppEntry {
             compositor: AppCompositor::default(),
             perf_overlay: false,
             fps_cap: FpsCap::default(),
+            per_client_config: Vec::new(),
         }
     }
 
@@ -768,6 +788,45 @@ mod tests {
         "#;
         let c: Catalog = toml::from_str(legacy).unwrap();
         assert_eq!(c.find("old").unwrap().fps_cap, FpsCap::Off);
+    }
+
+    #[test]
+    fn per_client_config_roundtrips_after_fixed_fps_cap() {
+        // Both are tables in TOML; the hand-written shape must parse, and a
+        // save (with a `[app.fps_cap]` sub-table before it) must come back.
+        let hand = r#"
+            [[app]]
+            slug = "lichii"
+            name = "Lichii"
+            command = "lichii"
+            fps_cap = { fixed = 60 }
+
+            [[app.per_client_config]]
+            file = "~/.config/lichii/qt-config.ini"
+            sections = ["Controls"]
+        "#;
+        let cat: Catalog = toml::from_str(hand).unwrap();
+        let e = cat.find("lichii").unwrap();
+        assert_eq!(
+            e.per_client_config,
+            vec![PerClientFile {
+                file: "~/.config/lichii/qt-config.ini".into(),
+                sections: vec!["Controls".into()],
+            }]
+        );
+        let text = toml::to_string_pretty(&cat).unwrap();
+        let back: Catalog = toml::from_str(&text).unwrap();
+        assert_eq!(cat, back);
+        // Empty stays out of the file entirely.
+        let plain = toml::to_string_pretty(&Catalog {
+            apps: vec![AppEntry {
+                slug: "x".into(),
+                name: "X".into(),
+                ..AppEntry::new()
+            }],
+        })
+        .unwrap();
+        assert!(!plain.contains("per_client_config"));
     }
 
     #[test]

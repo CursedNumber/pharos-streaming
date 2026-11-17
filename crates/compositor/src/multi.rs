@@ -789,6 +789,18 @@ fn mirror_target_slug(slug: &str) -> bool {
 /// gamescope output — issue #38). Native `width`/`height`, NOT the DRC-scaled
 /// coded size: the session renders at the streamed surface's full mode and the
 /// resolution ladder keeps downscaling the encode underneath it.
+/// Lowercase-hex pairing pubkey of the live client, if one is connected and
+/// paired. The host serves one client at a time (a new one pre-empts), so this
+/// is the client an app launch is for; in mirror mode it is the first live
+/// pipeline's. Keys per-client app config (`app_launcher::per_client`).
+fn connected_client(pipelines: &[Option<Pipeline>]) -> Option<String> {
+    pipelines
+        .iter()
+        .flatten()
+        .filter_map(|p| p.streamer.as_ref())
+        .find_map(|s| s.connected_pubkey())
+}
+
 fn primary_output_size(pipelines: &[Option<Pipeline>]) -> Option<(u32, u32)> {
     pipelines
         .first()
@@ -3473,7 +3485,14 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                     // panel-launched app.
                     data.state.pending_app_launch = Some((slug.clone(), std::time::Instant::now()));
                     let out_size = primary_output_size(&pipelines);
-                    match crate::control::launch_app(&slug, &socket_name, launch_fps, out_size) {
+                    let client = connected_client(&pipelines);
+                    match crate::control::launch_app(
+                        &slug,
+                        &socket_name,
+                        launch_fps,
+                        out_size,
+                        client.clone(),
+                    ) {
                         Ok(child) => {
                             info!("panel: launched app '{slug}'");
                             // Per-app gyro policy: read the saved entry's mode
@@ -3494,7 +3513,7 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                             #[cfg(feature = "portal-mirror")]
                             apply_capture_target(&mut pipelines, entry.map(|e| &e.target));
                             if let Some(c) = child {
-                                host_input.track_app_child(slug, c);
+                                host_input.track_app_child(slug, c, client);
                             }
                             let _ = reply.send(Ok(()));
                         }
@@ -3833,7 +3852,14 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                         data.state.pending_app_launch =
                             Some((id.clone(), std::time::Instant::now()));
                         let out_size = primary_output_size(&pipelines);
-                        match crate::control::launch_app(&id, &socket_name, launch_fps, out_size) {
+                        let client = connected_client(&pipelines);
+                        match crate::control::launch_app(
+                            &id,
+                            &socket_name,
+                            launch_fps,
+                            out_size,
+                            client.clone(),
+                        ) {
                             Ok(child) => {
                                 info!("client: launched app '{id}'");
                                 let catalog = app_launcher::config::load_with_builtins();
@@ -3847,7 +3873,7 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                                 #[cfg(feature = "portal-mirror")]
                                 apply_capture_target(&mut pipelines, entry.map(|e| &e.target));
                                 if let Some(c) = child {
-                                    host_input.track_app_child(id, c);
+                                    host_input.track_app_child(id, c, client);
                                 }
                             }
                             Err(e) => {

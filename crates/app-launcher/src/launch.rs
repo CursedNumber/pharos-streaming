@@ -54,6 +54,10 @@ pub struct LaunchContext {
     /// Sizes a [`LaunchKind::SteamSession`]'s gamescope output (`-W`/`-H`) to
     /// the streamed surface; `None` (CLI/tests) falls back to 1920×1080.
     pub output_size: Option<(u32, u32)>,
+    /// Lowercase-hex pairing pubkey of the client this launch is for, if any.
+    /// Keys the app's [`per_client_config`](crate::AppEntry::per_client_config)
+    /// snapshot ([`crate::per_client`]); `None` (host-local, anonymous) skips it.
+    pub client: Option<String>,
 }
 
 impl LaunchContext {
@@ -70,7 +74,15 @@ impl LaunchContext {
             audio_sink: session_audio_sink(),
             output_fps: None,
             output_size: None,
+            client: None,
         }
+    }
+
+    /// Record which paired client this launch is for (lowercase-hex pubkey),
+    /// so its per-client app config is restored before the spawn.
+    pub fn with_client(mut self, client: Option<String>) -> Self {
+        self.client = client;
+        self
     }
 
     /// Record the live virtual output's refresh (whole FPS), used to resolve an
@@ -201,6 +213,13 @@ pub fn launch(entry: &AppEntry, ctx: &LaunchContext) -> anyhow::Result<Option<Ch
             entry.slug
         );
         return Ok(None);
+    }
+
+    // A real spawn follows (the already-running no-op returned above): put this
+    // client's saved sections (e.g. its pad mapping) into the app's config
+    // first. Best-effort; failures are logged inside.
+    if let Some(client) = ctx.client.as_deref() {
+        crate::per_client::restore(entry, client);
     }
 
     // Per-app compositor routing (see [`AppCompositor`]): a non-builtin host
