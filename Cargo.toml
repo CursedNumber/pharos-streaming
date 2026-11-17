@@ -40,7 +40,6 @@ version = "0.1.0"
 edition = "2021"
 # GPLv3 — matches the Sunshine/Moonlight lineage this project descends from.
 license = "GPL-3.0-or-later"
-authors = ["The Pharos/Trireme authors"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

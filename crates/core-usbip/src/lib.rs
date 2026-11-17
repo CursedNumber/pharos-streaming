@@ -625,7 +625,9 @@ pub mod hello {
         /// Fill `interfaces` from `n` triples read after the fixed block.
         pub fn parse_interfaces(&mut self, b: &[u8]) {
             self.interfaces = b
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .map(|c| Interface {
                     class: c[0],
                     subclass: c[1],

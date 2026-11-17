@@ -420,8 +420,8 @@ mod tests {
         let px = [0x56u8, 0x34, 0x12, 0x00];
         let pixels: Vec<u8> = px.iter().cycle().take(2 * 2 * 4).copied().collect();
         blit(&mut fb, 2, &rect(0, 0, 2, 2), &pixels, &fmt);
-        for chunk in fb.chunks_exact(4) {
-            assert_eq!(chunk, [0x12, 0x34, 0x56, 255], "RGBA from BGRA wire pixel");
+        for chunk in fb.as_chunks::<4>().0 {
+            assert_eq!(*chunk, [0x12, 0x34, 0x56, 255], "RGBA from BGRA wire pixel");
         }
     }
 

@@ -26,7 +26,12 @@ pub fn bgrx_to_rgba(src: &[u8], width: usize, height: usize, stride: usize, dst:
         }
         let src_row = &src[row_off..row_off + row_bytes];
         let dst_row = &mut dst[y * row_bytes..(y + 1) * row_bytes];
-        for (s, d) in src_row.chunks_exact(4).zip(dst_row.chunks_exact_mut(4)) {
+        for (s, d) in src_row
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(dst_row.as_chunks_mut::<4>().0)
+        {
             d[0] = s[2]; // R ← src.R (byte 2)
             d[1] = s[1]; // G ← src.G (byte 1)
             d[2] = s[0]; // B ← src.B (byte 0)

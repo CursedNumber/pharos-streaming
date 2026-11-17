@@ -232,7 +232,7 @@ fn load_logo(px: u32) -> Option<(u32, u32, Vec<u8>)> {
         .resize_exact(px, px, image::imageops::FilterType::Triangle)
         .to_rgba8()
         .into_raw();
-    for p in rgba.chunks_exact_mut(4) {
+    for p in rgba.as_chunks_mut::<4>().0 {
         let a = p[3] as u32;
         p[0] = (p[0] as u32 * a / 255) as u8;
         p[1] = (p[1] as u32 * a / 255) as u8;
