@@ -59,15 +59,13 @@ option is ever wanted before upstream Wine matures.
 **All of A–G shipped this session** (`c40aee0` derive USB/IP target from the paired host; `4f4d37e`/`20138fb` de-personalize
 example IPs, the MQTT broker hint, `devbox`/`peripheralmox`/`couchpi` names, the `/home/user` doc path + `personal-name …`
 examples; `032185c` centralizes ports into `core_proto::ports`). An adversarial completeness sweep confirmed no
-`192.0.2.*`, broker IP, or personal machine-name survives in tracked source; `bücher.example` is deliberately retained as the
-IDNA example. The one remaining literal-port note (pharos-win help text shows `4432`/`4435`) is cosmetic display drift only.
+`192.0.2.*`, broker IP, or personal machine-name survives in tracked source; `bücher.example` serves as the IDNA example. The one remaining literal-port note (pharos-win help text shows `4432`/`4435`) is cosmetic display drift only.
 
 Inventory of personal-network literals and magic ports baked into the source. None
 are bugs; the concern is **publication** (this repo will go public) and **portability**
 (someone else's LAN is not `192.0.2.x`). The fix in every case is the same shape:
 lift the literal into config/env/a named constant with a neutral default. Listed
-worst-first. The `bücher.example` DDNS domain is **deliberately not here** — it's already
-public and intended to stay. Generated bindings under `client/shared/generated/` are
+worst-first. Generated bindings under `client/shared/generated/` are
 gitignored, so their mirrored doc-comments don't ship.
 
 ### A. Functional — a personal LAN address ships as the default behavior

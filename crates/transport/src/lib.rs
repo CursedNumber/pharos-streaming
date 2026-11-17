@@ -5926,9 +5926,12 @@ mod tests {
         // Malformed input (no port) is rejected, not panicked.
         assert!(super::resolve_addr("nope").is_err());
         // The IDN path: the Unicode host must IDNA-encode to punycode. We can't
-        // assert DNS success offline, but the punycode form of the user's domain
+        // assert DNS success offline, but the punycode form of a Unicode domain
         // must equal the expected `xn--` label (proves ToASCII ran, not raw UTF-8).
-        assert_eq!(idna::domain_to_ascii("bücher.example").unwrap(), "xn--bcher-kva.example");
+        assert_eq!(
+            idna::domain_to_ascii("bücher.example").unwrap(),
+            "xn--bcher-kva.example"
+        );
     }
 
     #[test]

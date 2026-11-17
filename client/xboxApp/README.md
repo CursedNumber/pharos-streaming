@@ -35,7 +35,7 @@ nothing and you will chase a phantom. In `Package.appxmanifest`:
 <Capabilities>
   <!-- LAN peers (host on your local network) -->
   <Capability Name="privateNetworkClientServer" />
-  <!-- WAN (pharos.example.com failover); drop if you only ever stream on the LAN -->
+  <!-- WAN (DDNS failover); drop if you only ever stream on the LAN -->
   <Capability Name="internetClientServer" />
 </Capabilities>
 ```

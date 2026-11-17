@@ -138,7 +138,7 @@ browser presents a short PIN or token to the bridge). Later, compile
 - **Xbox Edge API coverage** (Phase 0) — the whole thing hinges on it; unverifiable remotely.
 - **Secure context** — WebTransport/WebCodecs are secure-context-only. The SPA
   must be served over HTTPS; on the LAN that means a self-signed cert and a
-  click-through warning in Edge, or serving via the real `pharos.example.com` origin.
+  click-through warning in Edge, or serving via your own real HTTPS origin.
 - **Cert rotation** — the ≤14-day ECDSA cert needs an automatic regen+republish
   in the bridge, or WebTransport silently stops connecting after two weeks
   (a WAN-port-style trap).

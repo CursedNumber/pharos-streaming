@@ -46,7 +46,7 @@
   <Capabilities>
     <!-- LAN peers (the Pharos host on the local network). -->
     <Capability Name="privateNetworkClientServer" />
-    <!-- WAN failover (pharos.example.com) + anything routed (the VM's NAT). -->
+    <!-- WAN failover (DDNS) + anything routed (the VM's NAT). -->
     <Capability Name="internetClient" />
     <Capability Name="internetClientServer" />
   </Capabilities>
