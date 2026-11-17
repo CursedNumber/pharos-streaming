@@ -193,9 +193,10 @@ pub enum InputEvent {
     GamepadConnect { slot: u8, vendor: u16, product: u16 },
     /// A controller went away; the host drops the pad for `slot`.
     GamepadDisconnect { slot: u8 },
-    /// Motion-sensor sample for gyro-aim: gyroscope (rad/s — `gx`=pitch,
-    /// `gy`=yaw, `gz`=roll) + accelerometer (g). The host converts gyro into
-    /// relative mouse motion. Accel is forwarded for future tilt/levelling use.
+    /// Motion-sensor sample: gyroscope (rad/s) + accelerometer (m/s², Android
+    /// `SensorEvent` units), in the sending device's own axis frame. The host
+    /// turns gyro into relative mouse motion (GyroMode::Mouse) or relays both to
+    /// emulators over its DSU server (GyroMode::Enabled).
     GamepadMotion {
         slot: u8,
         gx: f32,

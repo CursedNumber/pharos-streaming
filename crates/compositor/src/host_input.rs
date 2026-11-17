@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::process::Child;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{dispatch_gyro_mouse, gamepad, gyro_imu, CalloopData};
+use crate::{dispatch_gyro_mouse, dsu, gamepad, gyro_imu, CalloopData};
 use app_launcher::GyroMode;
 use core_proto::InputEvent;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -47,6 +47,8 @@ pub struct HostInput {
     pub pads: gamepad::PadManager,
     pub controller_profiles: host_core::controller_profiles::ControllerProfiles,
     pub gyro_imu: gyro_imu::GyroImu,
+    /// DSU motion server: client gyro → emulators (`config.toml [dsu]`).
+    pub dsu: dsu::DsuServer,
     /// Absolute cursor position used by gyro→mouse aim (clamped to output).
     pub gyro_cursor: (f64, f64),
     /// Throttle counter for the gyro→mouse diagnostic log.
@@ -93,6 +95,7 @@ impl HostInput {
             pads: gamepad::PadManager::new(),
             controller_profiles: host_core::controller_profiles::ControllerProfiles::load(),
             gyro_imu: gyro_imu::GyroImu::spawn(),
+            dsu: dsu::DsuServer::spawn(),
             gyro_cursor: (f64::from(width) / 2.0, f64::from(height) / 2.0),
             gyro_log: 0,
             last_gyro_seq: 0,
@@ -206,6 +209,7 @@ impl HostInput {
                 product,
             } => {
                 self.pads.connect(slot, vendor, product);
+                self.dsu.pad(slot, true);
                 // Apply this controller's saved feel: face swaps to the pad,
                 // gyro tuning to the IMU reader. Unsaved controllers fall
                 // back to the built-in default profile.
@@ -221,6 +225,7 @@ impl HostInput {
             }
             InputEvent::GamepadDisconnect { slot } => {
                 self.pads.disconnect(slot);
+                self.dsu.pad(slot, false);
                 // Flip the matching liveness entry to `connected = false` but
                 // preserve its `last_connected_ms` so "Saved" rows still sort
                 // by when they last appeared.
@@ -236,11 +241,24 @@ impl HostInput {
                 pressed,
             } => self.pads.button(slot, button, pressed),
             InputEvent::GamepadAxis { slot, axis, value } => self.pads.axis(slot, axis, value),
-            InputEvent::GamepadMotion { gx, gy, gz, .. } => {
+            InputEvent::GamepadMotion {
+                slot,
+                gx,
+                gy,
+                gz,
+                ax,
+                ay,
+                az,
+            } => {
+                // Enabled = raw gyro reaches the game. The virtual Xbox pad has no
+                // gyro axes, so "raw" means the DSU server, which emulators read
+                // (a no-op while `[dsu]` is off).
+                if self.active_app_gyro_mode == GyroMode::Enabled {
+                    self.dsu.motion(slot, [gx, gy, gz], [ax, ay, az]);
+                }
                 // A client pad's gyro becomes mouse aim ONLY when the active app opted
                 // into GyroMode::Mouse (apps.toml). Enabled (the default) and Disabled
-                // must NOT wander the cursor — and a virtual Xbox pad has no gyro axes,
-                // so there's nothing to forward raw to the game either; we just drop.
+                // must NOT wander the cursor.
                 // This mirrors the USB/IP IMU path's gate in `drain_gyro_per_frame`;
                 // without it this arm ran unconditionally, so a phone-attached gyro pad
                 // flooded the host cursor regardless of GyroMode or the client's

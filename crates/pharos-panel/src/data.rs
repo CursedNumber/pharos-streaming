@@ -163,6 +163,15 @@ struct HostConfigToml {
     network: NetworkToml,
     #[serde(default)]
     compositor: CompositorToml,
+    #[serde(default)]
+    dsu: DsuToml,
+}
+
+/// Only the switch: `port`/`bind`/axis remaps are hand-edited and preserved.
+#[derive(Debug, Default, Deserialize)]
+struct DsuToml {
+    #[serde(default)]
+    enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -297,6 +306,7 @@ pub fn load_host_config() -> HostConfigUi {
         bind_mac: cfg.network.bind_mac.unwrap_or_default(),
         ipv6: cfg.network.ipv6,
         enable_virtual_displays: cfg.compositor.enable_virtual_displays,
+        dsu_enabled: cfg.dsu.enabled,
     }
 }
 
@@ -369,6 +379,20 @@ fn merge_host_config_toml(existing: &str, c: &HostConfigUi) -> Result<String> {
         compositor.insert("enable_virtual_displays".into(), false.into());
     }
     root.insert("compositor".into(), compositor.into());
+
+    // [dsu]: edit in place so hand-set port/bind/axis remaps survive.
+    let mut dsu = match root.remove("dsu") {
+        Some(toml::Value::Table(t)) => t,
+        _ => toml::Table::new(),
+    };
+    if c.dsu_enabled {
+        dsu.insert("enabled".into(), true.into());
+    } else {
+        dsu.remove("enabled");
+    }
+    if !dsu.is_empty() {
+        root.insert("dsu".into(), dsu.into());
+    }
 
     toml::to_string_pretty(&root).context("serialize config.toml")
 }

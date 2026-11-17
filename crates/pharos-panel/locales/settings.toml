@@ -162,6 +162,23 @@ nb = "Den innebygde Skrivebord-flisen speiler fortsatt det virkelige skriveborde
 en = "Every app now streams your real desktop. Per-app display choices in the app editor are ignored while this is off."
 nb = "Alle apper strømmer nå det virkelige skrivebordet ditt. Valg av skjerm per app i appredigereren blir ignorert så lenge dette er av."
 
+# --- Motion (DSU server) -----------------------------------------------------
+["settings.motion.title"]
+en = "Motion (gyro for emulators)"
+nb = "Bevegelse (gyro for emulatorer)"
+
+["settings.motion.dsu_enabled"]
+en = "Share client gyro over DSU"
+nb = "Del klientens gyro over DSU"
+
+["settings.motion.dsu_enabled_desc"]
+en = "Runs a DSU (cemuhook) motion server on 127.0.0.1:26760, fed by the gyro of the client's controller or phone. Emulators like Lichii/Eden, Cemu, and Dolphin read it: pick CemuhookUDP / DSU as the motion source. Only apps whose gyro mode is Enabled receive motion. Takes effect within a couple of seconds, no restart."
+nb = "Kjører en DSU-bevegelsesserver (cemuhook) på 127.0.0.1:26760, drevet av gyroen i klientens kontroller eller telefon. Emulatorer som Lichii/Eden, Cemu og Dolphin leser den: velg CemuhookUDP / DSU som bevegelseskilde. Bare apper med gyromodus Aktivert får bevegelse. Trer i kraft i løpet av et par sekunder, uten omstart."
+
+["settings.motion.hint"]
+en = "Port and axis mapping can be changed in config.toml under [dsu] (port, gyro_axes, accel_axes)."
+nb = "Port og aksetilordning kan endres i config.toml under [dsu] (port, gyro_axes, accel_axes)."
+
 # --- Security ---------------------------------------------------------------
 ["settings.security.title"]
 en = "Security"

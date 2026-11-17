@@ -112,6 +112,7 @@ fun SettingsPane(onOpenControllers: () -> Unit = {}) {
     // it). StreamHub owns the source of truth (also read at process start) and
     // applies on the NEXT dial.
     var gyroOn by remember { mutableStateOf(StreamHub.isGyroEnabled()) }
+    var phoneGyro by remember { mutableStateOf(StreamHub.isPhoneGyro()) }
     // Touch-pointer mode (absolute vs trackpad). Applies immediately — no re-dial.
     var touchAbs by remember { mutableStateOf(StreamHub.isTouchAbsolute()) }
     // Controller-as-cursor: the manual on/off (tracks the shared StateFlow so the
@@ -292,6 +293,24 @@ fun SettingsPane(onOpenControllers: () -> Unit = {}) {
                 val next = !gyroOn
                 gyroOn = next
                 StreamHub.setGyroEnabled(next)
+            },
+        )
+
+        // --- Gyro source: controller IMU or this phone's own sensors ---------
+        // Applies live. Phone = a phone in a clip-on controller, or a pad with no
+        // gyro: the phone's motion drives the game (DSU) or the cursor.
+        val gyroSourceLabel = if (phoneGyro) "Phone" else "Controller"
+        SettingRow(
+            title = "Gyro source",
+            summary = "Where gyro comes from: the controller's motion sensor, or " +
+                "this phone's own (for a phone clipped into a controller). Needs " +
+                "the gyro setting above.",
+            trailing = gyroSourceLabel,
+            state = gyroSourceLabel,
+            onClick = {
+                val next = !phoneGyro
+                phoneGyro = next
+                StreamHub.setPhoneGyro(next)
             },
         )
 

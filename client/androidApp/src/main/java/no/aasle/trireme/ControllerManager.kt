@@ -8,12 +8,15 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.hardware.display.DisplayManager
 import android.hardware.input.InputManager
 import android.os.Build
 import android.util.Log
+import android.view.Display
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.Surface
 import no.aasle.trireme.stream.StreamHub
 import uniffi.core_ffi.GamepadInput
 import uniffi.core_ffi.classifyController
@@ -65,6 +68,7 @@ class ControllerManager(
     private val slotOf = HashMap<Int, Int>() // deviceId -> slot
     private val used = BooleanArray(MAX_PADS)
     private val gyro = HashMap<Int, GyroReg>() // deviceId -> sensor registration
+    private var phoneGyro: GyroReg? = null // this phone's own IMU, when it's the gyro source
     private val lastButton = HashMap<Long, Boolean>()
     private val lastAxis = HashMap<Long, Float>()
     private val dpadHeld = HashMap<Int, MutableSet<Int>>() // slot -> held d-pad keycodes
@@ -79,6 +83,7 @@ class ControllerManager(
             InputDevice.getDevice(id)?.let { if (isGamepad(it)) attach(it) }
         }
         relayUsbExportProfiles()
+        if (managed && StreamHub.isGyroEnabled() && StreamHub.isPhoneGyro()) registerPhoneGyro()
     }
 
     /**
@@ -108,6 +113,7 @@ class ControllerManager(
     fun stop() {
         inputManager.unregisterInputDeviceListener(this)
         for (id in slotOf.keys.toList()) detach(id)
+        unregisterPhoneGyro()
     }
 
     /**
@@ -182,7 +188,9 @@ class ControllerManager(
         // host cursor (fighting the pad, "wild" motion) with the toggle off. Read at
         // attach; a live flip applies on the next reconnect, matching the wants_gyro
         // handshake contract (the setting "applies on next dial").
-        if (managed && StreamHub.isGyroEnabled()) registerGyro(d, slot)
+        // With the phone as the gyro source the pad's own IMU stays off: two
+        // sources on one slot would be summed host-side.
+        if (managed && StreamHub.isGyroEnabled() && !StreamHub.isPhoneGyro()) registerGyro(d, slot)
     }
 
     private fun detach(deviceId: Int) {
@@ -337,6 +345,72 @@ class ControllerManager(
     }
 
     /**
+     * Stream this phone's own gyro + accelerometer (Settings → Gyro source → Phone),
+     * for a phone clipped into a controller or a pad without a gyro. Samples go to
+     * the lowest attached pad's slot (slot 0 with none), so an emulator pairs them
+     * with player 1. The phone's axes are re-expressed in Trireme's canonical frame
+     * (landscape, top edge to the left) whatever the screen rotation, so turning the
+     * phone over doesn't flip the host's axis mapping.
+     */
+    private fun registerPhoneGyro() {
+        if (phoneGyro != null) return
+        val sm = appContext.getSystemService(Context.SENSOR_SERVICE) as? SensorManager ?: return
+        val g = sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+        if (g == null) {
+            Log.w(TAG, "phone gyro requested but this device has no gyroscope")
+            return
+        }
+        val accel = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        val display = (appContext.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager)
+            ?.getDisplay(Display.DEFAULT_DISPLAY)
+        val listener = object : SensorEventListener {
+            private val a = FloatArray(3)
+            private val out = FloatArray(3)
+            override fun onSensorChanged(e: SensorEvent) {
+                val rot = display?.rotation ?: Surface.ROTATION_90
+                when (e.sensor.type) {
+                    Sensor.TYPE_ACCELEROMETER -> canonical(e.values, rot, a)
+                    Sensor.TYPE_GYROSCOPE -> {
+                        canonical(e.values, rot, out)
+                        val slot = slotOf.values.minOrNull() ?: 0
+                        sink.motion(slot.toUByte(), out[0], out[1], out[2], a[0], a[1], a[2])
+                    }
+                }
+            }
+            override fun onAccuracyChanged(s: Sensor?, accuracy: Int) {}
+        }
+        sm.registerListener(listener, g, SensorManager.SENSOR_DELAY_GAME)
+        if (accel != null) sm.registerListener(listener, accel, SensorManager.SENSOR_DELAY_GAME)
+        phoneGyro = GyroReg(sm, listener)
+        Log.i(TAG, "phone gyro streaming")
+    }
+
+    private fun unregisterPhoneGyro() {
+        phoneGyro?.let {
+            it.sm.unregisterListener(it.listener)
+            Log.i(TAG, "phone gyro stopped")
+        }
+        phoneGyro = null
+    }
+
+    /**
+     * Device-frame vector → the canonical ROTATION_90 device frame. Derivation: map
+     * device axes to screen axes for the current rotation, then back to the device
+     * axes they'd be at ROTATION_90 (z, out of the screen, never changes).
+     */
+    private fun canonical(v: FloatArray, rotation: Int, out: FloatArray) {
+        val x = v[0]
+        val y = v[1]
+        when (rotation) {
+            Surface.ROTATION_0 -> { out[0] = y; out[1] = -x }
+            Surface.ROTATION_180 -> { out[0] = -y; out[1] = x }
+            Surface.ROTATION_270 -> { out[0] = -x; out[1] = -y }
+            else -> { out[0] = x; out[1] = y }
+        }
+        out[2] = v[2]
+    }
+
+    /**
      * Start or stop controller-gyro forwarding LIVE for every attached pad, without
      * waiting for a reconnect. The attach-time gate ([attach]) only decides gyro for
      * pads that connect *after* the Settings flip; this re-applies the choice to pads
@@ -347,7 +421,9 @@ class ControllerManager(
      */
     fun setGyroForwarding(enabled: Boolean) {
         if (!managed) return
-        if (enabled) {
+        if (enabled && StreamHub.isPhoneGyro()) {
+            registerPhoneGyro()
+        } else if (enabled) {
             for ((deviceId, slot) in slotOf.entries.toList()) {
                 if (gyro.containsKey(deviceId)) continue
                 InputDevice.getDevice(deviceId)?.let { registerGyro(it, slot) }
@@ -356,6 +432,7 @@ class ControllerManager(
             for ((_, reg) in gyro) reg.sm.unregisterListener(reg.listener)
             val n = gyro.size
             gyro.clear()
+            unregisterPhoneGyro()
             Log.i(TAG, "gyro forwarding OFF live — unregistered $n IMU listener(s)")
         }
     }

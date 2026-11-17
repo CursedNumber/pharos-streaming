@@ -1166,6 +1166,7 @@ dependencies = [
  "control-ipc",
  "core-crypto",
  "core-proto",
+ "crc32fast",
  "cudarc",
  "dirs 5.0.1",
  "evdev",

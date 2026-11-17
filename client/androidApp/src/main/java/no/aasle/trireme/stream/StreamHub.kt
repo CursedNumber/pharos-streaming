@@ -179,6 +179,9 @@ object StreamHub {
     // because nothing on the wire asks for it. Flipped live via [setGyroEnabled];
     // takes effect on the NEXT dial (the v2 auth handshake sends the flag once).
     @Volatile private var gyroEnabled: Boolean = false
+    // Gyro source: false = the controller's own IMU, true = this phone's sensors
+    // (e.g. a phone in a clip-on controller). Applied live via [setPhoneGyro].
+    @Volatile private var phoneGyro: Boolean = false
     @Volatile private var holdStartForCursor: Boolean = false
     // Physical-mouse (pointer-capture) sensitivity multiplier applied to raw
     // relative deltas before they're sent as PointerRel. A host canvas can be 4K,
@@ -337,6 +340,8 @@ object StreamHub {
             }
             paceOverride = readPacePref(this.appContext)
             gyroEnabled = readGyroEnabledPref(this.appContext)
+            phoneGyro = this.appContext.getSharedPreferences("trireme.settings", Context.MODE_PRIVATE)
+                .getBoolean("phone_gyro", false)
             touchAbsolute = readTouchAbsolutePref(this.appContext)
             holdStartForCursor = readHoldStartForCursorPref(this.appContext)
             mouseSensitivity = readMouseSensitivityPref(this.appContext)
@@ -1506,6 +1511,27 @@ object StreamHub {
             .apply()
         controllers?.setGyroForwarding(on)
         Log.i(TAG, "gyro opt-in set to $on (applied live to attached pads)")
+    }
+
+    /** Whether gyro comes from this phone's sensors instead of the controller. */
+    fun isPhoneGyro(): Boolean = phoneGyro
+
+    /**
+     * Switch the gyro source between the controller and this phone, live: the
+     * attached controllers drop their current IMU listeners and re-register from
+     * the new source (only while the gyro opt-in is on).
+     */
+    fun setPhoneGyro(on: Boolean) {
+        phoneGyro = on
+        appContext.getSharedPreferences("trireme.settings", Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean("phone_gyro", on)
+            .apply()
+        controllers?.let {
+            it.setGyroForwarding(false)
+            if (gyroEnabled) it.setGyroForwarding(true)
+        }
+        Log.i(TAG, "gyro source set to ${if (on) "phone" else "controller"}")
     }
 
     /** Read the persisted gyro opt-in (default false — never accidentally on). */

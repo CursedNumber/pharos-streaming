@@ -297,8 +297,8 @@ impl GamepadInput {
         let _ = self.tx.send(core_proto::InputEvent::Scroll { dx, dy });
     }
 
-    /// Motion-sensor sample for gyro-aim: gyroscope (rad/s) + accelerometer (g).
-    /// The host turns gyro into relative mouse motion.
+    /// Motion-sensor sample: gyroscope (rad/s) + accelerometer (m/s²). The host
+    /// turns it into mouse aim or relays it to emulators over DSU.
     #[allow(clippy::too_many_arguments)]
     pub fn motion(&self, slot: u8, gx: f32, gy: f32, gz: f32, ax: f32, ay: f32, az: f32) {
         let _ = self.tx.send(core_proto::InputEvent::GamepadMotion {

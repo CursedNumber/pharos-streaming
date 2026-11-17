@@ -545,6 +545,9 @@ pub struct HostConfigUi {
     /// every stream through the real-desktop mirror instead of a headless
     /// virtual output.
     pub enable_virtual_displays: bool,
+    /// `[dsu] enabled`: the DSU motion server that relays client gyro to
+    /// emulators. Off by default; the host picks it up live.
+    pub dsu_enabled: bool,
 }
 
 impl Default for HostConfigUi {
@@ -563,6 +566,7 @@ impl Default for HostConfigUi {
             bind_mac: String::new(),
             ipv6: false,
             enable_virtual_displays: true,
+            dsu_enabled: false,
         }
     }
 }

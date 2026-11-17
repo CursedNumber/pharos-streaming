@@ -89,6 +89,19 @@ pub fn ui(ui: &mut egui::Ui, state: &mut PanelState) {
     .default_open(false)
     .show(ui, |ui| desktop_section(ui, state));
 
+    // DSU motion server: client gyro → emulators.
+    egui::CollapsingHeader::new(
+        egui::RichText::new(format!(
+            "{}  {}",
+            ph::GAME_CONTROLLER,
+            tr("settings.motion.title")
+        ))
+        .strong(),
+    )
+    .id_salt("set_motion")
+    .default_open(false)
+    .show(ui, |ui| motion_section(ui, state));
+
     egui::CollapsingHeader::new(
         egui::RichText::new(format!("{}  {}", ph::LOCK, tr("settings.security.title"))).strong(),
     )
@@ -318,6 +331,31 @@ fn desktop_section(ui: &mut egui::Ui, state: &mut PanelState) {
             tr("settings.desktop.hint_off")
         };
         ui.label(egui::RichText::new(hint).weak().small());
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Motion (DSU server)
+// ---------------------------------------------------------------------------
+
+fn motion_section(ui: &mut egui::Ui, state: &mut PanelState) {
+    crate::widgets::card(ui, "motion_card", |ui| {
+        if ui
+            .checkbox(
+                &mut state.host_config.dsu_enabled,
+                tr("settings.motion.dsu_enabled"),
+            )
+            .describe(tr("settings.motion.dsu_enabled_desc"))
+            .changed()
+        {
+            state.dirty_host = true;
+        }
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(tr("settings.motion.hint"))
+                .weak()
+                .small(),
+        );
     });
 }
 

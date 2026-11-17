@@ -25,6 +25,46 @@ pub struct HostConfig {
     pub encode: EncodeConfig,
     #[serde(default)]
     pub compositor: CompositorConfig,
+    #[serde(default)]
+    pub dsu: DsuConfig,
+}
+
+/// `[dsu]`: the DSU ("cemuhook") motion server that hands client gyro to
+/// emulators (Eden/Lichii, Cemu, Dolphin) over UDP. Off by default; the host
+/// re-reads this live, so toggling it needs no restart.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DsuConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Listen address. Loopback by default: emulators run on this host.
+    #[serde(default = "localhost")]
+    pub bind: String,
+    /// The protocol's conventional port, which emulators default to.
+    #[serde(default = "default_dsu_port")]
+    pub port: u16,
+    /// Axis remap for gyro, e.g. `"-y,x,z"` (DSU x, y, z from input axes).
+    /// Unset = the default for a landscape phone held screen-toward-you.
+    #[serde(default)]
+    pub gyro_axes: Option<String>,
+    /// Axis remap for the accelerometer; same syntax as `gyro_axes`.
+    #[serde(default)]
+    pub accel_axes: Option<String>,
+}
+
+impl Default for DsuConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: localhost(),
+            port: default_dsu_port(),
+            gyro_axes: None,
+            accel_axes: None,
+        }
+    }
+}
+
+fn default_dsu_port() -> u16 {
+    26760
 }
 
 /// Compositor-wide toggles that aren't per-output (those live in `multi.toml`).
