@@ -274,7 +274,9 @@ fn decode_imu(d: &[u8]) -> ([f32; 3], [f32; 3]) {
     // HIDAPI_RemapVal(v, INT16_MIN, INT16_MAX, -scale, scale), scale = 2000°/s.
     let scale = 2000.0_f32.to_radians();
     let remap = |v: f32| (v + 32768.0) / 65535.0 * 2.0 * scale - scale;
-    let sdl_gyro = [remap(s(17)), remap(s(21)), remap(-s(19))];
+    // Pitch is at bytes 21..22 and yaw at 17..18: the reverse of SDL's
+    // labels, as tested live in Lichii (pitch came out as yaw).
+    let sdl_gyro = [remap(s(21)), remap(s(17)), remap(-s(19))];
     let g = STANDARD_GRAVITY / 4096.0;
     let sdl_accel = [s(23) * g, s(27) * g, -s(25) * g];
     let canon = |v: [f32; 3]| [v[1], -v[0], v[2]];
