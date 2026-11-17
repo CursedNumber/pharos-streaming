@@ -5,7 +5,7 @@ Kotlin Multiplatform client (Android first; a Rust desktop client lives in
 pairing, hardware HEVC/AV1 video decode → render, gamepad/keyboard/touch input
 back to the host, gyro-capable controller profiles, and USB device export over
 USB/IP. It runs on phones and Android TV (validated on a Sony Bravia and a Xiaomi
-phone). The app's `applicationId` is `no.aasle.trireme` (`.debug` suffix for the
+phone). The app's `applicationId` is `io.github.cursednumber.trireme` (`.debug` suffix for the
 side-by-side debug variant).
 
 The app talks to the host through the shared Rust core via **UniFFI** (a

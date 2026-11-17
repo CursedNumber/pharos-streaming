@@ -4,13 +4,13 @@
 #
 # xdg-desktop-portal-kde (Plasma 6.3+) skips that dialog when the portal
 # permission store holds  kde-authorized / remote-desktop / <app id> = yes.
-# Pharos registers itself with the portal as no.aasle.Pharos (see
+# Pharos registers itself with the portal as io.github.cursednumber.Pharos (see
 # PORTAL_APP_ID in crates/compositor/src/portal_mirror.rs).
 #
 # Run once as the desktop user. Undo with:  rig/authorize-remote-desktop.sh --revoke
 set -euo pipefail
 
-APP_ID=no.aasle.Pharos
+APP_ID=io.github.cursednumber.Pharos
 DEST=org.freedesktop.impl.portal.PermissionStore
 OBJ=/org/freedesktop/impl/portal/PermissionStore
 

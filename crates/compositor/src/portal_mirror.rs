@@ -65,10 +65,10 @@ use smithay::utils::{Rectangle, Transform};
 /// The host runs as a bare `systemd-run` unit (`pharos-host.service`), so the
 /// portal can't derive an app id from its cgroup and sees an anonymous caller.
 /// Registering one gives KDE something to key a pre-authorization on: with
-/// `kde-authorized` / `remote-desktop` / `no.aasle.Pharos` = `yes` in the
+/// `kde-authorized` / `remote-desktop` / `io.github.cursednumber.Pharos` = `yes` in the
 /// permission store, `xdg-desktop-portal-kde` skips the "Share your screen?"
 /// dialog entirely (see `rig/authorize-remote-desktop.sh`).
-pub const PORTAL_APP_ID: &str = "no.aasle.Pharos";
+pub const PORTAL_APP_ID: &str = "io.github.cursednumber.Pharos";
 
 /// Register [`PORTAL_APP_ID`] for this process's portal D-Bus connection.
 ///

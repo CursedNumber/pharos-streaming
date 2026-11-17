@@ -141,5 +141,5 @@ public final class ServerSelectorModel: ObservableObject {
 public extension Notification.Name {
     /// Posted when the selector wants to open a stream. The app shell wires
     /// this up to whatever player surface is current.
-    static let triremeRequestConnect = Notification.Name("no.aasle.trireme.requestConnect")
+    static let triremeRequestConnect = Notification.Name("io.github.cursednumber.trireme.requestConnect")
 }

@@ -10,11 +10,11 @@ plugins {
 val releaseKeystore: String? = System.getenv("TRIREME_KEYSTORE")
 
 android {
-    namespace = "no.aasle.trireme"
+    namespace = "io.github.cursednumber.trireme"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "no.aasle.trireme"
+        applicationId = "io.github.cursednumber.trireme"
         minSdk = 26
         targetSdk = 35
         // Bump both alongside [workspace.package] version in the root
@@ -46,7 +46,7 @@ android {
     }
 
     // The debug variant installs SIDE-BY-SIDE with release: applicationIdSuffix
-    // gives it its own package id (no.aasle.trireme.debug) + data dir, so an
+    // gives it its own package id (io.github.cursednumber.trireme.debug) + data dir, so an
     // e2e test build coexists with a "daily driver" release and has its own
     // pairing/identity (pair it once; it won't clash with release). The
     // src/debug/res override renames it "Trireme Debug" in the launcher. The
