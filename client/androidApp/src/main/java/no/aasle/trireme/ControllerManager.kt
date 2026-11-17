@@ -152,10 +152,18 @@ class ControllerManager(
 
     override fun onInputDeviceChanged(deviceId: Int) {
         // A device may have changed mode in place (e.g. mouse↔gamepad, as
-        // controllers that mode-switch do). Re-evaluate it: detach (no-op if it
-        // wasn't attached) then attach if it now looks like a gamepad.
-        detach(deviceId)
-        InputDevice.getDevice(deviceId)?.let { if (isGamepad(it)) attach(it) }
+        // controllers that mode-switch do). Only act on a real gamepad-ness flip:
+        // Android also reports "changed" on every input reconfigure (pointer-capture
+        // toggles, focus loss to a heads-up notification, battery/LED updates), and
+        // tearing a still-valid pad down made the host destroy + recreate its
+        // virtual pad every few seconds (a GameSir G8 over OTG: every ~10s).
+        val d = InputDevice.getDevice(deviceId)
+        val nowPad = d != null && isGamepad(d)
+        val attached = slotOf.containsKey(deviceId)
+        when {
+            attached && !nowPad -> detach(deviceId)
+            !attached && nowPad -> attach(d!!)
+        }
     }
 
     private fun attach(d: InputDevice) {
