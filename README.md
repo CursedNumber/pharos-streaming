@@ -5,8 +5,10 @@
 Pharos runs on your gaming PC. Trireme runs on whatever you want to play on: a
 TV, a phone, a laptop, a Raspberry Pi behind the telly. You pair them once with
 a PIN, and from then on your PC's games, desktop, and controllers are a tap
-away. It is a self-hosted, open-source alternative to Sunshine/Moonlight, written
-from scratch in Rust and Kotlin.
+away. It fills the same role as Sunshine and Moonlight, but it's a separate
+design written from scratch in Rust and Kotlin: its own protocol over QUIC, and a
+virtual screen for every client. (That also means Moonlight clients can't
+connect to it, and Trireme doesn't talk to Sunshine.)
 
 > *Pharos* was the lighthouse of Alexandria; a *trireme* is the small ship that
 > steers by it. The host shines, the client sails home.
