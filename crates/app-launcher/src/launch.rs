@@ -1031,7 +1031,9 @@ fn merge_env(
 /// Pharos compositor, so an implicit layer armed in *its* environment would
 /// post-process the whole session as well as the game — the same trap the
 /// MangoHud knobs already sidestep by declining to run under gamescope at all.
-/// Prefixing the inner argv arms the layer for the app alone.
+/// Prefixing the inner argv arms the layer for the app alone. Linux-only, like
+/// both of its callers (the gamescope paths).
+#[cfg(target_os = "linux")]
 fn env_prefix_argv(env: &[(String, String)]) -> Vec<String> {
     if env.is_empty() {
         return Vec::new();
@@ -2237,6 +2239,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn env_prefix_argv_is_empty_when_there_is_nothing_to_carry() {
         // No toggles => no `env` wrapper at all, so the nested command stays
         // byte-identical to what it was before this feature existed.
