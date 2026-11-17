@@ -52,7 +52,7 @@ package_pharos-bin() {
 }
 
 package_trireme-bin() {
-  pkgdesc="Trireme game-streaming client for Pharos hosts (desktop + headless KMS players, prebuilt)"
+  pkgdesc="Trireme game-streaming client for Pharos hosts (desktop + headless KMS players, USB export, prebuilt)"
   depends=(glibc gcc-libs mesa libdrm expat opus libusb systemd-libs ffmpeg libpulse)
   optdepends=(
     'vulkan-driver: GPU-accelerated presentation in the desktop player'
@@ -61,7 +61,7 @@ package_trireme-bin() {
   conflicts=(trireme)
 
   cd "trireme-$pkgver-linux-x86_64"
-  install -Dm755 trireme{,-kms} -t "$pkgdir/usr/bin"
+  install -Dm755 trireme{,-kms,-usbexport} -t "$pkgdir/usr/bin"
   install -Dm644 trireme.desktop -t "$pkgdir/usr/share/applications"
   install -Dm644 trireme.png \
     "$pkgdir/usr/share/icons/hicolor/256x256/apps/trireme.png"

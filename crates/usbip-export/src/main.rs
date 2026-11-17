@@ -353,8 +353,14 @@ fn service(dev: &Device, cmd: &CmdSubmit, out: &[u8]) -> RetSubmit {
 
 /// Open `vid:pid`, detach kernel drivers, claim interfaces, map endpoint types.
 fn claim(vid: u16, pid: u16) -> Result<(Device, core_usbip::hello::Hello)> {
-    let handle = rusb::open_device_with_vid_pid(vid, pid)
-        .with_context(|| format!("device {vid:04x}:{pid:04x} not found / not openable"))?;
+    let handle = rusb::open_device_with_vid_pid(vid, pid).with_context(|| {
+        format!(
+            "device {vid:04x}:{pid:04x} not found / not openable (plugged in? if so, it's \
+                 usually permissions: run with sudo, or add a udev rule such as \
+                 SUBSYSTEM==\"usb\", ATTR{{idVendor}}==\"{vid:04x}\", \
+                 ATTR{{idProduct}}==\"{pid:04x}\", TAG+=\"uaccess\")"
+        )
+    })?;
     let dev = handle.device();
     let dd = dev.device_descriptor().context("descriptor")?;
     let name = friendly_name(&dev, &dd);

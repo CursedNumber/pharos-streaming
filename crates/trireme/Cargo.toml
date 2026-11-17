@@ -92,7 +92,8 @@ through ffmpeg's hardware paths (cuvid/qsv/v4l2/rkmpp), and local input
 (keyboard, mouse, gamepads, even raw USB devices over USB/IP) flows back to
 the host. This package ships two players: trireme (windowed desktop client
 with LAN auto-discovery and a server selector) and trireme-kms (headless
-DRM/KMS player for SBCs and TVs; no desktop session needed).
+DRM/KMS player for SBCs and TVs; no desktop session needed), plus
+trireme-usbexport, which shares local USB devices with the host over USB/IP.
 .
 Decode is delegated to the ffmpeg CLI; audio plays through a
 PulseAudio-compatible server (PipeWire's pipewire-pulse works)."""
@@ -105,6 +106,7 @@ recommends = "libegl1, libgles2, libvulkan1, libwayland-client0, libx11-6, libxk
 assets = [
     ["target/release/trireme", "usr/bin/", "755"],
     ["target/release/trireme-kms", "usr/bin/", "755"],
+    ["target/release/trireme-usbexport", "usr/bin/", "755"],
     ["../../packaging/desktop/trireme.desktop", "usr/share/applications/", "644"],
     ["../../packaging/icons/trireme.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
     ["../../README.md", "usr/share/doc/trireme/", "644"],

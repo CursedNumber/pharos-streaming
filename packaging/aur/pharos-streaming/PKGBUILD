@@ -41,7 +41,7 @@ build() {
   export CARGO_TARGET_DIR=target
   cargo build --release --frozen \
     -p compositor -p pharos-panel -p pharos-tray -p usbip-host \
-    -p trireme -p trireme-kms
+    -p trireme -p trireme-kms -p usbip-export
 }
 
 package_pharos() {
@@ -73,14 +73,14 @@ package_pharos() {
 }
 
 package_trireme() {
-  pkgdesc="Trireme game-streaming client for Pharos hosts (desktop + headless KMS players)"
+  pkgdesc="Trireme game-streaming client for Pharos hosts (desktop + headless KMS players, USB export)"
   depends=(glibc gcc-libs mesa libdrm expat opus libusb systemd-libs ffmpeg libpulse)
   optdepends=(
     'vulkan-driver: GPU-accelerated presentation in the desktop player'
   )
 
   cd "$pkgbase-$pkgver"
-  install -Dm755 target/release/trireme{,-kms} -t "$pkgdir/usr/bin"
+  install -Dm755 target/release/trireme{,-kms,-usbexport} -t "$pkgdir/usr/bin"
   install -Dm644 packaging/desktop/trireme.desktop \
     -t "$pkgdir/usr/share/applications"
   install -Dm644 packaging/icons/trireme.png \
