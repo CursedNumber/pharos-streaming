@@ -19,6 +19,10 @@
 //! untouched. The thread ends when the server goes away (the app exited and
 //! `-terminate` shut Xwayland down), so there's nothing to clean up.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, ChangeWindowAttributesAux, ConfigureNotifyEvent, ConfigureRequestEvent,
@@ -52,7 +56,15 @@ struct Wm {
     transient_for: Atom,
     window_type: Atom,
     type_dialog: Atom,
+    /// Windows owed a resize "nudge" (see [`Wm::on_configure`]): when the next
+    /// step is due, and whether the 1px shrink has happened yet.
+    nudges: RefCell<HashMap<Window, (Instant, bool)>>,
 }
+
+/// Delay before a nudge starts, and between its shrink and restore steps.
+/// Qt folds two back-to-back size changes into one and doesn't relayout; a
+/// ~100ms gap between real ConfigureNotifys is what it reliably follows.
+const NUDGE_STEP: Duration = Duration::from_millis(100);
 
 fn run(dpy: u32) -> anyhow::Result<()> {
     let (conn, screen_num) = RustConnection::connect(Some(&format!(":{dpy}")))?;
@@ -75,6 +87,7 @@ fn run(dpy: u32) -> anyhow::Result<()> {
         transient_for: AtomEnum::WM_TRANSIENT_FOR.into(),
         window_type: atom(b"_NET_WM_WINDOW_TYPE")?,
         type_dialog: atom(b"_NET_WM_WINDOW_TYPE_DIALOG")?,
+        nudges: RefCell::new(HashMap::new()),
         conn,
         root,
         width,
@@ -84,11 +97,25 @@ fn run(dpy: u32) -> anyhow::Result<()> {
     wm.conn.flush()?;
 
     loop {
-        match wm.conn.wait_for_event()? {
-            Event::MapRequest(e) => wm.on_map(e.window)?,
-            Event::ConfigureRequest(e) => wm.on_configure(&e)?,
+        // Block on events unless a nudge is pending; then poll so it fires on time.
+        let event = if wm.nudges.borrow().is_empty() {
+            Some(wm.conn.wait_for_event()?)
+        } else {
+            let ev = wm.conn.poll_for_event()?;
+            if ev.is_none() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            ev
+        };
+        match event {
+            Some(Event::MapRequest(e)) => wm.on_map(e.window)?,
+            Some(Event::ConfigureRequest(e)) => wm.on_configure(&e)?,
+            Some(Event::DestroyNotify(e)) => {
+                wm.nudges.borrow_mut().remove(&e.window);
+            }
             _ => {}
         }
+        wm.run_nudges()?;
         wm.conn.flush()?;
     }
 }
@@ -182,15 +209,61 @@ impl Wm {
     /// Answer a resize/move request. Normal windows stay full screen whatever
     /// they ask for; dialogs get their requested size, kept centred. Stacking
     /// requests pass through so raise/lower still works.
+    ///
+    /// A refused resize to a normal window also schedules a "nudge": 1px
+    /// narrower, then back, [`NUDGE_STEP`] apart. The synthetic
+    /// `ConfigureNotify` from [`Wm::place`] isn't always enough: Qt resizes its
+    /// widget tree optimistically on its own request (Eden/Lichii asks for
+    /// 1920x1138 when a game boots, sizing the window to the game's
+    /// resolution), and a notify for the unchanged geometry didn't re-run the
+    /// layout, leaving the game view 1920 wide in the top-left corner of a
+    /// 2712-wide window, even after F11. Two real, spaced size changes from
+    /// the server do.
     fn on_configure(&self, e: &ConfigureRequestEvent) -> anyhow::Result<()> {
+        use x11rb::protocol::xproto::ConfigWindow;
         if e.parent != self.root {
             return Ok(());
         }
         let dialog = self.is_dialog(e.window).unwrap_or(false);
         let stack = e
             .value_mask
-            .contains(x11rb::protocol::xproto::ConfigWindow::STACK_MODE)
+            .contains(ConfigWindow::STACK_MODE)
             .then_some(e.stack_mode);
-        self.place(e.window, self.placement(dialog, e.width, e.height), stack)
+        let geo = self.placement(dialog, e.width, e.height);
+        let asked_resize = e
+            .value_mask
+            .intersects(ConfigWindow::WIDTH | ConfigWindow::HEIGHT);
+        if !dialog && asked_resize && (e.width, e.height) != (geo.2, geo.3) {
+            // (Re)arm; a request mid-nudge restarts it, so one nudge always
+            // lands after the client's last request.
+            self.nudges
+                .borrow_mut()
+                .insert(e.window, (Instant::now() + NUDGE_STEP, false));
+        }
+        self.place(e.window, geo, stack)
+    }
+
+    /// Advance due nudges: shrink by 1px, then restore full screen.
+    fn run_nudges(&self) -> anyhow::Result<()> {
+        let now = Instant::now();
+        let mut nudges = self.nudges.borrow_mut();
+        let due: Vec<(Window, bool)> = nudges
+            .iter()
+            .filter(|(_, (at, _))| *at <= now)
+            .map(|(w, (_, shrunk))| (*w, *shrunk))
+            .collect();
+        for (w, shrunk) in due {
+            if shrunk {
+                nudges.remove(&w);
+                self.place(w, (0, 0, self.width, self.height), None)?;
+            } else {
+                nudges.insert(w, (now + NUDGE_STEP, true));
+                self.conn.configure_window(
+                    w,
+                    &ConfigureWindowAux::new().width(u32::from(self.width.saturating_sub(1))),
+                )?;
+            }
+        }
+        Ok(())
     }
 }
