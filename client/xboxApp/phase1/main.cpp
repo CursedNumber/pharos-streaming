@@ -9,8 +9,8 @@
 // LocalState\phase1.log.
 //
 // Config comes from LocalState\phase1.txt (key=value, one per line):
-//   host=192.168.50.100      required; the Pharos host's IP or name
-//   pin=764153               optional; when present, SPAKE2-pair first
+//   host=192.168.1.100       required; the Pharos host's IP or name
+//   pin=123456               optional; when present, SPAKE2-pair first
 //   pubkey=<64 hex>          optional; expected host pubkey (else TOFU)
 //   seconds=25               optional; stream duration (default 25)
 //   width=0 height=0         optional; 0,0 = Auto (host-native canvas)

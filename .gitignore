@@ -45,3 +45,6 @@
 /rig/launch-crimson-wayland.sh
 /rig/run-host-stream.sh
 /.claude/
+
+# One-off scripts that poke the personal homelab (router API etc.)
+/rig/fix-*.sh

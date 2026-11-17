@@ -1,209 +1,182 @@
-# pharos-streaming: Pharos (host) · Trireme (client)
+# Pharos + Trireme
 
-**Self-hosted, low-latency game streaming and remote desktop (KVM-over-IP).**
-A clean-slate, from-scratch successor to Sunshine/Moonlight; Rust host and shared
-core, Kotlin/Android + Rust desktop client, a hand-rolled headless Wayland
-compositor, and zero-copy NVENC/AV1 over QUIC.
+**Play the games on your PC from your couch, your phone, or another room.**
 
-- **Pharos**: the host daemon (Rust). The lighthouse the client navigates by.
-- **Trireme**: the client (Kotlin Multiplatform, Android first; plus a Rust
-  desktop/reference client). The small craft that comes alongside.
-- **core**: one Rust core (protocol, crypto/pairing, session, USB/IP framing),
-  shared by both ends via UniFFI, so the wire format and pairing have exactly one
-  implementation.
+Pharos runs on your gaming PC. Trireme runs on whatever you want to play on: a
+TV, a phone, a laptop, a Raspberry Pi behind the telly. You pair them once with
+a PIN, and from then on your PC's games, desktop, and controllers are a tap
+away. It is a self-hosted, open-source alternative to Sunshine/Moonlight, written
+from scratch in Rust and Kotlin.
 
-> Detailed CLI, environment variables, and config reference live in
-> [`DOCUMENTATION.md`](DOCUMENTATION.md). Archived design notes are in
-> [`docs/history/`](docs/history/).
+> *Pharos* was the lighthouse of Alexandria; a *trireme* is the small ship that
+> steers by it. The host shines, the client sails home.
 
 ---
 
-## Highlights
+## Why you might like it
 
-Proven on real hardware, and used day-to-day for game streaming:
+- **It leaves your monitor alone.** Pharos gives each client its own invisible
+  screen, sized to fit that device exactly (your phone's odd aspect ratio, your
+  TV's 4K panel). Someone can keep using the desk while you play on the TV.
+  Prefer to see your actual desktop? It can mirror that too.
+- **Built for WiFi, not just Ethernet.** Quality adapts on the fly: when the
+  link gets crowded it lowers resolution before the picture falls apart, then
+  climbs back up. 4K60 HDR over WiFi works on decent hardware.
+- **Pair once, then forget about it.** A short PIN the first time; after that the
+  devices recognise each other. No certificate warnings, no web console.
+- **Controllers just work.** Gamepads appear on the PC as ordinary Xbox pads,
+  with per-controller button and gyro tuning. A full Steam Big Picture session
+  runs inside the stream, so even Steam Input games get your pad. Gyro aiming
+  reaches emulators too, through a built-in DSU motion server (tested with
+  Lichii; not yet tested with Grand Theft Auto VI).
+- **Plug a USB device into the client, and the PC sees it.** A controller, a
+  flight stick, or a thumb drive plugged into your TV box shows up on the PC as a
+  real local device.
+- **The little things.** Text clipboard in both directions, HDR10, HEVC/AV1/H.264,
+  low-latency Opus audio, Wake-on-LAN, and Home Assistant integration.
 
-- **120 fps @ 1080p, zero dropped frames**: headless Smithay → GLES→CUDA→NVENC
-  HEVC → QUIC → decode/render, **~3 ms encode**, zero-copy end to end on an
-  RTX 4070; pixel-correct on a Sony Bravia and a Xiaomi phone. This is the
-  regression baseline later work may not fall below.
-- **Real Proton games stream end-to-end** over native Wayland (winewayland /
-  proton-cachyos); gamepad passthrough, live resolution/bitrate ladder, and an
-  optional Steam-launch redirect, validated in live sessions.
-- **End-to-end HDR10**: the host emits conformant 10-bit HEVC Main10 (BT.2020 /
-  PQ + Mastering-Display/CLL SEI) and the TV **enters HDR mode off the stream on
-  its own**.
-- **AV1 validated end-to-end**, including **4K60**: nearly free on Ada GPUs, and
-  a royalty-free alternative to HEVC.
-- **Sub-second mid-stream resync**: 1 s IDRs with repeated sequence headers, so a
-  client that joins mid-stream is watching in ≤1 s.
-- **Reversed USB/IP**: export a controller, stick, or drive **from the client**
-  and it appears as a *real* device on the host (HID + mass-storage, verified over
-  the LAN).
-- **Mirror your real desktop**: stream the physical KDE/GNOME session you are
-  sitting at (not just the headless virtual display) through the same zero-copy
-  NVENC pipeline, with libei keyboard/mouse injection back and best-fit letterbox
-  scaling for odd aspect ratios; live-validated at ~60 fps HEVC on an RTX 4070.
-- **Windows host**: WGC/ddagrab + an IddCx headless virtual display →
-  Quick Sync / NVENC / AMF HEVC with SendInput; NVENC HEVC hosting validated on a
-  real GPU rig.
+## What you need
 
-## Features
+| | Runs on | Notes |
+|---|---|---|
+| **Pharos** (host) | Linux (Wayland) | NVIDIA GPU required for now |
+| | Windows 10/11 | NVIDIA, Intel, or AMD GPU |
+| **Trireme** (client) | Android phones and Android/Google TV | arm64 and 32-bit TVs |
+| | Linux and Windows desktops | |
+| | Raspberry Pi and other ARM boards | can drive a TV directly, no desktop needed |
+| | Xbox Series X\|S in Developer Mode | experimental |
 
-**Streaming pipeline**
-- One QUIC pipeline for **keyboard, video, mouse, and USB**: operate a headless
-  host remotely; game streaming is a first-class *mode* on the same
-  capture→encode→transport path, not a separate product.
-- **Headless Smithay compositor** (Linux) that owns the display and captures its
-  own GLES output **zero-copy** through CUDA into NVENC. Xwayland inside for X11
-  apps. No EVDI, no gamescope wrap; full frame-lifecycle control for latency.
-- **Selectable HEVC + AV1**, plus a real **HDR10** 10-bit Main10 path (behind
-  `PHAROS_HDR=1`).
-- **End-to-end low-latency Opus** audio (48 kHz stereo, 20 ms frames, LowDelay),
-  captured from a per-session PipeWire null-sink monitor.
-- **Adaptive resolution / bitrate / fps ladder**: a QoS pacer and live actuators
-  step quality down under sustained link pressure; the top rung is a
-  byte-identical direct blit.
+## Getting started
 
-**Input**
-- **Keyboard + mouse (move, buttons, scroll) + gamepad** from the desktop client
-  into the host seat; **relative mouse** (for pointer-locked / FPS games) is
-  handled host-side on both Linux and Windows.
-- **Controller profiles + gyro-aim**: per-controller button-swap and gyro tuning,
-  relayed live and persisted host-side; gyro angular velocity becomes relative
-  mouse motion. Client gamepads land on per-slot virtual Xbox 360 pads.
+1. **Install the host** on your gaming PC (see [Install](#install) below), then
+   open **Pharos Panel** from your app menu.
+2. **Install the client** on the device you want to play on and open Trireme.
+   Your PC appears automatically if both are on the same network.
+3. **Pick it, type the PIN** the host shows, and press play.
 
-**Beyond one screen**
-- **Real-desktop mirror** (Linux): launch the built-in `desktop` app and Pharos
-  streams your physical KDE/GNOME session through the full HEVC pipeline, captured
-  via xdg-desktop-portal + PipeWire off the render loop, with libei input
-  injection and best-fit letterboxing. Distinct from the multi-client fan-out
-  below (this mirrors the *real* screen; that fans *one virtual display* out).
-- **Steam Big Picture session** (Linux): a built-in tile runs the whole Steam
-  client Deck-style — gamescope-hosted, inside the stream — so Steam Input API
-  games get controllers and every Steam dialog is drivable from the couch.
-  Live-validated (issue #38): No Man's Sky, a Steam-Input-API-only title, at
-  native phone resolution / steady 60 fps with the pad fully working in-game.
-- **Native VNC and SPICE console sources** in the client, so a Proxmox/QEMU VM
-  console can share a split-screen cell alongside a Pharos stream, fully
-  interactive.
-- **Multi-client mirror/extend** fan-out (keep-N); *experimental, off by default,
-  not yet two-device-validated.*
-- **Home Assistant MQTT + Wake-on-LAN**: auto-discovered HA entities and remote
-  wake.
+## Install
 
-**Control & trust**
-- **Native control plane, no browser**: a cross-platform egui panel
-  (`pharos-panel`) and a KDE tray (`pharos-tray`) drive the host live over an
-  authenticated channel. No self-signed-cert wall.
-- **SPAKE2 pairing + per-connection Ed25519 auth, on by default**: pairing pins a
-  long-term identity; every connection is authorized against `peers.toml`. The
-  QUIC TLS cert is a throwaway opaque tunnel, never a trust anchor.
+Prebuilt packages are on the
+[Releases page](https://github.com/CursedNumber/pharos-streaming/releases),
+built by CI from the tagged source.
 
-## ⚠️ Security notice
+**Ubuntu / Debian** (22.04+ / 12+): this script fetches the latest `.deb` and
+installs it with apt.
 
-Pharos is a **network-listening daemon that injects input and can bridge USB
-devices** into the host. Treat it accordingly:
+```sh
+# pick --host, --client, or --both
+curl -fsSL https://raw.githubusercontent.com/CursedNumber/pharos-streaming/main/packaging/install.sh | bash -s -- --host
+```
 
-- Run it on a **trusted LAN**, not the open internet. There is no hardening audit yet.
-- Client authentication is **on by default**; `PHAROS_ALLOW_UNPAIRED=1` disables
-  it; don't set that on an untrusted network.
-- Exposing the stream port to the internet is at your own risk; prefer a
-  VPN/WireGuard tunnel.
+Or download the `.deb` yourself and run `sudo apt install ./pharos_*_amd64.deb`.
 
-Found a security issue? Please report it privately; see [`SECURITY.md`](SECURITY.md).
+**Arch / CachyOS**: AUR packages `pharos-streaming` (builds from source) and
+`pharos-streaming-bin` (prebuilt).
 
-## Architecture
+**Windows host**: run `pharos-<ver>-x86_64.msi`. It adds Start Menu shortcuts
+and the firewall rule streaming needs. Portable `.exe` files are on the release
+page too, if you'd rather not install.
 
-One shared Rust **core** is the keystone; `core-proto` (QUIC channel map,
-length-prefixed access-unit framing, the input wire format), `core-crypto` (SPAKE2
-pairing + Ed25519 identity/session keys), `core-session` (session FSM + capability
-negotiation), and `core-usbip` (USB/IP URB framing) are compiled natively into the
-host and exported to the Kotlin/Swift clients via `core-ffi`/**UniFFI**, so pairing
-and the protocol have exactly one implementation and test suite. A `pal` trait
-crate is the Windows/Linux co-equal seam.
+**Android / Android TV**: sideload `trireme-<ver>-<abi>.apk`. Use `arm64-v8a`
+for phones and recent TVs, `armeabi-v7a` for older 32-bit TVs (such as the Sony
+X90J), or `universal` if unsure.
+
+**Anything else**: the `linux-x86_64.tar.gz` archives carry the binaries,
+systemd units, and desktop files.
+
+After installing the Linux host:
+
+```sh
+systemctl --user enable --now pharos-host pharos-tray
+sudo systemctl enable --now pharos-usbimport   # optional: USB device forwarding
+pharos-panel                                   # set up screens, apps, and clients
+```
+
+More packaging detail lives in [`packaging/`](packaging/README.md).
+
+## What works today
+
+Tested on real hardware and used every day:
+
+- **120 fps at 1080p with zero dropped frames**, about 3 ms to encode a frame on
+  an RTX 4070, on both a Sony Bravia TV and a Xiaomi phone.
+- **4K60 HDR over WiFi**; the TV switches into HDR mode by itself.
+- **Real Proton games** streaming end to end, with gamepads and live quality
+  changes. No Man's Sky runs at the phone's native resolution with the
+  controller fully working through the Steam session.
+- **Mirroring the real KDE/GNOME desktop** at about 60 fps, keyboard and mouse
+  included.
+- **Windows hosting** with NVENC, plus clients on Android, Linux, Windows, a
+  Raspberry Pi, and an Xbox Series X in Developer Mode.
+
+### Honest caveats
+
+This is pre-1.0 software. Settings and config keys may still change.
+
+- **AMD and Intel GPUs on a Linux host** are not supported yet; the Linux host
+  encodes on NVIDIA only. On an AMD box, the Windows host works.
+- **HDR inside Proton games on Linux** is blocked by Wine itself. Pharos's own HDR
+  streaming works.
+- **Streaming one screen to several clients at once** exists but is off by
+  default and not yet tested on two devices. (Mirroring your real desktop is a
+  different feature, and that one is tested.)
+- **USB audio devices and webcams** cannot be forwarded yet.
+
+## Security
+
+Pharos listens on the network, types on your PC's keyboard, and can attach USB
+devices to it. Treat it with that respect:
+
+- Run it on a network you trust. There has been no independent security audit.
+- Only paired devices may connect (that's on by default). Setting
+  `PHAROS_ALLOW_UNPAIRED=1` turns this off; don't, except for testing.
+- To play away from home, prefer a VPN such as WireGuard over opening a port.
+
+Found a vulnerability? Please report it privately; see [`SECURITY.md`](SECURITY.md).
+
+## Under the hood
+
+For the curious and for contributors. Every command, environment variable, and
+config file is documented in [`DOCUMENTATION.md`](DOCUMENTATION.md); old design
+notes live in [`docs/history/`](docs/history/).
+
+One shared Rust **core** holds the protocol, pairing (SPAKE2 + Ed25519
+identities), session logic, and USB/IP framing. The host links it natively and
+the clients reach it through UniFFI, so the wire format and pairing have exactly
+one implementation and one test suite.
 
 ```
                           ┌───────────────────────────────┐
                           │   core (Rust, shared)         │
-                          │  proto · crypto/SPAKE2 ·       │
-                          │  session · usbip framing       │
-                          └──────▲──────────────▲──────────┘
+                          │  proto · crypto/SPAKE2 ·      │
+                          │  session · usbip framing      │
+                          └──────▲──────────────▲─────────┘
                        native    │              │  UniFFI (JNI)
-              ┌──────────────────┴──┐    ┌──────┴───────────────────┐
+              ┌──────────────────┴───┐    ┌─────┴────────────────────┐
               │  Pharos host (Rust)  │    │  Trireme client          │
               │  compositor·NVENC·   │    │  decode·render·input·    │
               │  inject·usbip-host   │    │  USB export (Kotlin+Rust)│
               └──────────────────────┘    └──────────────────────────┘
 ```
 
-**QUIC channel map** (`transport`, quinn): a reliable bidi **control** stream, a
-reliable **input** back-channel, **video/audio** as unreliable deadline-aware
-datagrams, and **one reliable stream per USB/IP device** (so a stalled device can't
-head-of-line-block your gamepad).
+- **Linux host**: a headless Smithay Wayland compositor renders each client's
+  screen and hands frames straight from GLES through CUDA into NVENC, with no
+  copies through system memory. Xwayland runs inside for X11 apps.
+- **Windows host**: WGC/ddagrab capture plus an IddCx virtual display, encoded
+  with Quick Sync, NVENC, or AMF; input via SendInput.
+- **Transport**: everything travels over one QUIC connection. Control and input
+  use reliable streams, video and audio go as unreliable deadline-aware
+  datagrams, and each USB device gets its own stream so a stalled device can't
+  hold up your gamepad.
+- **Trust**: pairing pins a long-term identity and every connection is checked
+  against `peers.toml`. The QUIC TLS certificate is just a tunnel, never a trust
+  anchor.
+- **Control**: a native egui panel (`pharos-panel`) and a tray icon
+  (`pharos-tray`) drive the host live; there is no browser UI.
 
-- **Linux host**: `compositor` (headless Smithay → zero-copy NVENC), `trireme-kms`
-  (direct DRM/KMS scanout to a real TV), `usbip-host` (`pharos-usbimport`),
-  `app-launcher` (launch into the display + Steam redirect).
-- **Windows host**: `pharos-win` (`pharos-host`): WGC/ddagrab + IddCx virtual
-  display → Quick Sync/NVENC/AMF HEVC with SendInput.
-- **Clients**: `trireme` (Rust desktop/reference: ffmpeg decode, winit render,
-  input, USB export) and the Kotlin Multiplatform Android app (MediaCodec decode,
-  controller/gyro input), with a SwiftUI iOS baseline.
+### Building from source
 
-For the full crate map, see [`DOCUMENTATION.md`](DOCUMENTATION.md).
-
-## Install
-
-Prebuilt packages come from [GitHub Releases](https://github.com/CursedNumber/pharos-streaming/releases)
-(built by CI from the tagged source; x86_64 Linux and Windows). Two packages:
-**pharos** is the host (the gaming PC that streams out; the Linux host needs an
-**NVIDIA GPU** for now, AMD/VAAPI encode is stubbed and unvalidated), **trireme**
-is the client (the machine you play on).
-
-**Ubuntu / Debian** (22.04+/12+): the install script fetches the latest
-release's `.deb` and installs it with apt:
-
-```sh
-# host, client, or --both
-curl -fsSL https://raw.githubusercontent.com/CursedNumber/pharos-streaming/main/packaging/install.sh | bash -s -- --host
-curl -fsSL https://raw.githubusercontent.com/CursedNumber/pharos-streaming/main/packaging/install.sh | bash -s -- --client
-```
-
-Or grab the `.deb` from the release page yourself and
-`sudo apt install ./pharos_*_amd64.deb` (apt resolves the dependencies).
-
-**Arch / CachyOS**: AUR packages `pharos-streaming` (build from source) and
-`pharos-streaming-bin` (prebuilt release binaries); both split into `pharos`
-and `trireme`.
-
-**Windows host**: `pharos-<ver>-x86_64.msi` installs the host stack
-(`pharos-host`, `pharos-tray`, `pharos-panel`) with Start Menu shortcuts and
-the firewall exception streaming needs. The same three exes are also on the
-release page bare, as the portable/no-admin option.
-
-**Android / Android TV client**: sideload `trireme-<ver>-<abi>.apk` from the
-release page — `arm64-v8a` for phones and recent TVs, `armeabi-v7a` for
-32-bit TVs (e.g. Sony X90J), or `universal` if unsure.
-
-**Anything else**: `pharos-<ver>-linux-x86_64.tar.gz` and
-`trireme-<ver>-linux-x86_64.tar.gz` on the release page carry the binaries,
-systemd units, and desktop files; copy them where your distro likes.
-
-**After installing the host:**
-
-```sh
-systemctl --user enable --now pharos-host pharos-tray
-sudo systemctl enable --now pharos-usbimport   # optional: USB/IP forwarding
-pharos-panel                                   # configure outputs, apps, clients
-```
-
-After installing the client, run `trireme` (also in the app menu): hosts on
-the LAN are discovered automatically, then you pair once with the on-screen
-PIN. Packaging sources live in [`packaging/`](packaging/README.md).
-
-## Quickstart (Linux host)
-
-**System packages** (Debian/Ubuntu names; use your distro's equivalents):
+System packages (Debian/Ubuntu names):
 
 ```sh
 sudo apt-get install -y \
@@ -213,73 +186,43 @@ sudo apt-get install -y \
   clang libclang-dev libpipewire-0.3-dev
 ```
 
-`ffmpeg` is required at **runtime** (client decode / some capture paths).
-`clang`/`libpipewire-0.3-dev` are for the compositor's desktop-mirror capture
-(issue #6, `portal-mirror` feature — on by default on Linux); at runtime it
-also needs `xdg-desktop-portal` plus a backend for your desktop (e.g.
-`xdg-desktop-portal-kde`/`-gnome`/`-wlr`) to actually mirror the real screen —
-without one, the host just falls back to virtual displays.
+`ffmpeg` is needed at runtime. Mirroring the real desktop also needs
+`xdg-desktop-portal` with a backend for your desktop (`-kde`, `-gnome`, or
+`-wlr`); without one, the host just uses virtual screens.
 
-**Build.** The `compositor` crate needs an NVIDIA driver + CUDA (it links
-`libnvidia-encode` / `libnvcuvid`); NVENC is the only wired Linux encoder today,
-with an AMD/VAAPI path stubbed but not yet validated. Without NVIDIA/CUDA, build
-everything else:
+The `compositor` crate links NVIDIA's encoder libraries, so it needs an NVIDIA
+driver and CUDA. Everything else builds without them:
 
 ```sh
 cargo build --workspace --exclude compositor   # no NVIDIA/CUDA
-cargo build --workspace                         # full (needs NVIDIA + CUDA)
-cargo run -p hostd                              # quick core self-test
+cargo build --workspace                         # full build
+pharos-compositor capture-zc-multi              # run the streaming host
 ```
 
-**Run the streaming host** and connect a client:
-
-```sh
-pharos-compositor capture-zc-multi              # resident multi-output host
-pharos-compositor --help                        # every subcommand
-```
-
-The Android client is built via `rig/build-android.sh`; see
-[`client/README.md`](client/README.md). Full command reference, env vars, and
-config keys: [`DOCUMENTATION.md`](DOCUMENTATION.md).
-
-## Status & honesty
-
-Pre-1.0 research-quality software; interfaces, config keys, and env vars may change
-between commits. Known honest caveats:
-
-- **AMD (VAAPI) GPU encode on the Linux host is a stub, pending validation.** The
-  Linux compositor encodes through **NVENC (NVIDIA only)** today; the VAAPI backend
-  is scaffolded behind the shared encoder trait but not yet wired or hardware-
-  validated. On an AMD box, run the Windows host (AMF) for now.
-- **Linux Proton *game*-HDR** is blocked upstream in Wine's Vulkan/Wayland WSI and
-  is deferred to the Windows-native host path. Host HDR10 encode itself works.
-- **Multi-client mirror/extend** (fan one virtual display out to several clients)
-  is shipped but **off by default and not two-device validated**. This is a
-  separate feature from real-desktop mirroring, which is validated.
-- USB/IP **isochronous** (USB-audio / webcams) has wire format + framing but iso
-  servicing is deferred.
+The Android client builds with `rig/build-android.sh`; see
+[`client/README.md`](client/README.md).
 
 ## Codecs & patents
 
-This project ships **no HEVC/AV1 codec implementation**: encoding runs on the
-GPU's hardware encoder (NVENC / Quick Sync / AMF) or an external `ffmpeg` binary;
-decoding uses the client OS's decoder (Android MediaCodec) or `ffmpeg`. Any HEVC
-patent obligations attach to those hardware/OS vendors, not to this software. For
-royalty-free assurances, prefer the **AV1** path.
+This project ships **no HEVC or AV1 codec of its own**. Encoding runs on the
+GPU's hardware encoder (NVENC, Quick Sync, AMF) or an external `ffmpeg`;
+decoding uses the client's own decoder (Android MediaCodec) or `ffmpeg`. Any HEVC
+patent obligations sit with those hardware and OS vendors. For a royalty-free
+path, choose AV1.
 
-## Localization
+## Languages
 
-The Pharos control panel is localized (**English + Norwegian Bokmål**,
-live-switchable). The Trireme desktop client, tray, and CLI output are English-only
-for now. Translations welcome; add your locale alongside `en` in
+The control panel speaks **English and Norwegian Bokmål** and switches live. The
+desktop client, tray, and command-line output are English only for now.
+Translations are welcome: add your locale next to `en` in
 `crates/pharos-panel/locales/*.toml`.
 
 ## License
 
 Copyright (C) 2026 The Pharos/Trireme authors.
 
-This program is free software: you can redistribute it and/or modify it under the
-terms of the **GNU General Public License** as published by the Free Software
+This program is free software: you can redistribute it and/or modify it under
+the terms of the **GNU General Public License** as published by the Free Software
 Foundation, either **version 3 of the License, or (at your option) any later
 version**: [`GPL-3.0-or-later`](LICENSE).
 
@@ -287,7 +230,6 @@ This program is distributed in the hope that it will be useful, but WITHOUT ANY
 WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
 PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
-Given freely, for everyone, and copyleft so it stays that way for everyone
-downstream. Bundled third-party material (the NVIDIA interface headers under
-`vendor/`, the Noto Sans Symbols fonts) carries its own licenses; see
-[`NOTICE`](NOTICE).
+Given freely, for everyone, and copyleft so it stays that way downstream.
+Bundled third-party material (the NVIDIA interface headers under `vendor/`, the
+Noto Sans Symbols fonts) carries its own licenses; see [`NOTICE`](NOTICE).
