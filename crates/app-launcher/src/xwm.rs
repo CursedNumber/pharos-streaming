@@ -21,8 +21,9 @@
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ChangeWindowAttributesAux, ConfigureRequestEvent, ConfigureWindowAux,
-    ConnectionExt as _, EventMask, InputFocus, Window,
+    Atom, AtomEnum, ChangeWindowAttributesAux, ConfigureNotifyEvent, ConfigureRequestEvent,
+    ConfigureWindowAux, ConnectionExt as _, EventMask, InputFocus, StackMode, Window,
+    CONFIGURE_NOTIFY_EVENT,
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
@@ -110,30 +111,68 @@ impl Wm {
             .is_some_and(|mut it| it.any(|t| t == self.type_dialog)))
     }
 
-    /// Geometry for a window: full screen, or centred at `(w, h)` for a dialog.
-    fn placement(&self, dialog: bool, w: u16, h: u16) -> ConfigureWindowAux {
+    /// Geometry `(x, y, w, h)` for a window: full screen, or centred at its own
+    /// `(w, h)` for a dialog.
+    fn placement(&self, dialog: bool, w: u16, h: u16) -> (i16, i16, u16, u16) {
         if dialog {
             let (w, h) = (w.min(self.width), h.min(self.height));
-            ConfigureWindowAux::new()
-                .x(i32::from((self.width - w) / 2))
-                .y(i32::from((self.height - h) / 2))
-                .width(u32::from(w))
-                .height(u32::from(h))
+            (
+                ((self.width - w) / 2) as i16,
+                ((self.height - h) / 2) as i16,
+                w,
+                h,
+            )
         } else {
-            ConfigureWindowAux::new()
-                .x(0)
-                .y(0)
-                .width(u32::from(self.width))
-                .height(u32::from(self.height))
-                .border_width(0)
+            (0, 0, self.width, self.height)
         }
+    }
+
+    /// Apply `geo` and tell the client where it really is.
+    ///
+    /// The synthetic `ConfigureNotify` is ICCCM 4.1.5's rule for a WM that
+    /// overrides a request: when the forced geometry equals the current one the
+    /// server sends nothing, so a toolkit that asked for another size (Qt
+    /// restoring a saved 1280x778, say) keeps believing its request and lays
+    /// its contents out for a window it doesn't have.
+    fn place(
+        &self,
+        w: Window,
+        geo: (i16, i16, u16, u16),
+        stack: Option<StackMode>,
+    ) -> anyhow::Result<()> {
+        let (x, y, width, height) = geo;
+        let mut aux = ConfigureWindowAux::new()
+            .x(i32::from(x))
+            .y(i32::from(y))
+            .width(u32::from(width))
+            .height(u32::from(height))
+            .border_width(0);
+        if let Some(mode) = stack {
+            aux = aux.stack_mode(mode);
+        }
+        self.conn.configure_window(w, &aux)?;
+        let notify = ConfigureNotifyEvent {
+            response_type: CONFIGURE_NOTIFY_EVENT,
+            sequence: 0,
+            event: w,
+            window: w,
+            above_sibling: x11rb::NONE,
+            x,
+            y,
+            width,
+            height,
+            border_width: 0,
+            override_redirect: false,
+        };
+        self.conn
+            .send_event(false, w, EventMask::STRUCTURE_NOTIFY, notify)?;
+        Ok(())
     }
 
     fn on_map(&self, w: Window) -> anyhow::Result<()> {
         let dialog = self.is_dialog(w).unwrap_or(false);
         let geo = self.conn.get_geometry(w)?.reply()?;
-        self.conn
-            .configure_window(w, &self.placement(dialog, geo.width, geo.height))?;
+        self.place(w, self.placement(dialog, geo.width, geo.height), None)?;
         self.conn.map_window(w)?;
         self.conn
             .set_input_focus(InputFocus::POINTER_ROOT, w, CURRENT_TIME)?;
@@ -148,13 +187,10 @@ impl Wm {
             return Ok(());
         }
         let dialog = self.is_dialog(e.window).unwrap_or(false);
-        let mut aux = self.placement(dialog, e.width, e.height);
-        if e.value_mask
+        let stack = e
+            .value_mask
             .contains(x11rb::protocol::xproto::ConfigWindow::STACK_MODE)
-        {
-            aux = aux.stack_mode(e.stack_mode);
-        }
-        self.conn.configure_window(e.window, &aux)?;
-        Ok(())
+            .then_some(e.stack_mode);
+        self.place(e.window, self.placement(dialog, e.width, e.height), stack)
     }
 }
