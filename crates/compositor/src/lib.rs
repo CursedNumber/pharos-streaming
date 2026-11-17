@@ -65,6 +65,7 @@ use capture::HevcEncoder;
 
 pub mod control;
 pub mod dsu;
+pub mod flydigi;
 pub mod gamepad;
 pub mod gyro_imu;
 pub mod host_input;

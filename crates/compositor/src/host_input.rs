@@ -90,6 +90,8 @@ pub struct HostInput {
     /// `pid_alive`). We keep the handle here and `try_wait()` it every frame
     /// alongside `running_apps` until it exits, so the process is always reaped.
     orphaned_children: Vec<(String, Child)>,
+    /// DSU slot the host-read Flydigi gyro is published on, while one streams.
+    flydigi_slot: Option<u8>,
 }
 
 impl HostInput {
@@ -110,6 +112,7 @@ impl HostInput {
             active_app_gyro_mode: GyroMode::default(),
             running_apps: HashMap::new(),
             orphaned_children: Vec::new(),
+            flydigi_slot: None,
         }
     }
 
@@ -186,6 +189,34 @@ impl HostInput {
 
     /// The gyro mode actually in force: the app's choice, with Mouse demoted to
     /// Enabled while the global gyro→mouse switch is off.
+    /// Feed the host-read Flydigi gyro (see [`crate::flydigi`]) to the DSU
+    /// server. It takes the first DSU slot no client controller holds, chosen
+    /// when it starts streaming, and obeys the active app's gyro mode like a
+    /// client's motion does.
+    pub fn flydigi_motion(&mut self, msg: crate::flydigi::Msg) {
+        use crate::flydigi::Msg;
+        match msg {
+            Msg::Connected => {
+                let slot = (0..4u8).find(|s| !self.pads.has_slot(*s)).unwrap_or(0);
+                info!("flydigi gyro → DSU slot {slot}");
+                self.dsu.pad(slot, true);
+                self.flydigi_slot = Some(slot);
+            }
+            Msg::Disconnected => {
+                if let Some(slot) = self.flydigi_slot.take() {
+                    self.dsu.pad(slot, false);
+                }
+            }
+            Msg::Sample { gyro, accel } => {
+                if let Some(slot) = self.flydigi_slot {
+                    if self.gyro_mode() == GyroMode::Enabled {
+                        self.dsu.motion(slot, gyro, accel);
+                    }
+                }
+            }
+        }
+    }
+
     fn gyro_mode(&self) -> GyroMode {
         match self.active_app_gyro_mode {
             GyroMode::Mouse if !GYRO_MOUSE_ENABLED.load(Ordering::Relaxed) => GyroMode::Enabled,

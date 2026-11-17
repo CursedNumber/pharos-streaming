@@ -207,6 +207,11 @@ impl PadManager {
         self.ensure(slot);
     }
 
+    /// Whether a client controller currently owns `slot`.
+    pub fn has_slot(&self, slot: u8) -> bool {
+        self.pads.contains_key(&slot)
+    }
+
     pub fn disconnect(&mut self, slot: u8) {
         self.swaps.remove(&slot);
         if self.pads.remove(&slot).is_some() {

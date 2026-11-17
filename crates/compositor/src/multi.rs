@@ -3190,6 +3190,9 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
     // USB/IP-imported keyboards (vhci) → seat. Reads only vhci devices, so the
     // host's own keyboard is untouched. Always on; idle when none are imported.
     let usbkbd = crate::usbkbd::UsbKbd::spawn();
+    // A Flydigi Vader's own gyro (vendor HID interface) → DSU. Idle unless a
+    // Vader is attached AND `[dsu] enabled`.
+    let flydigi = crate::flydigi::FlydigiGyro::spawn();
 
     // Gamepad slots + gyro→mouse + per-controller tuning. Lives in the shared
     // `host_input` module (used to be inline in the single-output path before
@@ -4398,6 +4401,10 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
             {
                 host_input.stream_raw_gyro(|pkt| s.send_gyro(pkt));
             }
+        }
+
+        for msg in flydigi.drain() {
+            host_input.flydigi_motion(msg);
         }
 
         // USB/IP-imported keyboards and mice → the focused surface. Keys go
