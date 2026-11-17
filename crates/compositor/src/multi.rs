@@ -2354,7 +2354,7 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
 
     // Advertise dmabuf so EGL clients (alacritty etc.) can submit GPU buffers.
     let formats: Vec<_> = renderer.dmabuf_formats().into_iter().collect();
-    let _dmabuf_global = state.dmabuf_state.create_global::<State>(&dh, formats);
+    let _dmabuf_global = crate::advertise_dmabuf(&mut state.dmabuf_state, &dh, node, formats);
 
     let cuda = CudaContext::new(0).map_err(|e| anyhow::anyhow!("cuda init: {e:?}"))?;
     cuda.bind_to_thread()

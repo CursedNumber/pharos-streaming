@@ -692,10 +692,12 @@ fn launch_in_gamescope(
 /// the app against it (`DISPLAY=:N`, `WAYLAND_DISPLAY` scrubbed so an
 /// X11-capable toolkit can't silently prefer Wayland). No window manager runs
 /// inside the X server — right for fullscreen games/emulators, wrong for
-/// multi-window desktop apps. `-terminate` makes the server exit on its own
-/// when its last client disconnects; until a client connects (or on a failed
-/// app spawn) we kill it ourselves, and [`end_app`] reaps it as a registered
-/// companion of the slug.
+/// multi-window desktop apps. `-terminate 10` makes the server exit on its own
+/// 10s after its last client disconnects. The grace delay is load-bearing: a
+/// bare `-terminate` exits on the FIRST disconnect, so an app that probes the
+/// display before opening its window (Eden/Lichii does) killed the server under
+/// itself. Until a client connects (or on a failed app spawn) we kill it
+/// ourselves, and [`end_app`] reaps it as a registered companion of the slug.
 fn launch_in_xwayland(
     entry: &AppEntry,
     ctx: &LaunchContext,
@@ -736,7 +738,8 @@ fn launch_in_xwayland(
             .arg("-fullscreen")
             .arg("-geometry")
             .arg(format!("{w}x{h}"))
-            .arg("-terminate");
+            .arg("-terminate")
+            .arg("10");
         if let Some(sock) = &ctx.wayland_socket {
             xcmd.env("WAYLAND_DISPLAY", sock);
         }
@@ -773,6 +776,13 @@ fn launch_in_xwayland(
         let mut cmd = build_command(entry, line, kind_shell)?;
         cmd.env("DISPLAY", format!(":{xdpy}"));
         cmd.env_remove("WAYLAND_DISPLAY");
+        // The host session is Wayland, and toolkits (and Eden-based emulators'
+        // "Wayland is experimental" check) read the session type, not just
+        // WAYLAND_DISPLAY. Inside this server there is only X11; say so. Entry
+        // env is applied after this and can still override.
+        cmd.env("XDG_SESSION_TYPE", "x11");
+        cmd.env("QT_QPA_PLATFORM", "xcb");
+        cmd.env("SDL_VIDEODRIVER", "x11");
         if let Some(sink) = &ctx.audio_sink {
             cmd.env("PULSE_SINK", sink);
         }

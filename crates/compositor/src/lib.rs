@@ -1097,7 +1097,7 @@ pub fn run_capture_gl(
     // Advertise linux-dmabuf with the renderer's formats so EGL/GPU clients
     // (alacritty) can submit GPU buffers, imported at render time.
     let formats: Vec<_> = renderer.dmabuf_formats().into_iter().collect();
-    let _dmabuf_global = state.dmabuf_state.create_global::<State>(&dh, formats);
+    let _dmabuf_global = advertise_dmabuf(&mut state.dmabuf_state, &dh, node, formats);
     // winewayland (and gamescope) require wp_viewporter to set up their surfaces;
     // without it the client creates a toplevel then immediately tears it down (the
     // symptom: `new_toplevel` fires, then the window count drops back to 0).
@@ -1422,5 +1422,41 @@ fn dispatch_gyro_mouse(
     pointer.frame(&mut data.state);
     if let Some(s) = focus_surface {
         activate_pointer_constraint_on(&mut data.state, s);
+    }
+}
+
+/// Advertise `zwp_linux_dmabuf_v1` **v4+ with default feedback** naming `node`
+/// as the main device, falling back to the plain v3 global if the feedback
+/// can't be built.
+///
+/// v4 matters: Xwayland's glamor (GPU) path finds its render node only through
+/// the feedback's main device (we expose no `wl_drm`). With bare v3 it logs
+/// "GBM Wayland interfaces not available" and falls back to software
+/// rendering, which crippled X11 apps on the per-app Xwayland.
+pub(crate) fn advertise_dmabuf(
+    dmabuf_state: &mut DmabufState,
+    dh: &smithay::reexports::wayland_server::DisplayHandle,
+    node: &str,
+    formats: Vec<smithay::backend::allocator::Format>,
+) -> DmabufGlobal {
+    use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
+    use std::os::unix::fs::MetadataExt;
+
+    let feedback = std::fs::metadata(node)
+        .map_err(|e| e.to_string())
+        .and_then(|m| {
+            DmabufFeedbackBuilder::new(m.rdev() as libc::dev_t, formats.clone())
+                .build()
+                .map_err(|e| e.to_string())
+        });
+    match feedback {
+        Ok(fb) => {
+            info!("linux-dmabuf v4+ advertised with main device {node}");
+            dmabuf_state.create_global_with_default_feedback::<State>(dh, &fb)
+        }
+        Err(e) => {
+            tracing::warn!("dmabuf feedback for {node} unavailable ({e}); advertising v3 only");
+            dmabuf_state.create_global::<State>(dh, formats)
+        }
     }
 }
