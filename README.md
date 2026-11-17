@@ -27,7 +27,8 @@ from scratch in Rust and Kotlin.
 - **Controllers just work.** Gamepads appear on the PC as ordinary Xbox pads,
   with per-controller button and gyro tuning. A full Steam Big Picture session
   runs inside the stream, so even Steam Input games get your pad. Gyro aiming
-  reaches emulators too, through a built-in DSU motion server.
+  reaches emulators too, through a built-in DSU motion server: aim in Lichii
+  with your phone's gyro ([how](docs/gyro-emulators.md)).
 - **Plug a USB device into the client, and the PC sees it.** A controller, a
   flight stick, or a thumb drive plugged into your TV box shows up on the PC as a
   real local device.
@@ -107,6 +108,9 @@ Tested on real hardware and used every day:
   controller fully working through the Steam session.
 - **Mirroring the real KDE/GNOME desktop** at about 60 fps, keyboard and mouse
   included.
+- **Gyro aiming in the Lichii emulator**, from the phone's own gyro under a
+  clamp controller, tunable from the couch.
+  See [Gyro aiming in emulators](docs/gyro-emulators.md).
 - **Games tested so far** include No Man's Sky, Cyberpunk 2077, Crimson Desert,
   and the Lichii emulator. Not yet tested with Grand Theft Auto VI.
 - **Windows hosting** with NVENC, plus clients on Android, Linux, Windows, a
