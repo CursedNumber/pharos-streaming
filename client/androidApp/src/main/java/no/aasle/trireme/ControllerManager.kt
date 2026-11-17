@@ -83,7 +83,9 @@ class ControllerManager(
             InputDevice.getDevice(id)?.let { if (isGamepad(it)) attach(it) }
         }
         relayUsbExportProfiles()
-        if (managed && StreamHub.isGyroEnabled() && StreamHub.isPhoneGyro()) registerPhoneGyro()
+        // Phone gyro is its own opt-in, independent of controller handling: raw
+        // mode only means "don't process the pad", not "no phone sensors".
+        if (StreamHub.isGyroEnabled() && StreamHub.isPhoneGyro()) registerPhoneGyro()
     }
 
     /**
@@ -420,10 +422,13 @@ class ControllerManager(
      * device from the pad?". No-op in raw mode (gyro is never forwarded there).
      */
     fun setGyroForwarding(enabled: Boolean) {
-        if (!managed) return
         if (enabled && StreamHub.isPhoneGyro()) {
             registerPhoneGyro()
-        } else if (enabled) {
+            return
+        }
+        if (!enabled) unregisterPhoneGyro()
+        if (!managed) return
+        if (enabled) {
             for ((deviceId, slot) in slotOf.entries.toList()) {
                 if (gyro.containsKey(deviceId)) continue
                 InputDevice.getDevice(deviceId)?.let { registerGyro(it, slot) }
