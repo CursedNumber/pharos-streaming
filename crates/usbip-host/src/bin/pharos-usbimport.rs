@@ -25,6 +25,50 @@ fn main() -> anyhow::Result<()> {
     win::run()
 }
 
+/// On SIGTERM/SIGINT (Linux: `systemctl stop`, the host launcher's reap) or
+/// Ctrl-C / console close (Windows), send every connected exporter a QUIC close
+/// before exiting, so phones re-export to the next importer right away instead
+/// of waiting out the 20s idle timeout. A second signal still kills at once.
+#[cfg(any(target_os = "linux", windows))]
+fn close_on_shutdown(endpoint: transport::UsbImportEndpoint) {
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        tracing::info!("shutting down: closing exporter connections");
+        transport::usb_import_close(&endpoint).await;
+        std::process::exit(0);
+    });
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let (Ok(mut term), Ok(mut int)) = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) else {
+        tracing::warn!("can't install signal handlers; stop will not close exporters cleanly");
+        return std::future::pending().await;
+    };
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = int.recv() => {}
+    }
+}
+
+#[cfg(windows)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::windows::{ctrl_close, ctrl_shutdown};
+    let (Ok(mut close), Ok(mut shut)) = (ctrl_close(), ctrl_shutdown()) else {
+        let _ = tokio::signal::ctrl_c().await;
+        return;
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = close.recv() => {}
+        _ = shut.recv() => {}
+    }
+}
+
 #[cfg(not(any(target_os = "linux", windows)))]
 fn main() {
     eprintln!(
@@ -63,6 +107,7 @@ mod imp {
         }
         let endpoint = transport::usb_import_endpoint(addr).context("bind USB relay")?;
         tracing::info!("Pharos USB import bridge listening on {addr}");
+        crate::close_on_shutdown(endpoint.clone());
 
         loop {
             let link = match transport::usb_import_accept(&endpoint).await {
@@ -313,6 +358,7 @@ mod win {
              shim on 127.0.0.1:{USBIP_TCP_PORT}; usbip.exe = {}",
             usbip.display()
         );
+        crate::close_on_shutdown(endpoint.clone());
 
         loop {
             let link = match transport::usb_import_accept(&endpoint).await {

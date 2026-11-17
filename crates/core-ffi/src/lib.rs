@@ -1270,6 +1270,18 @@ async fn usb_export_run(
         }
     };
     drop(tx);
-    let _ = writer.await;
+    // Flush replies already queued, but never wait on the in-flight transfers
+    // themselves: each holds a `tx` clone, and a pending interrupt-IN only
+    // returns when the device sends a report or the Kotlin sink is shut down.
+    // The sink is shut down from `on_end`, which runs only after we return, so
+    // an unbounded wait here could hold a dead export open until the user
+    // happens to touch an idle pad. Bounded, then the writer is dropped.
+    let mut writer = writer;
+    if tokio::time::timeout(std::time::Duration::from_millis(500), &mut writer)
+        .await
+        .is_err()
+    {
+        writer.abort();
+    }
     result
 }

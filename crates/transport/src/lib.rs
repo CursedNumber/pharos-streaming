@@ -5185,6 +5185,21 @@ pub fn usb_import_endpoint(addr: SocketAddr) -> Result<Endpoint> {
     Ok(Endpoint::server(usb_server_config()?, addr)?)
 }
 
+/// The USB import listener [`usb_import_endpoint`] returns, nameable by callers
+/// that don't depend on quinn directly (the importer binaries).
+pub type UsbImportEndpoint = Endpoint;
+
+/// Close the USB import listener *gracefully*: every live exporter connection
+/// gets a QUIC CONNECTION_CLOSE, so a Trireme exporter sees its link end at
+/// once and re-exports to the next importer instance within a second or so.
+/// Without this, a stopped importer just vanishes and each exporter only notices
+/// after its 20s idle timeout (the "USB reconnect takes a minute after a host
+/// restart" symptom). Bounded: gives the close frames up to 1s to go out.
+pub async fn usb_import_close(endpoint: &UsbImportEndpoint) {
+    endpoint.close(0u32.into(), b"importer shutting down");
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), endpoint.wait_idle()).await;
+}
+
 /// Accept one exporter connection and its relay stream on the listener. Low
 /// latency: the stream is used raw (no extra framing) so a URB hits the wire as
 /// soon as it's written.
@@ -5952,6 +5967,42 @@ mod tests {
     /// A multi-NIC host whose first address is dead (a bound but silent UDP
     /// socket: nothing answers the QUIC handshake) must still get the export
     /// via the next candidate.
+    /// A gracefully stopped importer must end the exporter's link at once (a
+    /// QUIC close), not leave it to the 20s idle timeout.
+    #[test]
+    fn usb_import_close_ends_exporter_link_promptly() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let endpoint = super::usb_import_endpoint((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+            let addr = endpoint.local_addr().unwrap();
+            let ep = endpoint.clone();
+            let server = tokio::spawn(async move {
+                let mut link = super::usb_import_accept(&ep).await.unwrap();
+                let mut hello = [0u8; 4];
+                link.recv.read_exact(&mut hello).await.unwrap();
+                link
+            });
+            let mut link = super::usb_export_connect_first(&[addr]).await.unwrap();
+            link.send.write_all(b"HELO").await.unwrap();
+            let _held = server.await.unwrap();
+            let t0 = std::time::Instant::now();
+            super::usb_import_close(&endpoint).await;
+            let mut buf = [0u8; 1];
+            let r = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                link.recv.read_exact(&mut buf),
+            )
+            .await
+            .expect("exporter link should end well before the idle timeout");
+            assert!(r.is_err(), "read on a closed link must fail");
+            assert!(t0.elapsed() < std::time::Duration::from_secs(3));
+        });
+    }
+
     #[test]
     fn usb_export_falls_back_to_the_next_address() {
         let _ = rustls::crypto::ring::default_provider().install_default();

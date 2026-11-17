@@ -16,7 +16,7 @@ path = "src/bin/pharos-usbimport.rs"
 transport = { path = "../transport" }
 # Shared wire-port constants (USB/IP import listener default).
 core-proto = { path = "../core-proto" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal"] }
 nix = { version = "0.29", features = ["socket"] }
 anyhow = "1"
 tracing = "0.1"
@@ -34,6 +34,7 @@ tokio = { version = "1", features = [
     "io-util",
     "time",
     "sync",
+    "signal",
 ] }
 anyhow = "1"
 tracing = "0.1"

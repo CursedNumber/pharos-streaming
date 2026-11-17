@@ -20,7 +20,7 @@ core-proto = { workspace = true }
 core-crypto = { path = "../core-crypto" }
 core-usbip = { path = "../core-usbip" }
 transport = { path = "../transport" }
-tokio = { version = "1", features = ["rt", "macros", "sync"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 anyhow = "1"
 hex = "0.4"
