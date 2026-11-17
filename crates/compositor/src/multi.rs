@@ -4400,9 +4400,19 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
             }
         }
 
-        // USB/IP-imported keyboards → the focused surface (the host adds the xkb
-        // +8 to the evdev code). Independent of the network back-channel.
-        for (code, pressed) in usbkbd.drain() {
+        // USB/IP-imported keyboards and mice → the focused surface. Keys go
+        // straight to the seat (the host adds the xkb +8 to the evdev code);
+        // mouse events take the same seat dispatch as a client's mouse, so
+        // focus, pointer locks, and the overlay cursor behave identically.
+        // Independent of the network back-channel.
+        for ev in usbkbd.drain() {
+            let (code, pressed) = match ev {
+                crate::usbkbd::UsbEvent::Key(code, pressed) => (code, pressed),
+                crate::usbkbd::UsbEvent::Pointer(pev) => {
+                    crate::dispatch_input(&mut data, input_w, input_h, focus_surface.as_ref(), pev);
+                    continue;
+                }
+            };
             if let Some(keyboard) = data.state.seat.get_keyboard() {
                 let serial = SERIAL_COUNTER.next_serial();
                 let time = data.state.start_time.elapsed().as_millis() as u32;
