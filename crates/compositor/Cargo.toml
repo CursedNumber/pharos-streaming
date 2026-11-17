@@ -122,9 +122,10 @@ Start with: systemctl --user enable --now pharos-host pharos-tray"""
 # requirement; see Recommends).
 depends = "libc6 (>= 2.35), libgcc-s1, libdrm2, libegl1, libexpat1, libgbm1, libopus0, libpixman-1-0, libxkbcommon0, pulseaudio-utils, libpipewire-0.3-0"
 # The compositor dlopens EGL (hard: it renders through it, hence Depends above)
-# and needs the NVIDIA driver's encode/decode libs at load time; those package
-# names vary per driver series (libnvidia-encode1 on Debian,
-# libnvidia-encode-NNN on Ubuntu), so they stay undeclared. The panel presents
+# and dlopens the NVIDIA driver's libcuda + libnvidia-encode at startup (it
+# exits with a clear message when they're missing); those package names vary
+# per driver series (libnvidia-encode1 on Debian, libnvidia-encode-NNN on
+# Ubuntu), so they stay undeclared. The panel presents
 # via Vulkan/Wayland. Xwayland runs X11 apps/games inside the stream; the
 # portal enables desktop-mirror mode.
 recommends = "libgles2, libvulkan1, libwayland-client0, xwayland, xdg-desktop-portal"

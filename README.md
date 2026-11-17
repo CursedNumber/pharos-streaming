@@ -74,7 +74,9 @@ Or download the `.deb` yourself and run `sudo apt install ./pharos_*_amd64.deb`.
 
 **Windows host**: run `pharos-<ver>-x86_64.msi`. It adds Start Menu shortcuts
 and the firewall rule streaming needs. Portable `.exe` files are on the release
-page too, if you'd rather not install.
+page too, if you'd rather not install. The Windows host also needs ffmpeg,
+which isn't bundled: run `winget install Gyan.FFmpeg`, or drop `ffmpeg.exe`
+next to `pharos-host.exe`. If it's missing, the tray tells you.
 
 **Android / Android TV**: sideload `trireme-<ver>-<abi>.apk`. Use `arm64-v8a`
 for phones and recent TVs, `armeabi-v7a` for older 32-bit TVs (such as the Sony

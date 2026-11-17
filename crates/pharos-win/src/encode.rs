@@ -104,9 +104,20 @@ impl WinCodec {
     }
 }
 
-/// Resolve the ffmpeg executable, checking the WinGet "Links" shim dir that
-/// already-open shells don't have on PATH (mirrors Trireme's `ffmpeg_program`).
+/// Resolve the ffmpeg executable: an `ffmpeg.exe` placed next to
+/// `pharos-host.exe` wins (no PATH edit needed for a manual install), then the
+/// WinGet "Links" shim dir that already-open shells don't have on PATH
+/// (mirrors Trireme's `ffmpeg_program`), then plain PATH lookup.
 pub fn ffmpeg_program() -> std::ffi::OsString {
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+    {
+        let cand = dir.join("ffmpeg.exe");
+        if cand.exists() {
+            return cand.into_os_string();
+        }
+    }
     if let Some(la) = std::env::var_os("LOCALAPPDATA") {
         let cand = std::path::Path::new(&la)
             .join("Microsoft")
@@ -118,6 +129,33 @@ pub fn ffmpeg_program() -> std::ffi::OsString {
         }
     }
     std::ffi::OsString::from("ffmpeg")
+}
+
+/// What to tell the user when ffmpeg can't be found. The ddagrab/wgc capture
+/// paths (and every Intel/AMD encode) run through it, and the installer does
+/// not ship it, so this lands in the tray/panel fault reason verbatim.
+pub const FFMPEG_MISSING: &str = "ffmpeg not found: install it with `winget install Gyan.FFmpeg` \
+     (or put ffmpeg.exe next to pharos-host.exe), then restart Pharos";
+
+/// Whether [`ffmpeg_program`] actually runs (`ffmpeg -version`).
+pub fn ffmpeg_available() -> bool {
+    Command::new(ffmpeg_program())
+        .arg("-version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|st| st.success())
+}
+
+/// Turn an ffmpeg spawn failure into an error, with the install hint when the
+/// executable simply isn't there.
+fn spawn_error(prog: &std::ffi::OsStr, e: std::io::Error) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        anyhow::anyhow!("{FFMPEG_MISSING}")
+    } else {
+        anyhow::anyhow!("spawn ffmpeg ({}): {e}", prog.to_string_lossy())
+    }
 }
 
 pub struct CaptureEncoder {
@@ -143,7 +181,7 @@ impl CaptureEncoder {
             // diagnostics (stream mapping, encoder init, `frame= N`) stay visible.
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| anyhow::anyhow!("spawn ffmpeg ({}): {e}", prog.to_string_lossy()))?;
+            .map_err(|e| spawn_error(&prog, e))?;
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         Ok(Self {
@@ -176,7 +214,7 @@ impl CaptureEncoder {
             // thread re-echoes every line to keep ffmpeg's diagnostics visible.
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| anyhow::anyhow!("spawn ffmpeg ({}): {e}", prog.to_string_lossy()))?;
+            .map_err(|e| spawn_error(&prog, e))?;
         let stdout = child.stdout.take();
         let stdin = child.stdin.take();
         let stderr = child.stderr.take();

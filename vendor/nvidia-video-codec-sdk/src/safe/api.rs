@@ -2,8 +2,6 @@
 
 use core::ffi::{c_int, c_void};
 
-#[cfg(not(windows))]
-use crate::sys::nvEncodeAPI::{NvEncodeAPICreateInstance, NvEncodeAPIGetMaxSupportedVersion};
 use crate::sys::nvEncodeAPI::{
     GUID,
     NVENCAPI_MAJOR_VERSION,
@@ -233,31 +231,44 @@ fn assert_versions_match(max_supported_version: u32) {
 type GetMaxSupportedVersionFn = unsafe extern "C" fn(*mut u32) -> NVENCSTATUS;
 type CreateInstanceFn = unsafe extern "C" fn(*mut NV_ENCODE_API_FUNCTION_LIST) -> NVENCSTATUS;
 
-/// On unix the bootstrap symbols are linked against libnvidia-encode.so
-/// (build.rs emits the link directives).
+/// The driver library that exports the two bootstrap symbols. It ships with
+/// every NVIDIA driver (not the SDK), so nothing is linked at build time.
 #[cfg(not(windows))]
-fn entry_points() -> (GetMaxSupportedVersionFn, CreateInstanceFn) {
-    (NvEncodeAPIGetMaxSupportedVersion, NvEncodeAPICreateInstance)
+pub const NVENC_LIBRARY: &str = "libnvidia-encode.so.1";
+/// The driver library that exports the two bootstrap symbols.
+#[cfg(windows)]
+pub const NVENC_LIBRARY: &str = "nvEncodeAPI64.dll";
+
+/// Whether the NVIDIA encode library can be loaded at all, so a caller can
+/// fail with a clear message before first touching [`ENCODE_API`] (whose
+/// initialisation panics when the driver is missing).
+///
+/// # Errors
+/// The loader's message when the library cannot be opened.
+pub fn nvenc_library_available() -> Result<(), String> {
+    unsafe { libloading::Library::new(NVENC_LIBRARY) }
+        .map(drop)
+        .map_err(|e| e.to_string())
 }
 
-/// On Windows the bootstrap symbols are loaded at runtime from the driver's
-/// nvEncodeAPI64.dll (the ffmpeg/nv-codec-headers approach): no import
-/// library and no SDK install are needed to build, and the DLL ships with
-/// every NVIDIA driver. The library handle is leaked intentionally — the
-/// resulting `ENCODE_API` is a process-lifetime static, so the DLL must stay
-/// mapped for as long as the process lives anyway.
-#[cfg(windows)]
+/// The bootstrap symbols are loaded at runtime from the driver's encode
+/// library (the ffmpeg/nv-codec-headers approach): no import library and no
+/// SDK install are needed to build, and a machine without an NVIDIA driver
+/// can still start the binary and report a clear error instead of failing in
+/// the dynamic loader. The library handle is leaked intentionally — the
+/// resulting `ENCODE_API` is a process-lifetime static, so the library must
+/// stay mapped for as long as the process lives anyway.
 fn entry_points() -> (GetMaxSupportedVersionFn, CreateInstanceFn) {
-    let lib = unsafe { libloading::Library::new("nvEncodeAPI64.dll") }.expect(
-        "nvEncodeAPI64.dll should load — it ships with the NVIDIA driver; is one installed?",
-    );
+    let lib = unsafe { libloading::Library::new(NVENC_LIBRARY) }.unwrap_or_else(|e| {
+        panic!("{NVENC_LIBRARY} should load — it ships with the NVIDIA driver; is one installed? ({e})")
+    });
     unsafe {
         let get_version: libloading::Symbol<GetMaxSupportedVersionFn> = lib
             .get(b"NvEncodeAPIGetMaxSupportedVersion\0")
-            .expect("NvEncodeAPIGetMaxSupportedVersion should exist in nvEncodeAPI64.dll");
+            .expect("NvEncodeAPIGetMaxSupportedVersion should exist in the NVENC library");
         let create_instance: libloading::Symbol<CreateInstanceFn> = lib
             .get(b"NvEncodeAPICreateInstance\0")
-            .expect("NvEncodeAPICreateInstance should exist in nvEncodeAPI64.dll");
+            .expect("NvEncodeAPICreateInstance should exist in the NVENC library");
         let entry = (*get_version, *create_instance);
         std::mem::forget(lib);
         entry

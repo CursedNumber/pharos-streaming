@@ -175,6 +175,12 @@ fn run_stream_args(args: &[String]) -> anyhow::Result<()> {
             codec.label()
         );
     }
+    // Every backend but the in-process NVENC one runs through ffmpeg, which the
+    // installer does not ship. Say so up front; the supervisor's build retries
+    // then surface the same hint as the tray/panel fault reason.
+    if !matches!(capture, CaptureBackend::WgcZc) && !encode::ffmpeg_available() {
+        tracing::error!("{}", encode::FFMPEG_MISSING);
+    }
     run_stream(bind, output_idx, fps, encoder, capture, codec)
 }
 

@@ -3,9 +3,10 @@
 # - safe `Session::reconfigure_bitrate`/`reconfigure_resolution` (the published
 #   crate seals the encoder handle and ships no reconfigure wrapper — see
 #   src/safe/session.rs);
-# - Windows support without the SDK installed: build.rs skips import-library
-#   linking and safe/api.rs loads the two bootstrap symbols from the driver's
-#   nvEncodeAPI64.dll at runtime (the ffmpeg/nv-codec-headers approach), and
+# - no link-time dependency on the driver: build.rs emits no link directives
+#   and safe/api.rs loads the two bootstrap symbols at runtime from
+#   nvEncodeAPI64.dll (Windows) or libnvidia-encode.so.1 (Linux), so the binary
+#   starts (and can say what's missing) on a machine without the driver (the ffmpeg/nv-codec-headers approach), and
 #   `Encoder::initialize_with_directx` opens D3D11-device sessions for the
 #   Windows host's zero-copy WGC capture (issue #12).
 # Manifest trimmed to lib-only: dev-dependencies (vulkano/libc), examples and
@@ -58,8 +59,9 @@ features = ["cuda-version-from-build-system"]
 [target.'cfg(windows)'.dependencies.cudarc]
 version = "0.16.4"
 
-# Runtime loading of nvEncodeAPI64.dll's two bootstrap symbols (safe/api.rs).
-[target.'cfg(windows)'.dependencies.libloading]
+# Runtime loading of the driver's two NVENC bootstrap symbols (safe/api.rs):
+# nvEncodeAPI64.dll on Windows, libnvidia-encode.so.1 on Linux.
+[dependencies.libloading]
 version = "0.8"
 
 [dependencies.lazy_static]

@@ -2269,6 +2269,18 @@ fn read_selection_text(read_fd: libc::c_int, timeout: std::time::Duration) -> Op
 }
 
 pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
+    // The NVENC library is loaded at runtime, not linked, so a box without the
+    // NVIDIA driver gets here; say so plainly instead of panicking later
+    // inside the first encoder session.
+    if let Err(e) = nvidia_video_codec_sdk::safe::nvenc_library_available() {
+        anyhow::bail!(
+            "the Linux host encodes with NVIDIA NVENC, but {} could not be loaded ({e}). \
+             Install the NVIDIA proprietary driver (its encode library ships with it), \
+             or use the Windows host on Intel/AMD GPUs.",
+            nvidia_video_codec_sdk::safe::NVENC_LIBRARY
+        );
+    }
+
     // Load (or generate) the host's long-term Ed25519 identity once; share
     // it with every per-output streamer so clients can pin the same key
     // regardless of which output they're watching.
