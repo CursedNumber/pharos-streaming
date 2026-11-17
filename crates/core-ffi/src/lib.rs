@@ -1058,7 +1058,9 @@ impl UsbExportHandle {
     }
 }
 
-/// Export a local USB device to Pharos over the standalone USB relay. `name` is
+/// Export a local USB device to Pharos over the standalone USB relay. `pharos`
+/// is the importer's `host:port`, or a comma-separated list of them for a
+/// multi-NIC host (tried in order, first reachable wins). `name` is
 /// the friendly label shown on Pharos; `devid`/`speed` are the USB/IP attach
 /// params (speed: 2=full, 3=high, 5=super). Returns a handle to cancel it; the
 /// relay runs on its own thread and drives `sink` per URB until cancelled or
@@ -1132,10 +1134,21 @@ async fn usb_export_run(
     use core_usbip::proto::*;
     use std::collections::HashSet;
 
-    let addr = pharos.parse()?;
+    // `pharos` is one `host:port`, or several comma-separated ones for a
+    // multi-NIC host (tried in order, first reachable wins).
+    let candidates: Vec<String> = pharos
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    let addrs = transport::resolve_candidates(&candidates);
+    if addrs.is_empty() {
+        anyhow::bail!("no resolvable USB/IP target in {pharos:?}");
+    }
     let mut link = tokio::select! {
         _ = cancel.cancelled() => return Ok(()),
-        r = transport::usb_export_connect(addr) => r?,
+        r = transport::usb_export_connect_first(&addrs) => r?,
     };
     // Hello: v2 (descriptor block — what a Windows import bridge needs) when
     // the importer advertised it AND the caller supplied the descriptors;

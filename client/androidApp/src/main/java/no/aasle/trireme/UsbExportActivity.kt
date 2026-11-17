@@ -204,7 +204,7 @@ private fun ExportScreen(
             ) {
                 Text(
                     if (pharos.isBlank()) "Trireme — share USB with the host"
-                    else "Trireme — share USB with $pharos",
+                    else "Trireme — share USB with ${pharos.replace(",", " or ")}",
                     style = MaterialTheme.typography.titleMedium,
                     color = MaterialTheme.colorScheme.onSurface,
                     modifier = Modifier.weight(1f),

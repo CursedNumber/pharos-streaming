@@ -5207,12 +5207,19 @@ pub async fn usb_import_accept(endpoint: &Endpoint) -> Result<UsbLink> {
 /// Trireme (export side): open a persistent USB-relay connection to Pharos and the
 /// bidirectional stream the URBs ride on. Not contingent on any video session.
 pub async fn usb_export_connect(server_addr: SocketAddr) -> Result<UsbLink> {
+    usb_export_connect_first(&[server_addr]).await
+}
+
+/// [`usb_export_connect`] over several candidate addresses for the same host
+/// (a multi-NIC host: Wi-Fi + wired), tried in order like the video stream's
+/// [`connect_first`], so a dead first address doesn't strand the export.
+pub async fn usb_export_connect_first(server_addrs: &[SocketAddr]) -> Result<UsbLink> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut endpoint = Endpoint::client((Ipv4Addr::UNSPECIFIED, 0).into())?;
     // The verifier flags the importer's v2 capability during the handshake.
     let saw_v2 = Arc::new(AtomicBool::new(false));
     endpoint.set_default_client_config(usb_client_config(saw_v2.clone())?);
-    let conn = endpoint.connect(server_addr, "localhost")?.await?;
+    let conn = connect_first(&endpoint, server_addrs).await?;
     // The exporter opens the stream and speaks first (device-info handshake),
     // which is what makes the importer's accept_bi() resolve.
     let (send, recv) = conn.open_bi().await?;
@@ -5940,6 +5947,36 @@ mod tests {
         let data: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
         let received = super::quic_loopback(data.clone()).expect("loopback");
         assert_eq!(received, data);
+    }
+
+    /// A multi-NIC host whose first address is dead (a bound but silent UDP
+    /// socket: nothing answers the QUIC handshake) must still get the export
+    /// via the next candidate.
+    #[test]
+    fn usb_export_falls_back_to_the_next_address() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let dead = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let dead_addr = dead.local_addr().unwrap();
+            let endpoint = super::usb_import_endpoint((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+            let live_addr = endpoint.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let mut link = super::usb_import_accept(&endpoint).await.unwrap();
+                let mut hello = [0u8; 4];
+                link.recv.read_exact(&mut hello).await.unwrap();
+                hello
+            });
+            let mut link = super::usb_export_connect_first(&[dead_addr, live_addr])
+                .await
+                .unwrap();
+            link.send.write_all(b"HELO").await.unwrap();
+            assert_eq!(&server.await.unwrap(), b"HELO");
+            drop(dead);
+        });
     }
 
     /// The USB relay channel must carry bytes both ways on one bidi stream

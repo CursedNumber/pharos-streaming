@@ -69,23 +69,34 @@ class UsbStore(ctx: Context) {
     private val app = ctx.applicationContext
     private val p = app.getSharedPreferences("trireme_usb", Context.MODE_PRIVATE)
 
-    /** USB/IP export target `<host>:port`. An explicit user override wins;
-     *  otherwise it's derived from the paired host's address (its LAN host + the
-     *  USB/IP port), so it follows whatever host you actually paired with. Empty
-     *  when no host is known yet — the export screen then asks for one. We never
-     *  ship a hard-coded personal LAN address as the default. */
-    fun pharos(): String =
-        p.getString("pharos", null)?.takeIf { it.isNotBlank() } ?: derivedPharos() ?: ""
+    /** USB/IP export target(s), comma-separated `<host>:port`, tried in order.
+     *  A saved explicit target goes first (older builds could store one); the
+     *  paired host's LAN addresses follow as fallbacks, so a stale saved address
+     *  can't strand the export. Empty when no host is known yet — the export
+     *  screen then asks for one. We never ship a hard-coded personal LAN
+     *  address as the default. */
+    fun pharos(): String {
+        val saved = p.getString("pharos", null)?.takeIf { it.isNotBlank() }
+        return (listOfNotNull(saved) + (derivedPharos()?.split(",") ?: emptyList()))
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .joinToString(",")
+    }
 
     fun setPharos(a: String) = p.edit().putString("pharos", a).apply()
 
     /** Best-effort export target from the saved host registry: a paired entry if
-     *  there is one, else the first known host; its host part + [USBIP_PORT].
-     *  Null when no host has been added yet. */
+     *  there is one, else the first known host. Every LAN address it has (the
+     *  pinned NIC first, then the others) + [USBIP_PORT], comma-separated: the
+     *  core tries them in order like the video stream does, so a host whose
+     *  first-listed NIC went dead (e.g. moved from Wi-Fi to a wired link) still
+     *  gets the device. Null when no host has been added yet. */
     private fun derivedPharos(): String? {
         val servers = ServerStore(app).load().servers
-        val host = (servers.firstOrNull { it.paired } ?: servers.firstOrNull())?.host
-        return host?.takeIf { it.isNotBlank() }?.let { "$it:$USBIP_PORT" }
+        val entry = servers.firstOrNull { it.paired } ?: servers.firstOrNull() ?: return null
+        val hosts = entry.orderedLanHosts().filter { it.isNotBlank() }
+        return hosts.takeIf { it.isNotEmpty() }?.joinToString(",") { "$it:$USBIP_PORT" }
     }
 
     /** Master USB/IP switch. Default OFF: with it off nothing is forwarded, the
