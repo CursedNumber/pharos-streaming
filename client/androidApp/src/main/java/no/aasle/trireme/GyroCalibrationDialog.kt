@@ -3,6 +3,14 @@
 
 package no.aasle.trireme
 
+import android.content.Context
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import android.hardware.display.DisplayManager
+import android.view.Display
+import android.view.Surface as ViewSurface
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -37,12 +45,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import kotlin.math.abs
+import no.aasle.trireme.stream.StreamHub
 import uniffi.core_ffi.ControllerProfile
 import uniffi.core_ffi.FrameSink
 import uniffi.core_ffi.GamepadInput
@@ -127,6 +137,30 @@ fun GyroCalibrationDialog(
             GyroTelemetry.startSession(h) // owned centrally so onPause can tear it down too
         }
         onDispose { GyroTelemetry.stopSession() }
+    }
+
+    // With this phone as the gyro source, show its own sensor: the host never
+    // sees it until a stream is up, and the choices here shape it all the same
+    // (they reach the host's emulator motion even with controller handling off).
+    val ctx = LocalContext.current.applicationContext
+    val phoneGyro = remember { StreamHub.isPhoneGyro() }
+    DisposableEffect(phoneGyro) {
+        val sm = if (phoneGyro) ctx.getSystemService(Context.SENSOR_SERVICE) as? SensorManager else null
+        val sensor = sm?.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+        val display = (ctx.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager)
+            ?.getDisplay(Display.DEFAULT_DISPLAY)
+        val listener = object : SensorEventListener {
+            private val c = FloatArray(3)
+            override fun onSensorChanged(e: SensorEvent) {
+                ControllerManager.canonical(e.values, display?.rotation ?: ViewSurface.ROTATION_90, c)
+                // Canonical (x = yaw, y = -pitch, z = roll) → [roll, pitch, yaw] deg/s.
+                val deg = (180.0 / Math.PI).toFloat()
+                GyroTelemetry.publishLocal(c[2] * deg, -c[1] * deg, c[0] * deg)
+            }
+            override fun onAccuracyChanged(s: Sensor?, accuracy: Int) {}
+        }
+        if (sensor != null) sm.registerListener(listener, sensor, SensorManager.SENSOR_DELAY_GAME)
+        onDispose { sm?.unregisterListener(listener) }
     }
 
     fun current(): ControllerProfile = ControllerProfile(

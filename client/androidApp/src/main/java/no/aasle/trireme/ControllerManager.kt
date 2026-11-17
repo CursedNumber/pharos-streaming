@@ -137,7 +137,14 @@ class ControllerManager(
             val d = InputDevice.getDevice(deviceId) ?: continue
             sink.connect(slot.toUByte(), d.vendorId.toUShort(), d.productId.toUShort())
             val key = GamepadPrefs.controllerKey(d.vendorId, d.productId)
-            val profile = if (managed) prefs.profile(key) else defaultControllerProfile()
+            // The gyro choices survive raw mode: they only shape motion the user opted
+        // into separately (the phone gyro works with handling off), so the gyro
+        // screen stays meaningful either way.
+        val profile = if (managed) {
+            prefs.profile(key)
+        } else {
+            defaultControllerProfile().copy(gyro = prefs.profile(key).gyro)
+        }
             sink.setTuning(slot.toUByte(), d.vendorId.toUShort(), d.productId.toUShort(), profile)
         }
         if (managed) relayUsbExportProfiles()
@@ -176,8 +183,8 @@ class ControllerManager(
         // Managed: push this controller's saved tuning so the host applies its feel
         // (gyro + face swaps) the instant it connects — and re-asserts it after a
         // host restart or a client reinstall. Raw (handling off): push the host
-        // DEFAULT profile instead so any swap previously left on the host is reset
-        // — "raw" must mean no swaps/gyro regardless of what the host remembers.
+        // DEFAULT face buttons instead so any swap previously left on the host is
+        // reset: "raw" must mean no swaps regardless of what the host remembers.
         val profile = if (managed) prefs.profile(key) else defaultControllerProfile()
         sink.setTuning(slot.toUByte(), d.vendorId.toUShort(), d.productId.toUShort(), profile)
         val info = runCatching {
@@ -404,23 +411,6 @@ class ControllerManager(
     }
 
     /**
-     * Device-frame vector → the canonical ROTATION_90 device frame. Derivation: map
-     * device axes to screen axes for the current rotation, then back to the device
-     * axes they'd be at ROTATION_90 (z, out of the screen, never changes).
-     */
-    private fun canonical(v: FloatArray, rotation: Int, out: FloatArray) {
-        val x = v[0]
-        val y = v[1]
-        when (rotation) {
-            Surface.ROTATION_0 -> { out[0] = y; out[1] = -x }
-            Surface.ROTATION_180 -> { out[0] = -y; out[1] = x }
-            Surface.ROTATION_270 -> { out[0] = -x; out[1] = -y }
-            else -> { out[0] = x; out[1] = y }
-        }
-        out[2] = v[2]
-    }
-
-    /**
      * Start or stop controller-gyro forwarding LIVE for every attached pad, without
      * waiting for a reconnect. The attach-time gate ([attach]) only decides gyro for
      * pads that connect *after* the Settings flip; this re-applies the choice to pads
@@ -486,6 +476,23 @@ class ControllerManager(
         private const val MAX_PADS = 8
         private const val CENTER_DEADZONE = 0.06f
         private const val AXIS_EPSILON = 0.004f
+
+        /**
+         * Device-frame vector → the canonical ROTATION_90 device frame. Derivation: map
+         * device axes to screen axes for the current rotation, then back to the device
+         * axes they'd be at ROTATION_90 (z, out of the screen, never changes).
+         */
+        internal fun canonical(v: FloatArray, rotation: Int, out: FloatArray) {
+            val x = v[0]
+            val y = v[1]
+            when (rotation) {
+                Surface.ROTATION_0 -> { out[0] = y; out[1] = -x }
+                Surface.ROTATION_180 -> { out[0] = -y; out[1] = x }
+                Surface.ROTATION_270 -> { out[0] = -x; out[1] = -y }
+                else -> { out[0] = x; out[1] = y }
+            }
+            out[2] = v[2]
+        }
 
         // Canonical axis indices (core_proto::gamepad).
         private const val AX_LX = 0

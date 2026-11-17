@@ -443,7 +443,9 @@ private fun GroupCard(
             Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 val gyroSensor = g.members.any { it.gyroSensor }
-                val gyroCapable = gyroSensor || g.members.any { it.info?.gyro == true }
+                // The phone's own gyro can stand in for any pad's.
+                val gyroCapable = gyroSensor || StreamHub.isPhoneGyro() ||
+                    g.members.any { it.info?.gyro == true }
                 if (gyroCapable) {
                     TileButton(
                         text = if (gyroSensor) "Gyro ✓" else "Gyro",

@@ -95,8 +95,52 @@ pub struct HostInput {
     /// under that client when the app exits. Absent = no client (panel/CLI
     /// launch with nobody connected, or an anonymous client).
     app_clients: HashMap<String, String>,
-    /// DSU slot the host-read Flydigi gyro is published on, while one streams.
-    flydigi_slot: Option<u8>,
+    /// The host-read Flydigi gyro, while one streams (see [`FlydigiFeed`]).
+    flydigi: Option<FlydigiFeed>,
+    /// Last Flydigi sample sequence relayed to the calibration visualizer.
+    last_flydigi_seq: u64,
+    /// Gyro tuning of each client controller slot, for its DSU motion. Cached
+    /// on connect and on a live edit, so the per-sample path never touches
+    /// the profile map.
+    slot_tuning: HashMap<u8, core_proto::GyroTuning>,
+}
+
+/// A Flydigi controller whose gyro the host reads itself and publishes on DSU.
+struct FlydigiFeed {
+    slot: u8,
+    ids: (u16, u16),
+    tuning: core_proto::GyroTuning,
+    /// Latest sample as `[roll, pitch, yaw]` deg/s for the calibration
+    /// visualizer, and a sequence bumped per sample.
+    latest: [f32; 3],
+    seq: u64,
+}
+
+/// Canonical-frame gyro (x = yaw, y = -pitch, z = roll, as the DSU server's
+/// default axis map expects) as `[roll, pitch, yaw]`: the axis order Trireme's
+/// gyro screen names (0 = RX roll, 1 = RY pitch, 2 = RZ yaw).
+fn named_axes(c: [f32; 3]) -> [f32; 3] {
+    [c[2], -c[1], c[0]]
+}
+
+/// Apply a controller's gyro-screen choices to its emulator (DSU) motion:
+/// "Axis ←→" picks the axis reported as yaw, "Axis ↑↓" the one reported as
+/// pitch, and the invert toggles flip them. The defaults (yaw, pitch, no
+/// inverts) leave the motion untouched. Accel is left alone: it's the gravity
+/// reference emulators correct drift with, not something to aim with.
+fn tune_dsu_gyro(c: [f32; 3], t: &core_proto::GyroTuning) -> [f32; 3] {
+    let named = named_axes(c);
+    let (h, v) = (usize::from(t.axis_h), usize::from(t.axis_v));
+    let (h, v) = if h < 3 && v < 3 && h != v {
+        (h, v)
+    } else {
+        (2, 1)
+    };
+    let sign = |inv: bool| if inv { -1.0 } else { 1.0 };
+    let yaw = named[h] * sign(t.invert_x);
+    let pitch = named[v] * sign(t.invert_y);
+    let roll = named[3 - h - v];
+    [yaw, -pitch, roll]
 }
 
 impl HostInput {
@@ -118,7 +162,9 @@ impl HostInput {
             running_apps: HashMap::new(),
             orphaned_children: Vec::new(),
             app_clients: HashMap::new(),
-            flydigi_slot: None,
+            flydigi: None,
+            last_flydigi_seq: 0,
+            slot_tuning: HashMap::new(),
         }
     }
 
@@ -217,25 +263,55 @@ impl HostInput {
     pub fn flydigi_motion(&mut self, msg: crate::flydigi::Msg) {
         use crate::flydigi::Msg;
         match msg {
-            Msg::Connected => {
+            Msg::Connected { vendor, product } => {
                 let slot = (0..4u8).find(|s| !self.pads.has_slot(*s)).unwrap_or(0);
-                info!("flydigi gyro → DSU slot {slot}");
+                info!("flydigi {vendor:04x}:{product:04x} gyro → DSU slot {slot}");
                 self.dsu.pad(slot, true);
-                self.flydigi_slot = Some(slot);
+                self.flydigi = Some(FlydigiFeed {
+                    slot,
+                    ids: (vendor, product),
+                    tuning: self.controller_profiles.get(vendor, product).gyro,
+                    latest: [0.0; 3],
+                    seq: 0,
+                });
             }
             Msg::Disconnected => {
-                if let Some(slot) = self.flydigi_slot.take() {
-                    self.dsu.pad(slot, false);
+                if let Some(f) = self.flydigi.take() {
+                    self.dsu.pad(f.slot, false);
                 }
             }
             Msg::Sample { gyro, accel } => {
-                if let Some(slot) = self.flydigi_slot {
-                    if self.gyro_mode() == GyroMode::Enabled {
-                        self.dsu.motion(slot, gyro, accel);
+                let mode = self.gyro_mode();
+                if let Some(f) = self.flydigi.as_mut() {
+                    f.latest = named_axes(gyro).map(f32::to_degrees);
+                    f.seq += 1;
+                    if mode == GyroMode::Enabled {
+                        self.dsu
+                            .motion(f.slot, tune_dsu_gyro(gyro, &f.tuning), accel);
                     }
                 }
             }
         }
+    }
+
+    /// Relay the host-read Flydigi gyro to a client's calibration visualizer,
+    /// on each fresh sample (at most once per frame). Unlike
+    /// [`stream_raw_gyro`](Self::stream_raw_gyro) this doesn't wait for the
+    /// client's gyro opt-in: the Flydigi is read for DSU regardless, so its
+    /// gyro screen works even with gyro forwarding and controller handling off.
+    pub fn stream_flydigi_gyro<F>(&mut self, send: F)
+    where
+        F: FnOnce(Vec<u8>),
+    {
+        let Some(f) = &self.flydigi else { return };
+        if f.seq == 0 || f.seq == self.last_flydigi_seq {
+            return;
+        }
+        self.last_flydigi_seq = f.seq;
+        if self.active_app_gyro_mode == GyroMode::Disabled {
+            return;
+        }
+        send(f.latest.iter().flat_map(|v| v.to_le_bytes()).collect());
     }
 
     fn gyro_mode(&self) -> GyroMode {
@@ -283,6 +359,7 @@ impl HostInput {
                 let profile = self.controller_profiles.get(vendor, product);
                 self.pads.set_swap(slot, profile.swap_ab, profile.swap_xy);
                 self.gyro_imu.set_tuning(&profile.gyro);
+                self.slot_tuning.insert(slot, profile.gyro);
                 // Stamp liveness so the panel's Controllers tab can sort
                 // connected-and-most-recently-seen first.
                 let entry = self.liveness.entry((vendor, product)).or_default();
@@ -293,6 +370,7 @@ impl HostInput {
             InputEvent::GamepadDisconnect { slot } => {
                 self.pads.disconnect(slot);
                 self.dsu.pad(slot, false);
+                self.slot_tuning.remove(&slot);
                 // Flip the matching liveness entry to `connected = false` but
                 // preserve its `last_connected_ms` so "Saved" rows still sort
                 // by when they last appeared.
@@ -322,7 +400,11 @@ impl HostInput {
                 // (a no-op while `[dsu]` is off).
                 let mode = self.gyro_mode();
                 if mode == GyroMode::Enabled {
-                    self.dsu.motion(slot, [gx, gy, gz], [ax, ay, az]);
+                    let gyro = match self.slot_tuning.get(&slot) {
+                        Some(t) => tune_dsu_gyro([gx, gy, gz], t),
+                        None => [gx, gy, gz],
+                    };
+                    self.dsu.motion(slot, gyro, [ax, ay, az]);
                 }
                 // A client pad's gyro becomes mouse aim ONLY when the active app opted
                 // into GyroMode::Mouse (apps.toml). Enabled (the default) and Disabled
@@ -370,6 +452,16 @@ impl HostInput {
                 }
                 self.pads.set_swap(slot, profile.swap_ab, profile.swap_xy);
                 self.gyro_imu.set_tuning(&profile.gyro);
+                // Emulator motion follows the edit live too: every client
+                // slot holding this controller, and the host-read Flydigi.
+                for (s, ids) in &self.slot_ids {
+                    if *ids == (vendor, product) {
+                        self.slot_tuning.insert(*s, profile.gyro);
+                    }
+                }
+                if let Some(f) = self.flydigi.as_mut().filter(|f| f.ids == (vendor, product)) {
+                    f.tuning = profile.gyro;
+                }
                 self.controller_profiles.set(vendor, product, profile);
                 if let Err(e) = self.controller_profiles.save() {
                     tracing::warn!(
@@ -484,5 +576,49 @@ fn save_per_client_config(slug: String, client: String) {
         });
     if let Err(e) = spawned {
         tracing::warn!("app '{label}': per-client config save thread failed to start: {e}");
+    }
+}
+
+#[cfg(test)]
+mod dsu_tuning_tests {
+    use super::*;
+
+    fn tuning(axis_h: u8, axis_v: u8, invert_x: bool, invert_y: bool) -> core_proto::GyroTuning {
+        core_proto::GyroTuning {
+            axis_h,
+            axis_v,
+            invert_x,
+            invert_y,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn default_tuning_leaves_motion_alone() {
+        let g = [1.0, 2.0, 3.0];
+        assert_eq!(tune_dsu_gyro(g, &core_proto::GyroTuning::default()), g);
+    }
+
+    #[test]
+    fn swapping_the_axes_swaps_yaw_and_pitch() {
+        // yaw 1, pitch 2 (canonical y = -pitch), roll 3.
+        let g = [1.0, -2.0, 3.0];
+        let out = named_axes(tune_dsu_gyro(g, &tuning(1, 2, false, false)));
+        assert_eq!(out, [3.0, 1.0, 2.0]); // [roll, pitch, yaw]
+    }
+
+    #[test]
+    fn inverts_flip_only_their_axis() {
+        let g = [1.0, -2.0, 3.0];
+        let out = named_axes(tune_dsu_gyro(g, &tuning(2, 1, true, false)));
+        assert_eq!(out, [3.0, 2.0, -1.0]);
+        let out = named_axes(tune_dsu_gyro(g, &tuning(2, 1, false, true)));
+        assert_eq!(out, [3.0, -2.0, 1.0]);
+    }
+
+    #[test]
+    fn a_clashing_axis_choice_falls_back_to_the_default() {
+        let g = [1.0, 2.0, 3.0];
+        assert_eq!(tune_dsu_gyro(g, &tuning(1, 1, false, false)), g);
     }
 }

@@ -25,10 +25,23 @@ object GyroTelemetry {
     @Volatile private var lastNs = 0L
     @Volatile private var session: GamepadInput? = null
 
+    @Volatile private var localNs = 0L
+
     /** Called from the QUIC datagram thread for each sample (deg/s, raw axes). */
     fun publish(gx: Float, gy: Float, gz: Float) {
+        val now = System.nanoTime()
+        // This phone's own gyro is the source: a host-read controller's samples
+        // would fight it in the visualizer.
+        if (localNs != 0L && now - localNs < FRESH_NS) return
+        rx = gx; ry = gy; rz = gz
+        lastNs = now
+    }
+
+    /** A sample from this phone's own gyro (deg/s, `[roll, pitch, yaw]`). */
+    fun publishLocal(gx: Float, gy: Float, gz: Float) {
         rx = gx; ry = gy; rz = gz
         lastNs = System.nanoTime()
+        localNs = lastNs
     }
 
     /** True if a sample arrived recently (host connected + IMU reporting). */
@@ -47,7 +60,7 @@ object GyroTelemetry {
     fun stopSession() {
         session?.stop()
         session = null
-        lastNs = 0L; rx = 0f; ry = 0f; rz = 0f
+        lastNs = 0L; localNs = 0L; rx = 0f; ry = 0f; rz = 0f
     }
 
     private const val FRESH_NS = 500_000_000L // 0.5 s

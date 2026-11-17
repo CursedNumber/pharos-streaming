@@ -4432,6 +4432,15 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
         for msg in flydigi.drain() {
             host_input.flydigi_motion(msg);
         }
+        // The Flydigi's gyro also feeds the first client's calibration screen.
+        if let Some(s) = pipelines
+            .iter()
+            .flatten()
+            .filter_map(|p| p.streamer.as_ref())
+            .next()
+        {
+            host_input.stream_flydigi_gyro(|pkt| s.send_gyro(pkt));
+        }
 
         // USB/IP-imported keyboards and mice → the focused surface. Keys go
         // straight to the seat (the host adds the xkb +8 to the evdev code);

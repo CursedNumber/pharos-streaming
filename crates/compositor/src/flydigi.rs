@@ -48,8 +48,9 @@ const STANDARD_GRAVITY: f32 = 9.806_65;
 /// What the reader thread reports to the render loop.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Msg {
-    /// A Vader was acquired and is streaming.
-    Connected,
+    /// A Vader was acquired and is streaming; its USB ids key its saved
+    /// controller profile (invert / axis choices from Trireme's gyro screen).
+    Connected { vendor: u16, product: u16 },
     /// It went away (unplugged, read error, or the DSU server was switched off).
     Disconnected,
     /// One IMU sample in Trireme's canonical frame (gyro rad/s, accel m/s²),
@@ -89,7 +90,7 @@ fn manager_loop(tx: &SyncSender<Msg>) {
     let mut warned_perm: Option<PathBuf> = None;
     loop {
         if dsu_enabled() {
-            if let Some(path) = find_vendor_interface() {
+            if let Some((path, product)) = find_vendor_interface() {
                 match OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -98,7 +99,7 @@ fn manager_loop(tx: &SyncSender<Msg>) {
                 {
                     Ok(dev) => {
                         warned_perm = None;
-                        run_device(dev, &path, tx);
+                        run_device(dev, &path, product, tx);
                     }
                     Err(e) => {
                         if warned_perm.as_ref() != Some(&path) {
@@ -114,26 +115,26 @@ fn manager_loop(tx: &SyncSender<Msg>) {
 }
 
 /// The hidraw node of a Flydigi V2 controller's vendor interface (report
-/// descriptor opens with usage page `0xFFA0`).
-fn find_vendor_interface() -> Option<PathBuf> {
+/// descriptor opens with usage page `0xFFA0`), with the controller's product id.
+fn find_vendor_interface() -> Option<(PathBuf, u16)> {
     let entries = std::fs::read_dir("/sys/class/hidraw").ok()?;
     for entry in entries.flatten() {
         let dev = entry.path().join("device");
         let Ok(uevent) = std::fs::read_to_string(dev.join("uevent")) else {
             continue;
         };
-        let is_flydigi = uevent.lines().any(|l| {
-            l.strip_prefix("HID_ID=")
-                .and_then(|id| id.split(':').nth(1))
-                .and_then(|v| u32::from_str_radix(v, 16).ok())
-                == Some(FLYDIGI_V2_VENDOR)
-        });
-        if !is_flydigi {
+        // HID_ID=bus:vendor:product, each in hex.
+        let Some(product) = uevent.lines().find_map(|l| {
+            let mut id = l.strip_prefix("HID_ID=")?.split(':').skip(1);
+            let vendor = u32::from_str_radix(id.next()?, 16).ok()?;
+            let product = u32::from_str_radix(id.next()?, 16).ok()?;
+            (vendor == FLYDIGI_V2_VENDOR).then_some(product as u16)
+        }) else {
             continue;
-        }
+        };
         let desc = std::fs::read(dev.join("report_descriptor")).unwrap_or_default();
         if desc.starts_with(&[0x06, 0xA0, 0xFF]) {
-            return Some(Path::new("/dev").join(entry.file_name()));
+            return Some((Path::new("/dev").join(entry.file_name()), product));
         }
     }
     None
@@ -164,7 +165,7 @@ fn send(dev: &mut File, body: &[u8]) -> std::io::Result<()> {
     dev.write_all(&buf)
 }
 
-fn run_device(mut dev: File, path: &Path, tx: &SyncSender<Msg>) {
+fn run_device(mut dev: File, path: &Path, product: u16, tx: &SyncSender<Msg>) {
     use std::os::fd::AsRawFd;
     let fd = dev.as_raw_fd();
     let mut announced = false;
@@ -244,7 +245,11 @@ fn run_device(mut dev: File, path: &Path, tx: &SyncSender<Msg>) {
                 last_input = Instant::now();
                 if !announced {
                     tracing::info!("flydigi: gyro streaming from {}", path.display());
-                    if tx.send(Msg::Connected).is_err() {
+                    let connected = Msg::Connected {
+                        vendor: FLYDIGI_V2_VENDOR as u16,
+                        product,
+                    };
+                    if tx.send(connected).is_err() {
                         return;
                     }
                     announced = true;

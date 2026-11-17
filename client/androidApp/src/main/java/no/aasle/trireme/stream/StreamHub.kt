@@ -944,14 +944,13 @@ object StreamHub {
         // belt-and-braces against a v1 host that didn't honor the flag. When
         // on, the real sink publishes to GyroTelemetry (calibration dialog +
         // any future visualizer read from there).
+        // The sink itself is always installed: a host-read Flydigi's gyro is
+        // relayed for the calibration screen whatever this flag says, and
+        // publishing to GyroTelemetry costs nothing when nobody's looking.
         val wantsGyro = gyroEnabled
-        val gyroSink: GyroSink? = if (wantsGyro) {
-            object : GyroSink {
-                override fun onSample(gx: Float, gy: Float, gz: Float) =
-                    GyroTelemetry.publish(gx, gy, gz)
-            }
-        } else {
-            null
+        val gyroSink: GyroSink = object : GyroSink {
+            override fun onSample(gx: Float, gy: Float, gz: Float) =
+                GyroTelemetry.publish(gx, gy, gz)
         }
         // Phase 3c: tell the host the encode envelope to render at — the panel
         // native size, oriented by the Orientation setting, and capped by the user's
