@@ -179,7 +179,20 @@ pub struct State {
     /// text to the client). The render loop `take()`s it. The host→client sender,
     /// echo-guard hashes, and pipe-read plumbing all live as render-loop locals.
     pub pending_clipboard_read: Option<Vec<String>>,
+
+    // --- host-drawn cursor (see [`State::host_cursor_wanted`]) ---
+    /// What the focused client last asked the cursor to look like. Only the
+    /// `Hidden` case matters: an app that hides its pointer (most games) gets
+    /// no overlay arrow.
+    pub cursor_status: smithay::input::pointer::CursorImageStatus,
+    /// When a client last moved the host pointer (mouse or controller-as-
+    /// cursor; gyro aiming deliberately doesn't count). Drives the auto-hide.
+    pub last_pointer_input: Option<std::time::Instant>,
 }
+
+/// How long the overlay cursor lingers after the last pointer movement over a
+/// fullscreen app, so a pointer that isn't in use stays out of the picture.
+pub const CURSOR_IDLE_HIDE: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl State {
     pub fn new(event_loop: &mut EventLoop<CalloopData>, display: Display<Self>) -> Self {
@@ -226,6 +239,8 @@ impl State {
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("off"))
                 .unwrap_or(true),
             pending_clipboard_read: None,
+            cursor_status: smithay::input::pointer::CursorImageStatus::default_named(),
+            last_pointer_input: None,
         }
     }
 
@@ -349,6 +364,49 @@ impl State {
             // Smaller than EVERY output ⇒ genuinely windowed (not just smaller
             // than a mismatched secondary output in an extend layout).
             outputs.iter().all(|&(ow, oh)| sz.w < ow || sz.h < oh)
+        })
+    }
+
+    /// Whether to paint the overlay arrow. The compositor never renders the
+    /// cursor images clients set, so without this a fullscreen app with a
+    /// normal pointer (an emulator's game list, a launcher filling the screen)
+    /// shows no cursor on the stream at all. Rules, in order:
+    /// - never while the focused surface holds a pointer lock (FPS aiming);
+    /// - always over a windowed dialog (the original case: launchers that set
+    ///   no cursor at all);
+    /// - otherwise only if the app hasn't hidden its cursor AND the pointer
+    ///   moved within [`CURSOR_IDLE_HIDE`].
+    pub fn host_cursor_wanted(&self) -> bool {
+        if self.pointer_locked() {
+            return false;
+        }
+        if self.windowed_dialog_present() {
+            return true;
+        }
+        !matches!(
+            self.cursor_status,
+            smithay::input::pointer::CursorImageStatus::Hidden
+        ) && self
+            .last_pointer_input
+            .is_some_and(|t| t.elapsed() < CURSOR_IDLE_HIDE)
+    }
+
+    /// True when the surface under the pointer holds an ACTIVE pointer lock.
+    fn pointer_locked(&self) -> bool {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return false;
+        };
+        let Some(surface) = pointer.current_focus() else {
+            return false;
+        };
+        with_pointer_constraint(&surface, &pointer, |constraint| {
+            constraint.is_some_and(|c| {
+                c.is_active()
+                    && matches!(
+                        &*c,
+                        smithay::wayland::pointer_constraints::PointerConstraint::Locked(_)
+                    )
+            })
         })
     }
 
@@ -510,8 +568,11 @@ impl SeatHandler for State {
     fn cursor_image(
         &mut self,
         _seat: &Seat<Self>,
-        _image: smithay::input::pointer::CursorImageStatus,
+        image: smithay::input::pointer::CursorImageStatus,
     ) {
+        // Not rendered (see `host_cursor_wanted`); remembered so an app that
+        // hides its pointer doesn't get the overlay arrow drawn over it.
+        self.cursor_status = image;
     }
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
         let dh = &self.display_handle;
@@ -1259,6 +1320,7 @@ fn dispatch_input(
             let Some(pointer) = data.state.seat.get_pointer() else {
                 return;
             };
+            data.state.last_pointer_input = Some(std::time::Instant::now());
             let loc = Point::from((x as f64 * width as f64, y as f64 * height as f64));
             // Focus the surface ACTUALLY under the cursor (with its real map
             // location), not the keyboard-focused surface assumed at (0,0): a
@@ -1284,6 +1346,7 @@ fn dispatch_input(
             let Some(pointer) = data.state.seat.get_pointer() else {
                 return;
             };
+            data.state.last_pointer_input = Some(std::time::Instant::now());
             // Advance the current absolute location by the delta (clamped to the
             // output) AND emit relative motion, so both desktop apps and
             // pointer-locked games (which read `wl_relative_pointer`) follow —

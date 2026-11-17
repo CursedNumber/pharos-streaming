@@ -4526,15 +4526,15 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
             } else {
                 None
             };
-            // Overlay host cursor: only when a windowed dialog / launcher is up (a
-            // fullscreen game manages its own cursor, so this stays off in-game)
-            // and we're painting the app composite — never over a desktop mirror
+            // Overlay host cursor: over a windowed dialog / launcher, or over a
+            // fullscreen app that shows a pointer while the client is moving it
+            // (`host_cursor_wanted`: never under a pointer lock or a hidden
+            // cursor, so it stays off in-game), and only when painting the app composite — never over a desktop mirror
             // (that stream already carries the real host cursor) or the idle
             // screen. Gives a streamed TV mouse / controller-cursor a visible
             // pointer to aim with. Rects are physical (session scale 1.0).
             let cursor_overlay =
-                if mirror_el.is_none() && idle_el.is_none() && data.state.windowed_dialog_present()
-                {
+                if mirror_el.is_none() && idle_el.is_none() && data.state.host_cursor_wanted() {
                     data.state
                         .pointer_location()
                         .map(|loc| cursor_overlay_rects(loc, cursor_scale(p.height)))
