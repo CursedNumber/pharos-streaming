@@ -23,6 +23,8 @@
     <string name="apps_action_switch_to">Switch to</string>
     <string name="apps_action_relaunch">Relaunch</string>
     <string name="apps_action_end_process">End process</string>
+    <!-- Desktop tile while it mirrors the host's real desktop: back to the virtual display. -->
+    <string name="apps_action_end_desktop">End desktop stream</string>
 
     <!-- Per-host section header includes a count for the live region. -->
     <string name="apps_host_header">%1$s</string>

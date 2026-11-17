@@ -767,6 +767,24 @@ fn primary_is_mirroring(_pipelines: &[Option<Pipeline>]) -> bool {
     false
 }
 
+/// Slugs of apps whose launch target mirrors the real desktop
+/// (`DuplicatePhysical`, which the built-in Desktop tile defaults to).
+/// Parses apps.toml, so call it only on a state change, not per frame.
+fn mirror_target_slugs() -> Vec<String> {
+    app_launcher::config::load_with_builtins()
+        .apps
+        .into_iter()
+        .filter(|a| a.target == app_launcher::config::LaunchTarget::DuplicatePhysical)
+        .map(|a| a.slug)
+        .collect()
+}
+
+fn mirror_target_slug(slug: &str) -> bool {
+    app_launcher::config::load_with_builtins()
+        .find(slug)
+        .is_some_and(|a| a.target == app_launcher::config::LaunchTarget::DuplicatePhysical)
+}
+
 /// The primary output's native mode, for sizing launches (a steam-session's
 /// gamescope output — issue #38). Native `width`/`height`, NOT the DRC-scaled
 /// coded size: the session renders at the streamed surface's full mode and the
@@ -3130,6 +3148,7 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
     }
     let mut last_apps_check = std::time::Instant::now();
     let mut last_probe_gen: u64 = 0;
+    let mut last_mirroring = false;
     let mut focus_surface: Option<
         smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
     > = None;
@@ -3834,6 +3853,25 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                             None => tracing::info!("client: switch-to '{id}': no live window"),
                         }
                     }
+                    core_proto::AppMsg::EndProcess { id } if mirror_target_slug(&id) => {
+                        // "End" on the app that's mirroring the real desktop (the
+                        // built-in Desktop tile) = stop mirroring: there's no
+                        // process to kill, the stream just returns to the virtual
+                        // display. The running highlight clears on the next
+                        // catalog push (mirror state is part of it).
+                        #[cfg(feature = "portal-mirror")]
+                        if primary_is_mirroring(&pipelines) {
+                            if host_core::config::load().compositor.enable_virtual_displays {
+                                info!("client: ended desktop mirror via '{id}'");
+                                apply_capture_target(&mut pipelines, None);
+                            } else {
+                                tracing::info!(
+                                    "client: end '{id}' ignored: virtual displays are off, \
+                                     so every stream mirrors the real desktop"
+                                );
+                            }
+                        }
+                    }
                     core_proto::AppMsg::EndProcess { id } => {
                         // Kill the whole process tree OFF the render thread: end_app
                         // SIGTERMs, sleeps 600ms, then SIGKILLs — blocking it here
@@ -3986,7 +4024,25 @@ pub fn run_capture_zc_multi(cfg: &MultiCfg, inject_keys: &[u32]) -> Result<()> {
                     None
                 }
             };
-            if let Some(running) = snapshot {
+            // Mirroring the real desktop counts as the mirror-target apps
+            // (the Desktop tile) "running", so the client offers End on them.
+            let mirroring = primary_is_mirroring(&pipelines);
+            let snapshot = match snapshot {
+                Some(r) => Some(r),
+                None if mirroring != last_mirroring => Some(
+                    running_probe
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .running
+                        .clone(),
+                ),
+                None => None,
+            };
+            last_mirroring = mirroring;
+            if let Some(mut running) = snapshot {
+                if mirroring {
+                    running.extend(mirror_target_slugs());
+                }
                 let catalog = crate::control::build_app_catalog(&running);
                 for s in pipelines
                     .iter()

@@ -168,15 +168,26 @@ fun AppTile(
                     onSwitchTo()
                 },
             )
+            // The Desktop tile is "running" while the host mirrors its real desktop;
+            // relaunching it means nothing, and End returns to the virtual display.
+            val desktop = app.kind.toInt() == APP_KIND_DESKTOP
+            if (!desktop) {
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.apps_action_relaunch)) },
+                    onClick = {
+                        menuOpen = false
+                        onLaunch()
+                    },
+                )
+            }
             DropdownMenuItem(
-                text = { Text(stringResource(R.string.apps_action_relaunch)) },
-                onClick = {
-                    menuOpen = false
-                    onLaunch()
+                text = {
+                    Text(
+                        stringResource(
+                            if (desktop) R.string.apps_action_end_desktop else R.string.apps_action_end_process,
+                        ),
+                    )
                 },
-            )
-            DropdownMenuItem(
-                text = { Text(stringResource(R.string.apps_action_end_process)) },
                 onClick = {
                     menuOpen = false
                     onEndProcess()
@@ -196,6 +207,9 @@ fun decodeArt(art: ByteArray): ImageBitmap? {
         BitmapFactory.decodeByteArray(art, 0, art.size)?.asImageBitmap()
     }.getOrNull()
 }
+
+/** core_proto::apps::app_kind::DESKTOP. */
+private const val APP_KIND_DESKTOP = 2
 
 /** Placeholder glyph by kind tag (mirrors core_proto::apps::app_kind). */
 fun kindGlyph(kind: UByte): String = when (kind.toInt()) {

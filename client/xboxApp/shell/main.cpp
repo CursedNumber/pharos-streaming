@@ -997,9 +997,15 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
                     mm.hint = L"A Launch/Switch   X End   B Back";
                     if (appsNow.empty()) mm.items = {L"(no apps published by this host)"};
                     else
-                        for (const auto& a : appsNow)
-                            mm.items.push_back(widen(a.name) +
-                                               (a.running ? L"  \x2022 running" : L""));
+                        for (const auto& a : appsNow) {
+                            // A "running" Desktop tile = the host is mirroring its
+                            // real desktop; X ends that and returns to the virtual
+                            // display.
+                            const wchar_t* tag = !a.running ? L""
+                                                 : a.kind == 2 ? L"  \x2022 desktop stream (X ends)"
+                                                               : L"  \x2022 running";
+                            mm.items.push_back(widen(a.name) + tag);
+                        }
                     mm.focus = appsModalFocus;
                     ui.drawStreamMenu(mm);
                 } else if (screen == Screen::Streaming && settingsOpen) {
