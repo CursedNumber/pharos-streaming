@@ -20,8 +20,8 @@ android {
         // Bump both alongside [workspace.package] version in the root
         // Cargo.toml when cutting a release; an APK update only installs
         // over the old one if versionCode increased.
-        versionCode = 2
-        versionName = "0.1.0"
+        versionCode = 3
+        versionName = "0.2.0"
     }
 
     sourceSets["main"].apply {

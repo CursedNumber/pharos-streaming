@@ -1,14 +1,14 @@
 pkgbase = pharos-streaming-bin
 	pkgdesc = Clean-slate game-streaming stack in the Sunshine/Moonlight lineage (Pharos host + Trireme client, prebuilt)
-	pkgver = 0.1.0
+	pkgver = 0.2.0
 	pkgrel = 1
 	url = https://github.com/CursedNumber/pharos-streaming
 	arch = x86_64
 	license = GPL-3.0-or-later
-	source = https://github.com/CursedNumber/pharos-streaming/releases/download/v0.1.0/pharos-0.1.0-linux-x86_64.tar.gz
-	source = https://github.com/CursedNumber/pharos-streaming/releases/download/v0.1.0/trireme-0.1.0-linux-x86_64.tar.gz
-	sha256sums = 80faa5d2c0cdd93838d5e7b4092b5c431e8e006947bbb9e24d32c2c71cc32119
-	sha256sums = 06e21c599f0fa41b8ffcdeaa2f36d3c47007f628ab6c49fd75b87850f23957c0
+	source = https://github.com/CursedNumber/pharos-streaming/releases/download/v0.2.0/pharos-0.2.0-linux-x86_64.tar.gz
+	source = https://github.com/CursedNumber/pharos-streaming/releases/download/v0.2.0/trireme-0.2.0-linux-x86_64.tar.gz
+	sha256sums = SKIP
+	sha256sums = SKIP
 
 pkgname = pharos-bin
 	pkgdesc = Pharos game-streaming host (headless Wayland compositor + NVENC, prebuilt)
@@ -25,11 +25,16 @@ pkgname = pharos-bin
 	depends = pipewire
 	optdepends = vulkan-driver: GPU-accelerated pharos-panel UI
 	optdepends = xdg-desktop-portal: desktop-mirror mode (issue #6) — also needs a portal backend for your desktop (e.g. xdg-desktop-portal-kde/-gnome/-wlr)
+	optdepends = xorg-xwayland: run X11 apps and games inside the stream
+	optdepends = gamescope: Steam Big Picture session
+	optdepends = steam: Steam Big Picture session
+	optdepends = mpv: media-player app
+	optdepends = ffmpeg: software VVC encode
 	provides = pharos
 	conflicts = pharos
 
 pkgname = trireme-bin
-	pkgdesc = Trireme game-streaming client for Pharos hosts (desktop + headless KMS players, prebuilt)
+	pkgdesc = Trireme game-streaming client for Pharos hosts (desktop + headless KMS players, USB export, prebuilt)
 	depends = glibc
 	depends = gcc-libs
 	depends = mesa

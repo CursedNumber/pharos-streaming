@@ -238,7 +238,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "app-launcher"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
@@ -1158,7 +1158,7 @@ dependencies = [
 
 [[package]]
 name = "compositor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -1211,7 +1211,7 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "control-ipc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "core-proto",
  "dirs 5.0.1",
@@ -1227,7 +1227,7 @@ checksum = "9885fa71e26b8ab7855e2ec7cae6e9b380edff76cd052e07c683a0319d51b3a2"
 
 [[package]]
 name = "core-crypto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -1245,7 +1245,7 @@ dependencies = [
 
 [[package]]
 name = "core-ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "core-crypto",
@@ -1338,7 +1338,7 @@ dependencies = [
 
 [[package]]
 name = "core-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "postcard",
  "serde",
@@ -1347,14 +1347,14 @@ dependencies = [
 
 [[package]]
 name = "core-session"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "core-proto",
 ]
 
 [[package]]
 name = "core-usbip"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "core_maths"
@@ -2310,7 +2310,7 @@ dependencies = [
 
 [[package]]
 name = "gamepad-bridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "evdev",
@@ -2944,7 +2944,7 @@ dependencies = [
 
 [[package]]
 name = "host-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "control-ipc",
@@ -2964,14 +2964,14 @@ dependencies = [
 
 [[package]]
 name = "host-info"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "network-interface",
 ]
 
 [[package]]
 name = "hostd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "core-proto",
  "input-inject",
@@ -3195,11 +3195,11 @@ dependencies = [
 
 [[package]]
 name = "input-inject"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "integration-mqtt"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "host-info",
@@ -3629,7 +3629,7 @@ dependencies = [
 
 [[package]]
 name = "media-audio"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "opus",
@@ -3639,11 +3639,11 @@ dependencies = [
 
 [[package]]
 name = "media-capture"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "media-decode"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "tracing",
@@ -3652,11 +3652,11 @@ dependencies = [
 
 [[package]]
 name = "media-encode"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "media-spice"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "core-proto",
@@ -4481,7 +4481,7 @@ dependencies = [
 
 [[package]]
 name = "pal"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -4584,7 +4584,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pharos-assets"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "resvg",
@@ -4594,7 +4594,7 @@ dependencies = [
 
 [[package]]
 name = "pharos-panel"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -4620,7 +4620,7 @@ dependencies = [
 
 [[package]]
 name = "pharos-tray"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "control-ipc",
@@ -4635,7 +4635,7 @@ dependencies = [
 
 [[package]]
 name = "pharos-win"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "app-launcher",
@@ -6551,7 +6551,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6604,7 +6604,7 @@ dependencies = [
 
 [[package]]
 name = "trireme"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "core-crypto",
@@ -6636,7 +6636,7 @@ dependencies = [
 
 [[package]]
 name = "trireme-kms"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -6659,7 +6659,7 @@ dependencies = [
 
 [[package]]
 name = "trireme-xbox-ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "core-ffi",
 ]
@@ -6915,7 +6915,7 @@ dependencies = [
 
 [[package]]
 name = "usbip-export"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "core-usbip",
@@ -6931,7 +6931,7 @@ dependencies = [
 
 [[package]]
 name = "usbip-host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "core-proto",
