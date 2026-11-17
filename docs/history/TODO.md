@@ -57,7 +57,7 @@ option is ever wanted before upstream Wine matures.
 ## 2026-06-24 — Hardcoded IPs / hostnames / ports in code (design smell — catalog, refactor later) — ✅ RESOLVED 2026-06-24
 
 **All of A–G shipped this session** (`c40aee0` derive USB/IP target from the paired host; `4f4d37e`/`20138fb` de-personalize
-example IPs, the MQTT broker hint, `devbox`/`peripheralmox`/`couchpi` names, the `/home/user` doc path + `personal-name …`
+example IPs, the MQTT broker hint, personal machine names, the `/home/user` doc path, and personal-name
 examples; `032185c` centralizes ports into `core_proto::ports`). An adversarial completeness sweep confirmed no
 `192.0.2.*`, broker IP, or personal machine-name survives in tracked source; `bücher.example` serves as the IDNA example. The one remaining literal-port note (pharos-win help text shows `4432`/`4435`) is cosmetic display drift only.
 
@@ -108,9 +108,9 @@ gitignored, so their mirrored doc-comments don't ship.
 
 ### F. Personal rig/host names in comments
 
-- **[low]** `devbox` in [`core-proto/src/profile.rs:40`](crates/core-proto/src/profile.rs:40)
+- **[low]** The dev desktop's name in [`core-proto/src/profile.rs:40`](crates/core-proto/src/profile.rs:40)
   and [`controllers.rs:30`](crates/pharos-panel/src/tabs/controllers.rs:30) (the controller
-  feel was "dialled in live on devbox"); `peripheralmox` in
+  feel was "dialled in live on" it); a homelab VM's name in
   [`trireme-kms/src/main.rs:3`](crates/trireme-kms/src/main.rs:3) +
   [`trireme-kms/Cargo.toml:7`](crates/trireme-kms/Cargo.toml:7); `couchpi` in
   [`data.rs:572`](crates/pharos-panel/src/data.rs:572). → generic role names
@@ -153,7 +153,7 @@ Hit live: client reinstall dropped the stream; on reconnect a **second** `launch
 
 ## 2026-06-23 — Trireme client text-input / focus bugs (found on Xiaomi 14T Pro during debug-build testing)
 
-Surfaced live on the phone (touchscreen + controller) while pairing with host "devbox". **Root cause:** `ui/TvEditField.kt` was TV-first for ALL devices — it gated the IME behind a `readOnly` flag and assumed "any key reaching the field ⇒ the keyboard is already down ⇒ exit edit", which holds on a D-pad-only TV but breaks on a touch phone (tap never focused; D-pad keys collapsed edit + dismissed the IME).
+Surfaced live on the phone (touchscreen + controller) while pairing with the dev desktop. **Root cause:** `ui/TvEditField.kt` was TV-first for ALL devices — it gated the IME behind a `readOnly` flag and assumed "any key reaching the field ⇒ the keyboard is already down ⇒ exit edit", which holds on a D-pad-only TV but breaks on a touch phone (tap never focused; D-pad keys collapsed edit + dismissed the IME).
 
 - **[FIXED ✅ — verified on 14T Pro] Soft-keyboard text entry on touch.** `TvEditField` now splits on `FEATURE_TOUCHSCREEN`: touch devices get a plain editable `OutlinedTextField` (native focus→IME, nothing intercepted); D-pad-only TVs keep the validated gated model. Tapping a field focuses + opens the keyboard and it stays up. (Commit `trireme: fix touch text-input`.)
 - **[FIXED — needs controller re-verify] Controller navigation of the soft keyboard.** On touch devices the field no longer intercepts D-pad keys, so the IME owns its own key navigation. Verified for touch typing; **re-confirm with the Vader driving the soft keyboard on the phone.**

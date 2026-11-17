@@ -13,7 +13,7 @@ value is decided purely by its **HEVC/AV1 hardware** support.
 
 | Config (device · role) | Encode | Decode | Fits pipeline? | Coverage value | Verdict |
 |---|---|---|---|---|---|
-| **4070 · devbox .100 · Linux host** | NVENC HEVC+AV1 (direct CUDA) | — | ✅ both | reference (gold standard) | **Keep untouched.** Everything else validates against it. |
+| **4070 · dev desktop · Linux host** | NVENC HEVC+AV1 (direct CUDA) | — | ✅ both | reference (gold standard) | **Keep untouched.** Everything else validates against it. |
 | **4070 · Windows host** (dual-boot) | ffmpeg `hevc_nvenc` (AV1 needs a code-add) | — | ✅ HEVC | **NEW — never live-validated** | **#1 — highest-value gap.** Dual-boot, don't swap. |
 | **Topton Intel · Linux** (bare-metal) | `hevc_qsv` host = new code | `hevc_qsv`/`av1_qsv` client (plumbed) | ✅ | client decode NEW (free); host encode = new code | **#2 client now; host encode is P-later.** |
 | **T14 Intel · Windows host** | `hevc_qsv` | — | ✅ HEVC | covered | done |

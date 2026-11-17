@@ -28,7 +28,7 @@ data class ServerEntry(
     /**
      * Additional LAN addresses this SAME host (same [hostPubkey]) is reachable
      * on — a multi-homed host advertises one identity across every NIC (e.g.
-     * devbox on wifi .100 + fiber .200). Folded here by [Registry.mergeByIdentity]
+     * a desktop on WiFi .100 and fiber .200). Folded here by [Registry.mergeByIdentity]
      * so one row represents the machine; each address is a selectable connection.
      * Same [port] as [host]; pairing is identity-scoped, so all of them inherit
      * the single paired trust.

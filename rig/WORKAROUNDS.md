@@ -212,7 +212,7 @@ the bridge without a GUI password prompt. The host script falls back gracefully
 if `sudo -n` is rejected (prints a notification, skips the bridge), so this is
 a "nice-to-have," not a hard requirement.
 
-**Where:** a `/etc/sudoers.d/*` entry granting `your-user` NOPASSWD for at least:
+**Where:** a `/etc/sudoers.d/*` entry granting your user NOPASSWD for at least:
 - `/usr/bin/systemctl`
 - `/usr/bin/systemd-run`
 

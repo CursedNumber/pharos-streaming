@@ -17,7 +17,7 @@ The PQ/BT.2020 path (`create_windows_bt2100`) exists in the driver but is **gate
 version 3**, which no shipping compositor (KDE included, it advertises v2) exposes — so games use
 scRGB. **Consequence: we advertise v2 + `windows_scrgb`, accept scRGB, and do the scRGB→PQ/BT.2020
 conversion ourselves in a GLES shader.** (evidence: `strings winewayland.so`; `wayland-info` on
-devbox shows KWin at `wp_color_manager_v1 v2`.)
+the dev host shows KWin at `wp_color_manager_v1 v2`.)
 
 Enable for testing: `PROTON_ENABLE_WAYLAND=1 DXVK_HDR=1` (ENABLE_HDR_WSI *not* needed on driver
 610). Test clients already installed (no game needed): **mpv 0.41 gpu-next** (cleanest first test),

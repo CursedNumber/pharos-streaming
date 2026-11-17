@@ -73,27 +73,8 @@ jobs:
             exit 1
           fi
 
-      # The NVENC crate links libnvidia-encode/libnvcuvid at build time, but the
-      # compositor only imports two symbols (everything else goes through the
-      # function table NvEncodeAPICreateInstance returns), so a runner without
-      # an NVIDIA driver links against these hand-made stubs. -soname makes the
-      # binary's DT_NEEDED entries libnvidia-encode.so.1/libnvcuvid.so.1, which
-      # the user's real driver provides at runtime. If a future change imports
-      # more driver symbols, the link fails here; list what's missing with
-      # `nm -D --undefined-only target/release/pharos-compositor` and add them.
-      - name: create NVIDIA link stubs
-        run: |
-          mkdir -p /opt/nvidia-link-stubs
-          cat > /tmp/nvenc-stub.c <<'EOF'
-          void NvEncodeAPICreateInstance(void) {}
-          void NvEncodeAPIGetMaxSupportedVersion(void) {}
-          EOF
-          gcc -shared -fPIC -Wl,-soname,libnvidia-encode.so.1 \
-            -o /opt/nvidia-link-stubs/libnvidia-encode.so /tmp/nvenc-stub.c
-          gcc -shared -fPIC -Wl,-soname,libnvcuvid.so.1 \
-            -o /opt/nvidia-link-stubs/libnvcuvid.so -x c /dev/null
-          echo "NVIDIA_VIDEO_CODEC_SDK_PATH=/opt/nvidia-link-stubs" >> "$GITHUB_ENV"
-
+      # Nothing links the NVIDIA driver at build time any more: the NVENC
+      # crate dlopens libnvidia-encode at runtime, so no driver stubs needed.
       - name: build release binaries
         run: |
           cargo build --release --locked \

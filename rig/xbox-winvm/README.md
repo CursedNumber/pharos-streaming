@@ -1,6 +1,6 @@
 # xbox-winvm — headless Windows build VM for the Xbox UWP client
 
-A `dockurr/windows` QEMU/KVM guest on devbox that builds and runs the
+A `dockurr/windows` QEMU/KVM guest on the Linux dev desktop that builds and runs the
 Windows-only parts of the Xbox client work: the tier-3
 `x86_64-uwp-windows-msvc` Rust build, the C++/WinRT harness/shell, and UWP
 (AppContainer) runtime tests. Validated for Phase 0 (2026-07-15: build + C ABI
