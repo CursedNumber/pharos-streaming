@@ -818,6 +818,16 @@ fn launch_in_xwayland(
         };
         register_pid(&entry.slug, child.id());
         register_companion(&entry.slug, xchild.id());
+        // Reap the server when it exits (on its own via -terminate, or killed by
+        // `end_app`); nothing else holds its `Child`, so without this it lingers
+        // as a zombie under the host.
+        let slug = entry.slug.clone();
+        let _ = std::thread::Builder::new()
+            .name(format!("xwayland-reap-{xdpy}"))
+            .spawn(move || match xchild.wait() {
+                Ok(status) => tracing::info!("Xwayland :{xdpy} for `{slug}` exited ({status})"),
+                Err(e) => tracing::warn!("Xwayland :{xdpy} for `{slug}`: wait failed: {e}"),
+            });
         Ok(Some(child))
     }
 }
