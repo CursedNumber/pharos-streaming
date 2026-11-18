@@ -19,7 +19,7 @@ pkgbase = pharos-streaming
 	makedepends = pipewire
 	options = !lto
 	source = pharos-streaming-0.2.0.tar.gz::https://github.com/CursedNumber/pharos-streaming/archive/refs/tags/v0.2.0.tar.gz
-	sha256sums = SKIP
+	sha256sums = 3ff34a95d0b5ab791b470fbba46cdcd46bc5c4fe8ba40024bf353111c39c8349
 
 pkgname = pharos
 	pkgdesc = Pharos game-streaming host (headless Wayland compositor + NVENC)

@@ -5,7 +5,7 @@
 # on any current Arch). Compile-from-source counterpart: pharos-streaming.
 #
 # Before pushing to the AUR: run `updpkgsums` against the real release assets
-# (sha256sums below are SKIP until the release exists), then regenerate
+# (sha256sums below are for the v0.2.0 release), then regenerate
 # .SRCINFO with `makepkg --printsrcinfo > .SRCINFO`.
 
 pkgbase=pharos-streaming-bin
@@ -20,8 +20,8 @@ source=(
   "$url/releases/download/v$pkgver/pharos-$pkgver-linux-x86_64.tar.gz"
   "$url/releases/download/v$pkgver/trireme-$pkgver-linux-x86_64.tar.gz"
 )
-sha256sums=('SKIP'
-            'SKIP')
+sha256sums=('4656feb3b9f9c72218ab9ee8b36de457641d5734c8d14cd0a1e30cc5152d38cb'
+            'd0e29044477810e3c0fe52b2c7f882da778b6e78ca0f4287bc3c0f518167e319')
 
 package_pharos-bin() {
   pkgdesc="Pharos game-streaming host (headless Wayland compositor + NVENC, prebuilt)"

@@ -7,8 +7,8 @@ pkgbase = pharos-streaming-bin
 	license = GPL-3.0-or-later
 	source = https://github.com/CursedNumber/pharos-streaming/releases/download/v0.2.0/pharos-0.2.0-linux-x86_64.tar.gz
 	source = https://github.com/CursedNumber/pharos-streaming/releases/download/v0.2.0/trireme-0.2.0-linux-x86_64.tar.gz
-	sha256sums = SKIP
-	sha256sums = SKIP
+	sha256sums = 4656feb3b9f9c72218ab9ee8b36de457641d5734c8d14cd0a1e30cc5152d38cb
+	sha256sums = d0e29044477810e3c0fe52b2c7f882da778b6e78ca0f4287bc3c0f518167e319
 
 pkgname = pharos-bin
 	pkgdesc = Pharos game-streaming host (headless Wayland compositor + NVENC, prebuilt)
