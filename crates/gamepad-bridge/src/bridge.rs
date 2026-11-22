@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! The Linux implementation of `gamepad-bridge` (evdev capture, uinput
 //! replay, and the UDP wire loop); see `main.rs` for the crate docs.

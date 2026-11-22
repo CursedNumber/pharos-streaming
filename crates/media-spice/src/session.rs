@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! Headless SPICE display + inputs sessions driven by a **single shared GLib
 //! main loop** over raw `spice-client-glib-2.0` FFI.

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! Host identity helpers (hostname + NIC MACs/IPs) for telemetry, Wake-on-LAN,
 //! and MAC-driven socket binding.

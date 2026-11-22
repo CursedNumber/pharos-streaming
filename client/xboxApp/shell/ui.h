@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 //
 // Direct2D/DirectWrite UI drawn over the swapchain backbuffer after the video
 // blit (or the clear). Pure presentation: the screens are drawn from small

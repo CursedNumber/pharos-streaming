@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! USB/IP import side (BATTLE_PLAN §8): Linux vhci-hcd / Windows signed bridge.
 //! The host side that materializes a client-exported device into a virtual hub.

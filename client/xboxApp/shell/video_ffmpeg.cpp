@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 //
 // Hardware HEVC decode via FFmpeg's D3D11VA hwaccel. The Xbox AppContainer
 // doesn't expose a hardware decoder MFT, but FFmpeg talks to ID3D11VideoDevice

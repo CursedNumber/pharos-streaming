@@ -1,4 +1,4 @@
-# Pharos + Trireme
+# Pharos
 
 **Play the games on your PC from your couch, your phone, or another room.**
 
@@ -228,7 +228,7 @@ Translations are welcome: add your locale next to `en` in
 
 ## License
 
-Copyright (C) 2026 The Pharos/Trireme authors.
+Copyright (C) 2026 The Pharos authors.
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the **GNU General Public License** as published by the Free Software

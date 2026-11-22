@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! Host-side gyro→mouse from a USB/IP-imported or directly-paired controller IMU.
 //!

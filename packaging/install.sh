@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pharos/Trireme installer for Ubuntu and Debian.
+# Pharos installer for Ubuntu and Debian.
 #
 # Fetches the latest (or a pinned) GitHub release and installs the .deb(s)
 # with apt, which resolves the runtime dependencies. Usage:

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! Input capture and the (configurable) filter that decides which winit events
 //! get forwarded to Pharos, which Trireme handles locally, and which fall

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! Raw `spice-client-glib-2.0` FFI: the `spice_*` entry points + constants the
 //! headless display/inputs session needs. GLib/GObject FFI itself comes from

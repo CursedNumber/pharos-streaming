@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! Opt-in live end-to-end test of the Proton auto-pin against a REAL Steam
 //! install on the host: it copies the machine's `config.vdf` into a throwaway

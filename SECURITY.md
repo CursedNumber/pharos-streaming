@@ -1,6 +1,6 @@
 # Security policy
 
-Pharos/Trireme is pre-1.0 software that listens on the network, injects input, and can
+Pharos is pre-1.0 software that listens on the network, injects input, and can
 bridge USB devices into the host. It has **not** had a security audit. Run it on a
 trusted LAN and keep authentication enabled (the default).
 

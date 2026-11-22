@@ -81,7 +81,7 @@ spice = ["dep:media-spice"]
 [package.metadata.deb]
 name = "trireme"
 maintainer = "CursedNumber <16852735+CursedNumber@users.noreply.github.com>"
-copyright = "2026 The Pharos/Trireme authors"
+copyright = "2026 The Pharos authors"
 license-file = ["../../LICENSE", "0"]
 section = "video"
 priority = "optional"

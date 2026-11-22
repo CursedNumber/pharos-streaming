@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! Settings tab — every configurable knob the host owns: appearance, streaming/
 //! encoding tuning, security, gamepad fallback, network NIC binding, Home

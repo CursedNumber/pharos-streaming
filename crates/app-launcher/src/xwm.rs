@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! A minimal "fullscreen everything" X11 window manager for the per-app
 //! Xwayland (`compositor = "xwayland"`).

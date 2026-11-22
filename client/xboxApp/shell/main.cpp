@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 //
 // Trireme Xbox client shell. Layer 3: the D3D11 swapchain + HEVC decode
 // (video_ffmpeg.cpp / video.cpp) + Opus audio (audio.cpp) behind a real

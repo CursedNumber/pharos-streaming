@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 //
 // Opus audio playback: libavcodec's native Opus decoder (48 kHz stereo, float
 // planar) feeding a WinRT AudioGraph frame-input node in pull mode. submit()

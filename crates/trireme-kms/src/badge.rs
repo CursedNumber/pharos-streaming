@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! The idle "badge": a crescent-moon + star + pearl mark with a "Ready to
 //! connect" label to its left, composited (on black) into one RGBA texture at

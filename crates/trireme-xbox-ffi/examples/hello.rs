@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! Phase-0 "hello core" smoke test: link the shim and print the protocol
 //! version, proving the C ABI executes on the target.

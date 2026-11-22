@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pharos/Trireme pre-commit hook: keep the tree rustfmt-clean so CI's `fmt` step
+# Pharos pre-commit hook: keep the tree rustfmt-clean so CI's `fmt` step
 # (which gates `clippy`) never goes red on formatting drift. Runs only when Rust
 # files are staged, so docs-only / config-only commits are unaffected.
 #

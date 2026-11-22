@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! Pure input-translation logic shared by the FFI loop: pointer-button mapping,
 //! the held-button mask accumulator, and absolute-coordinate scaling. Kept

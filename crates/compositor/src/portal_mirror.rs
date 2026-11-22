@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! Experimental session-mirror capture (feature `portal-mirror`): stream the
 //! user's REAL desktop session (KDE/GNOME on Wayland) instead of the headless

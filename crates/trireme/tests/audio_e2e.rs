@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! Rig-only end-to-end audio check: real PipeWire capture → Opus encode → QUIC
 //! datagram → Opus decode, asserting the decoded PCM actually carries signal.

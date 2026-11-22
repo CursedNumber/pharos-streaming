@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! Keyboard + pointer injection into the REAL desktop session mirrored by
 //! [`crate::portal_mirror`], via libei (the `reis` crate).

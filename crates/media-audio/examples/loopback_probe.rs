@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! Manual loopback capture check: is real audio (not silence) reaching the
 //! Opus encoder? Captures the default output's system mix for 500 frames

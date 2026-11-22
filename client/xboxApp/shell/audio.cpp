@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 //
 // See audio.h. The AudioGraph is created on a worker thread (CreateAsync +
 // .get() would deadlock the STA UI thread), so init() returns immediately and

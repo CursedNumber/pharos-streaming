@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
-//! Audio for Pharos/Trireme (BATTLE_PLAN §7): capture a PipeWire sink monitor
+//! Audio for Pharos (BATTLE_PLAN §7): capture a PipeWire sink monitor
 //! (Linux) / WASAPI loopback (Windows, M3) → **Opus**, low-latency, in the
 //! shared core from M2 so host (encode) and desktop client (decode) use one
 //! implementation.

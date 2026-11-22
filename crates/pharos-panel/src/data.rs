@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! Disk + probe access for the panel. Every loader is **non-panicking**: a
 //! missing/unparseable file yields safe defaults, and savers do an atomic

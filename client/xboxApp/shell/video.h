@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 //
 // Media Foundation HEVC decode of Trireme access units into D3D11 NV12
 // textures, presented to the swapchain backbuffer via ID3D11VideoProcessor

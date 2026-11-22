@@ -1,4 +1,4 @@
-# Pharos / Trireme: Reference Documentation
+# Pharos: Reference Documentation
 
 Detailed reference for the command-line tools, environment variables, and
 configuration files. For an overview and the feature list, see

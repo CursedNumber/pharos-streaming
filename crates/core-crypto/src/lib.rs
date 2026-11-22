@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
-//! Pairing + identity for Pharos/Trireme.
+//! Pairing + identity for Pharos.
 //!
 //! Shared by host and client (via `core-ffi` on Android/iOS, directly on
 //! desktop) so pairing has exactly one implementation and one test suite.

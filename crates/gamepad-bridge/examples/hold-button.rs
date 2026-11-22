@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! Synthesise a virtual Xbox-style gamepad via uinput and hold one button for a
 //! few seconds, so a game can be driven with no physical/paired controller.

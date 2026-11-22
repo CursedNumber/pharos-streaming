@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! Shared host-side input plumbing — gamepad slots, gyro→mouse, controller
 //! profiles. Lifted out of the (now-deleted) single-output `run_capture_zc`

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! Native **SPICE** source for split-screen cells — e.g. a Proxmox/QEMU VM
 //! console reached over `protocol = "spice"`. Mirrors `trireme::vncsrc`: a

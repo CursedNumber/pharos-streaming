@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 //
 // Phase-1 gate harness: prove quinn's QUIC/UDP survives the UWP AppContainer
 // sandbox BEFORE any decode code exists (see crates/trireme-xbox-ffi/README.md,

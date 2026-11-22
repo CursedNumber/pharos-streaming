@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! *Easy mode*: discover installed games/apps and turn a pick into a ready
 //! [`AppEntry`] with a generated launch command and offline box art.

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 //
 // LAN discovery of Pharos hosts via DNS-SD (the host advertises
 // `_pharos._udp` while its pairing window is open, with TXT records carrying

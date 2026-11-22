@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# MQTT integration for Pharos/Trireme: publishes Home Assistant MQTT-Discovery
+# MQTT integration for Pharos: publishes Home Assistant MQTT-Discovery
 # entities (telemetry + controls) and availability (LWT), and dispatches inbound
 # command topics back to the host/client. Plain TCP (LAN broker = HA Mosquitto);
 # TLS is intentionally off (default-features = false) to stay lean + cross-compile

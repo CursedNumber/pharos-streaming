@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! Shared key-chord grammar (e.g. `"Ctrl+Alt+End"`, `"F11"`, `"Alt+Tab"`).
 //!

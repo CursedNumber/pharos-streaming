@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! Input injection backends (BATTLE_PLAN §7): uinput (Linux) /
 //! SendInput + ViGEm (Windows). Will implement `pal::InputSink`. M0 stub.

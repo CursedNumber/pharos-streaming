@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! Reconnecting control **client** — the shared bridge a panel or tray uses to
 //! reach a running host. Pulled out of `pharos-panel` so the panel and the tray

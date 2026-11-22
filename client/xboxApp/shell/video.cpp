@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 //
 // Media Foundation HEVC decode. The Xbox AppContainer exposes the *software*
 // "Microsoft H265 Video Decoder MFT" (sync, system-memory NV12 output), not a

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 The Pharos/Trireme authors
+// Copyright (C) 2026 The Pharos authors
 
 //! The tab bodies. Each exposes `pub fn ui(ui, state)` and is dispatched from
 //! `crate::app`. All helpers a tab needs live inside that tab's file.
